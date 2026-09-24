@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#0d0f12">
+  <title>CMU 3D · 卡内基梅隆大学校园漫游</title>
+  <meta name="description" content="基于 OpenStreetMap 数据与真实地形重建的卡内基梅隆大学（CMU）匹兹堡校园 3D 漫游（非官方爱好者作品）">
+  <!-- Web fonts load without blocking: if Google Fonts is slow or unreachable the page uses system fonts -->
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=Source+Serif+4:opsz,wght@8..60,600;8..60,700&display=swap" media="print" onload="this.media='all'">
+  <link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+  <div id="app">
+    <canvas id="scene" aria-label="CMU 校园 3D 场景"></canvas>
+    <div id="ui"></div>
+  </div>
+  <noscript>此页面需要启用 JavaScript 与 WebGL。</noscript>
+  <script src="data/campus.js"></script>
+  <script src="data/info.js"></script>
+  <script src="dist/app.js"></script>
+</body>
+</html>

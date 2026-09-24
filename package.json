@@ -1,0 +1,20 @@
+{
+  "name": "cmu3d",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Explorable 3D recreation of the Carnegie Mellon University campus (fan project)",
+  "scripts": {
+    "data": "node tools/build-data.mjs",
+    "build": "esbuild src/main.js --bundle --format=iife --target=es2020 --minify --sourcemap --outfile=dist/app.js",
+    "dev": "esbuild src/main.js --bundle --format=iife --target=es2020 --sourcemap --outfile=dist/app.js --watch",
+    "serve": "node tools/serve.mjs"
+  },
+  "dependencies": {
+    "three": "^0.170.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.2",
+    "pngjs": "^7.0.0",
+    "puppeteer-core": "^25.11.0"
+  }
+}
