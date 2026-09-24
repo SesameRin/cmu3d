@@ -1,67 +1,77 @@
-# CMU 3D · 卡内基梅隆大学校园漫游
+# CMU 3D
 
-一个可以在浏览器里自由探索的 **卡内基梅隆大学（Carnegie Mellon University）匹兹堡主校区 3D 复刻**。
-建筑轮廓、道路、步道、草坪和树木来自 OpenStreetMap 真实数据，地形来自真实高程（DEM），
-哈默施拉格楼、贝克楼、美术学院、亨特图书馆、韦恩楼、盖茨中心、科翁大学中心（CUC）、泰珀广场、CIC、史密斯楼、INI、
-彩绘围栏（The Fence）、学习大教堂等 40 余座地标参照实景照片逐个手工建模。
+卡内基梅隆大学（Carnegie Mellon University）匹兹堡校区的交互式三维复刻，基于 three.js，在浏览器中运行。
 
-> 非官方爱好者作品，与卡内基梅隆大学无关。
+**在线访问：<https://sesamerin.github.io/cmu3d/>**
 
-## 打开方式
+> 非官方爱好者项目，与卡内基梅隆大学无关。
 
-**直接双击 `index.html` 即可**（Chrome / Edge / Firefox 均可；需要支持 WebGL2 的显卡）。
+## 功能
 
-也可以双击 **`start-preview.bat`**（自动启动本地服务器并打开浏览器，关闭窗口即停止），或在终端里起一个本地服务器：
+- **真实地理数据**：建筑轮廓、道路、步道、绿地与树木取自 OpenStreetMap，地形取自真实高程数据。
+- **地标建模**：参照实景照片手工建模 40 余座建筑与地标，包括 Hamerschlag Hall、Hunt Library、Wean Hall、Gates-Hillman Center、Cohon University Center、Tepper Quad 与 The Fence 等。
+- **三种浏览模式**：俯瞰、第一人称步行（含碰撞检测与地形跟随）、自由飞行。
+- **导航与信息**：建筑介绍面板、搜索、小地图、15 站导览，以及中英文路名标注与路口路牌。
+- **动态环境**：基于真实太阳轨迹的昼夜变化，支持四季与天气切换及夜间照明。
+- **自适应画质**：提供低 / 中 / 高三档，按设备性能自动选择，并支持移动端触控。
 
-```bash
-node tools/serve.mjs
-```
+## 运行
 
-然后访问 http://localhost:5173 。
+| 方式 | 说明 |
+|---|---|
+| 直接打开 | 双击 `index.html`，无需服务器 |
+| 本地服务器 | 执行 `npm run serve` 或双击 `start-preview.bat`，然后访问 <http://localhost:5173> |
+
+需使用支持 WebGL 2 的现代浏览器（Chrome、Edge、Firefox 或 Safari）。
 
 ## 操作
 
 | 模式 | 操作 |
 |---|---|
-| 俯瞰（1） | 左键拖动旋转 · 右键拖动平移 · 滚轮缩放 · 双击飞到该处 |
-| 步行（2） | 点击画面锁定鼠标 · WASD / 方向键移动 · Shift 奔跑 · 空格跳跃 · Esc 退出 |
-| 飞行（3） | WASD 移动 · E / Q 升降 · 拖动鼠标转向 · 滚轮调速度 |
+| 俯瞰 `1` | 左键拖动旋转，右键拖动平移，滚轮缩放，双击飞往该处 |
+| 步行 `2` | 点击画面锁定鼠标；`WASD` / 方向键移动，`Shift` 奔跑，`Space` 跳跃，`Esc` 退出 |
+| 飞行 `3` | `WASD` 移动，`E` / `Q` 升降，拖动鼠标转向，滚轮调整速度 |
 
 快捷键：`/` 或 `F` 搜索 · `M` 小地图 · `T` 导览 · `L` 标签 · `N` 昼夜切换 · `H` 帮助 · `Esc` 关闭面板。
-手机 / 平板：单指旋转、双指缩放；步行模式有虚拟摇杆。
+移动端：单指旋转，双指缩放；步行模式使用虚拟摇杆。
 
-点击任何建筑或地标可查看介绍（中英文名称、建成年代、建筑师、用途、趣闻），并可“飞过去”或“步行到这里”。
-主要道路（福布斯大道、第五大道、克雷格街……）有中英文路名标注，路口有路牌；克雷格街等处的商店和餐馆有真实店名招牌。
-左下角可以调节一天中的时间、开启延时摄影、切换春夏秋冬（秋季有红叶，冬季会下雪）。
+## URL 参数
 
-URL 参数：`?q=low|medium|high`（画质）· `?hours=18.5`（时间）· `?season=winter` · `?tour`（加载后自动导览）·
-`?cam=x,y,z&look=x,y,z`（指定视角，分享链接会自动生成）· `?debug`（显示帧率）· `?noui`（隐藏界面）。
+| 参数 | 说明 |
+|---|---|
+| `q=low\|medium\|high` | 画质等级 |
+| `hours=18.5` | 一天中的时间（0–24） |
+| `season=spring\|summer\|autumn\|winter` | 季节 |
+| `weather=clear\|partly\|cloudy\|overcast\|snow` | 天气 |
+| `tour` | 加载完成后自动开始导览 |
+| `cam=x,y,z&look=x,y,z[&mode=walk\|fly]` | 指定视角（分享链接自动生成） |
+| `debug` / `noui` | 显示性能信息 / 隐藏界面 |
 
-## 目录
-
-```
-index.html            入口
-css/styles.css        界面样式
-dist/app.js           打包后的程序（npm run build 生成）
-data/campus.js        校园数据（由 OSM + 高程生成）
-data/info.js          中文介绍与导览脚本
-data/curated/         人工校订的建筑高度 / 风格 / 颜色
-src/                  源代码（three.js，ES 模块）
-tools/                数据生成、截图测试、静态服务器
-ARCHITECTURE.md       模块划分与接口约定
-```
-
-## 重新构建
+## 开发
 
 ```bash
 npm install
-npm run data     # 从 data/raw 的 OSM 与高程瓦片重新生成 data/campus.js
-npm run build    # 打包 src → dist/app.js
+npm run data    # 由 data/raw 中的 OSM 数据与高程瓦片生成 data/campus.js
+npm run build   # 打包 src/ 至 dist/app.js
+npm run dev     # 监听源码并自动重新打包
 ```
 
-## 数据来源与许可
+模块划分、坐标系与接口约定见 [ARCHITECTURE.md](ARCHITECTURE.md)。
 
-- 地图数据 © OpenStreetMap 贡献者，遵循 ODbL 许可。
-- 高程：AWS Terrain Tiles（Mapzen / USGS 3DEP 等）。
-- 3D 引擎：three.js（MIT）。
-- 所有纹理均在运行时用 Canvas 程序化绘制，没有使用任何照片或第三方模型。
+```
+index.html        页面入口
+css/              界面样式
+dist/app.js       构建产物
+data/campus.js    生成的校园数据
+data/info.js      中文介绍与导览内容
+data/curated/     人工校订的建筑属性
+src/              源代码（core · world · landmarks · controls · ui）
+tools/            数据生成、截图测试与本地服务器
+```
+
+## 数据来源与致谢
+
+- 地图数据 © [OpenStreetMap](https://www.openstreetmap.org/copyright) 贡献者，采用 ODbL 许可。
+- 高程数据：[AWS Terrain Tiles](https://registry.opendata.aws/terrain-tiles/)（Mapzen，含 USGS 3DEP 等来源）。
+- 渲染引擎：[three.js](https://threejs.org/)（MIT 许可）。
+- 全部纹理均在运行时程序化生成，未使用照片或第三方模型。
