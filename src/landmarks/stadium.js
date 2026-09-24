@@ -533,6 +533,7 @@ async function buildStadium(ctx, def) {
   poolMesh.name = 'stadium-lightpool';
   poolMesh.renderOrder = 2;
   poolMesh.visible = false;
+  poolMesh.userData.dynamic = true;   // (shown at night only)
   root.add(poolMesh);
   ctx.onUpdate?.(() => {
     const nf = ctx.env?.state?.nightFactor ?? 0;

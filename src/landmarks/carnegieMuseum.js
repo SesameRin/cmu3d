@@ -441,6 +441,7 @@ async function buildDippy(ctx) {
   for (const g of geo.scarf) SB.addGeometry('scarf', g);
   const scarf = SB.build({ scarf: ctx.materials.color('#b8202f', { roughness: 0.9 }) });
   scarf.name = 'dippy-scarf';
+  scarf.userData.dynamic = true;   // (season-toggled: static batching / shadow proxies leave it alone)
   group.add(scarf);
   const setSeason = (s) => { scarf.visible = s === 'winter'; };
   setSeason(ctx.env?.state?.season);
@@ -560,6 +561,7 @@ async function buildBellefieldStack(ctx) {
   const plume = new THREE.Mesh(steamPlume(top), plumeMat);
   plume.name = 'bellefield-steam';
   plume.castShadow = false; plume.receiveShadow = false;
+  plume.userData.dynamic = true;   // (season-toggled and animated)
   group.add(plume);
   const setSeason = (s) => { plume.visible = s === 'winter'; };
   setSeason(ctx.env?.state?.season);

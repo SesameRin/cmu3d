@@ -34,7 +34,8 @@ import { createSignage, businessStyle } from './signage.js';
 //    start-up only around the start view (LOD.init); everywhere else lazily — time-sliced, nearest first — once the
 //    camera comes within LOD.build, and drawn within LOD.show (its small shadows only within ~420 m).
 const CHUNK = 250;
-const BASE_CHUNK = 250; // (same grid as the detail chunks: tighter frustum / shadow culling than 500 m)
+const BASE_CHUNK = 500; // base meshes: one draw per 500 m (their shadows come from the shadow proxies, merged per 500 m
+                        // anyway; each chunk draw is CPU time on a slow machine, the extra off-screen triangles are cheap)
 const SIGN_FAR = 520;   // fascia signs + awning-free boards visible up to this distance (m) from their 250 m chunk
 const DETAIL_NEAR = 250; // blade signs, café furniture
 
@@ -1409,9 +1410,13 @@ export async function createBuildings(ctx) {
       const vis = chunkDist(c, p) < far;
       for (const m of c.meshes) m.visible = vis;
     }
+    // detail range × ctx.lodScale (engine CPU degrade), adopted per chunk only while that flips nothing right now
+    const showWant = LOD.show * (ctx.lodScale ?? 1);
     for (const c of detailList) {
       const d = chunkDist(c, p);
-      const vis = d < LOD.show, cast = d < 420;
+      if (c.show === undefined) c.show = LOD.show;
+      if (c.show !== showWant && (d < c.show) === (d < showWant)) c.show = showWant;
+      const vis = d < c.show, cast = d < 420;
       for (const m of c.meshes) { m.visible = vis; m.castShadow = cast; } // (picked up by the next periodic shadow update)
       if (c.signFar) c.signFar.visible = d < SIGN_FAR;
       if (c.signNear) c.signNear.visible = d < DETAIL_NEAR;

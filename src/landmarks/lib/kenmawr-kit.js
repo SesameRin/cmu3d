@@ -371,7 +371,9 @@ export function lodBuilding(ctx, { name, centre, coarse, far, near, fine }) {
         if (!g) return;
         place(g);
         lod.setFine(g);
-        try { ctx.engine?.warm?.(g); } catch { /* compiled on first use instead */ }
+        // (while loading only the compiles: the precompile uploads every texture later, and uploading here released
+        // shared canvases before the static batching could copy them into its texture arrays)
+        try { ctx.engine?.warm?.(g, { upload: !!ctx.engine?.running }); } catch { /* compiled on first use instead */ }
         try { ctx.env?.refreshShadows?.(); } catch { /* next scheduled refresh */ }
         lod.userData.fineTriangles = countTris(g);
       },

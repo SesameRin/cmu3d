@@ -402,16 +402,19 @@ export function groundRange(ctx, frame, ring, step = 4) {
 export function distanceCull(ctx, { x, z, detail = null, near = 600, main = null, far = Infinity }) {
   if (!ctx.onUpdate || (!detail && !main)) return;
   // (their visibility changes at runtime: world/shadowproxy.js must not merge their casters)
-  if (detail) detail.userData.noShadowProxy = true;
-  if (main) main.userData.noShadowProxy = true;
-  let frameN = 0;
+  if (detail) { detail.userData.noShadowProxy = true; detail.userData.dynamic = true; }
+  if (main) { main.userData.noShadowProxy = true; main.userData.dynamic = true; }
+  let frameN = 0, nearNow = near;
   ctx.onUpdate(() => {
     if ((frameN++ & 7) !== 0) return;
     const cam = ctx.camera?.position;
     if (!cam) return;
     const d = Math.hypot(cam.x - x, cam.z - z);
     let changed = false;
-    if (detail && detail.visible !== d < near) { detail.visible = d < near; changed = true; }
+    // detail range × ctx.lodScale (engine CPU degrade), adopted only when that does not flip the detail right now
+    const nearWant = near * (ctx.lodScale ?? 1);
+    if (nearWant !== nearNow && (d < nearWant) === (d < nearNow)) nearNow = nearWant;
+    if (detail && detail.visible !== d < nearNow) { detail.visible = d < nearNow; changed = true; }
     if (main && main.visible !== d < far) { main.visible = d < far; changed = true; }
     // (no forced shadow refresh: the next scheduled one picks the casters up — a forced one re-renders both
     // cascades in the frame the threshold is crossed)

@@ -122,7 +122,7 @@ export function createTour(ctx, { root, onStart, onStop, toast, onFinishAction }
     body.classList.remove('swap'); void body.offsetWidth; body.classList.add('swap');
     [...dots.children].forEach((d, i) => { d.classList.toggle('on', i === idx); d.classList.toggle('done', i < idx); d.setAttribute('aria-selected', String(i === idx)); });
     prevBtn.disabled = idx === 0;
-    bar.style.transform = 'scaleX(0)';
+    bar.style.width = '0%';
   }
 
   function setPlaying(p) {
@@ -168,7 +168,7 @@ export function createTour(ctx, { root, onStart, onStop, toast, onFinishAction }
     textEl.textContent = '你已经游览了校园的主要地标。接下来可以回到校园全景自由探索，去中央草坪（The Mall）步行走一走，或者搜索更多地点。'
       + (isTouchUI(ctx) ? '' : '（快捷键：/ 搜索 · 2 步行 · H 操作指南）');
     body.classList.remove('swap'); void body.offsetWidth; body.classList.add('swap');
-    bar.style.transform = 'scaleX(1)';
+    bar.style.width = '100%';
     [...dots.children].forEach((d) => { d.classList.remove('on'); d.classList.add('done'); });
     idx = stops.length;
     if (!isTouchUI(ctx)) requestAnimationFrame(() => { if (el.classList.contains('finished')) finish1.focus({ preventScroll: true }); });
@@ -237,7 +237,10 @@ export function createTour(ctx, { root, onStart, onStop, toast, onFinishAction }
     if (!active || flying || !playing || idx >= stops.length) return;
     const dur = dwellFor(stops[idx]);
     if (!hovering) dwell += dt;
-    bar.style.transform = `scaleX(${clamp(dwell / dur, 0, 1).toFixed(4)})`;
+    // (width, not a transform: a gradient under scaleX(≈0) made Chrome re-raster the bar at an enormous scale —
+    // a 0.3–0.9 s stall in the GPU process whenever a stop started on a slow machine)
+    const w = `${(clamp(dwell / dur, 0, 1) * 100).toFixed(2)}%`;
+    if (bar.style.width !== w) bar.style.width = w;
     if (dwell >= dur) go(idx + 1);
   }
 

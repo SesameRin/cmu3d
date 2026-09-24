@@ -1154,6 +1154,11 @@ function createNearLevel(ctx, P, cfg, mkTex) {
     return left;
   }
   const dir = new THREE.Vector3();
+  // CPU degrade (engine 'perf:degrade'): fewer tiles per second and a smaller main-thread budget — the tiles right
+  // around the camera still come at once, the rest of the window fills in a little later
+  const PACE = [[NEAR_GPU_PER_FRAME, NEAR_BUDGET_MS], [3.6, 2], [2.6, 1.5], [1.8, 1]];
+  let pace = PACE[0];
+  ctx.events?.on?.('perf:degrade', (e) => { pace = PACE[Math.max(0, Math.min(PACE.length - 1, Math.round(Number(e?.cpu) || 0)))]; });
   function update(force = false) {
     const cam = ctx.camera;
     if (!cam) return;
@@ -1162,8 +1167,8 @@ function createNearLevel(ctx, P, cfg, mkTex) {
     if (hAbove > NEAR_MAX_H && !force) return;
     cam.getWorldDirection(dir);
     focusWindow(p.x, p.z, dir.x, dir.y, dir.z, hAbove);
-    gpuDebt = Math.max(0, gpuDebt - NEAR_GPU_PER_FRAME);
-    if (want.length) paintMissing(NEAR_BUDGET_MS, !(force || ctx.shotMode), p.x, p.z);
+    gpuDebt = Math.max(0, gpuDebt - pace[0]);
+    if (want.length) paintMissing(pace[1], !(force || ctx.shotMode), p.x, p.z);
   }
   // During loading: paint the window around the start view (a ?cam= link, else the opening overview — the same
   // pose as controls.js HOME) so the first frames have nothing (or only a strip) to paint.

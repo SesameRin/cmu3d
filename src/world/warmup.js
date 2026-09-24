@@ -5,10 +5,14 @@
 // view); what is left is done here, behind the loading screen:
 //   1. finish the landmarks' deferred refinements (flushRefine: sculpted details, the Fence paint job, Kenmawr's
 //      detailed buildings) — they used to be built in idle slices / on approach while exploring;
-//   2. merge the static shadow casters of landmarks / building chunks / structures into shadow-only proxies
+//   2. find what changes at runtime (staticbatch.js probeDynamic: a few update ticks by day / night) — flagged
+//      userData.dynamic, left alone by the next two steps;
+//   3. merge the static shadow casters of landmarks / building chunks / structures into shadow-only proxies
 //      (shadowproxy.js) — a fraction of the shadow-pass draw calls;
-//   3. make the water reflection's per-body cull lists (no first-visit cost later);
-//   4. put everything on the GPU: when the engine has a warm-up of its own (engine.warmScene, run by main.js after
+//   4. static batching of the main pass (staticbatch.js): equivalent landmark / structure materials merged, static
+//      meshes sharing a material merged per ~480 m cell, picking and bounds preserved (?nobatch turns 2 and 4 off);
+//   5. make the water reflection's per-body cull lists (no first-visit cost later; after 4: they list the batches);
+//   6. put everything on the GPU: when the engine has a warm-up of its own (engine.warmScene, run by main.js after
 //      the shader precompile: every object drawn once — vertex buffers, textures and the ANGLE/D3D11 shader
 //      variants for each vertex layout, which otherwise compile inside the frame that first shows an object) that
 //      is it; otherwise this module does it: every object made visible and unculled (hidden LOD levels, far
@@ -18,6 +22,7 @@
 // there; without it, it runs right away at the end of createLife.
 import { flushRefine } from '../landmarks/lib/icons-common.js';
 import { buildShadowProxies } from './shadowproxy.js';
+import { probeDynamic, buildStaticBatches } from './staticbatch.js';
 
 export function scheduleFinishWorld(ctx) {
   if (typeof ctx.addLoadTask === 'function') { ctx.addLoadTask('完善场景细节', () => finishWorld(ctx)); return null; }
@@ -33,15 +38,40 @@ export async function finishWorld(ctx) {
   await ctx.yield?.();
   if (!ctx.scene || !ctx.renderer) return stats;
 
+  // what changes at runtime (static batching and the shadow proxies leave it alone) — landmarks and static structures
+  const batchOn = !ctx.params?.has?.('nobatch');
+  const lmRoots = new Set((ctx.landmarks || []).map((l) => l.object).filter(Boolean));
+  for (const o of ctx.scene.children) if (/^landmarks?:/.test(o.name || '')) lmRoots.add(o);
+  const structRoots = ctx.scene.children.filter((o) => /^(bridges|cliffs)$/.test(o.name || ''));
+  const liteRoots = ctx.scene.children.filter((o) => /^(barriers|railways)$/.test(o.name || ''));   // (skipped by the water reflection)
+  let dynamic = null;
+  if (batchOn) {
+    // relief normal maps first (materials.enhance, idempotent — the precompile would add them later): they are
+    // part of what the merged materials copy
+    try { for (const r of [...lmRoots, ...structRoots, ...liteRoots]) ctx.materials?.enhance?.(r); } catch (e) { console.warn('[warmup] material relief failed', e); }
+    try { dynamic = probeDynamic(ctx, [...lmRoots, ...structRoots, ...liteRoots]); stats.dynamic = { objects: dynamic.objects.size, materials: dynamic.materials.size, textures: dynamic.textures.size, ms: dynamic.ms }; } catch (e) { console.warn('[warmup] dynamic probe failed', e); }
+    await ctx.yield?.();
+  }
+
   // static landmark / structure / building-chunk shadow casters → merged shadow-only proxies (while every flag is
   // still the real one: parts hidden right now are the ones whose visibility changes at runtime)
   try {
-    const roots = new Set((ctx.landmarks || []).map((l) => l.object).filter(Boolean));
+    const roots = new Set(lmRoots);
     for (const o of ctx.scene.children) if (/^landmark|^(bridges|barriers|cliffs|buildings)$/.test(o.name || '')) roots.add(o);
     const t = performance.now();
     stats.shadowProxies = buildShadowProxies(ctx, [...roots])?.stats || null;
     if (stats.shadowProxies) stats.shadowProxies.ms = Math.round(performance.now() - t);
   } catch (e) { console.warn('[warmup] shadow proxies failed', e); }
+  await ctx.yield?.();
+
+  // static meshes that share a material (after merging equivalent materials) → one mesh per ~480 m cell
+  if (batchOn) {
+    try {
+      stats.batches = buildStaticBatches(ctx, { roots: [...lmRoots, ...structRoots], lite: liteRoots, dynamic });
+      ctx.staticBatches = stats.batches;
+    } catch (e) { console.warn('[warmup] static batching failed', e); }
+    await ctx.yield?.();
+  }
   try { ctx.water?.reflection?.prepare?.(); } catch (e) { console.warn('[warmup] reflection lists failed', e); }
 
   // the engine's own warm-up (main.js: after the precompile) draws everything once — nothing more to do here

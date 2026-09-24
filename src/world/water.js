@@ -263,7 +263,7 @@ export function createWater(ctx) {
 // warm() renders it once during loading, so its render target's shader variants and buffers exist before exploring.
 const REFL_RANGE = 320, REFL_SIZE = 512, REFL_FAR = 600, REFL_STILL_MS = 1000, REFL_MIN_SCREEN = 0.04, REFL_SMALL_SCREEN = 0.15;
 // small street-level detail that does not read in a 512² rippled reflection: left out of the pass (top-level groups)
-const REFL_SKIP = new Set(['props', 'life', 'road-markings', 'curbs', 'barriers', 'terrain-grass', 'street-signage', 'streetSigns', 'railways', 'terrain-surroundings']);
+const REFL_SKIP = new Set(['props', 'life', 'road-markings', 'curbs', 'barriers', 'terrain-grass', 'street-signage', 'streetSigns', 'railways', 'terrain-surroundings', 'static-batches-lite']);
 function createReflection(ctx, bodies, mat, water) {
   if (ctx.quality?.level !== 'high' || !ctx.renderer) return;
   const U = mat.userData.waterUniforms;
@@ -287,6 +287,14 @@ function createReflection(ctx, bodies, mat, water) {
   let lastBody = null, lastT = -1e9, frameN = 0;
   const lastPose = new Float32Array(16);
   const skipped = [];
+  // CPU degrade (engine 'perf:degrade', first thing to go — it is a whole extra scene pass): level 1 re-renders it
+  // half as often, level 2 a third as often and only within 400 m of the water, level 3 turns it off (sky
+  // reflection) — but not under the viewer's eyes: a reflection on screen keeps going (every 8th frame) until its
+  // body leaves the view, only no new one starts
+  const DEG = [{ every: 2, still: 1000, far: REFL_FAR }, { every: 4, still: 2000, far: REFL_FAR }, { every: 6, still: 3000, far: 400 },
+    { every: 8, still: 4000, far: 400, noNew: true }];
+  let deg = DEG[0];
+  ctx.events?.on?.('perf:degrade', (e) => { deg = DEG[Math.max(0, Math.min(DEG.length - 1, Math.round(Number(e?.cpu) || 0)))]; lastT = -1e9; });
   ctx.onUpdate(() => {
     const main = ctx.camera, scene = ctx.scene;
     if (!main || !scene) return;
@@ -304,39 +312,44 @@ function createReflection(ctx, bodies, mat, water) {
     // how big the body is on screen (radius / half the view height at its distance): a pond that is a few pixels
     // across gets the plain sky reflection; a small one is re-rendered less often while the camera moves
     const scr = best ? best.r / Math.max(1, bd + best.r) / Math.tan(THREE.MathUtils.degToRad(main.fov || 55) / 2) : 0;
-    if (!best || !stats.enabled || scr < REFL_MIN_SCREEN) { U.uReflLevel.value = -1e9; lastBody = null; return; }
+    if (!best || !stats.enabled || scr < REFL_MIN_SCREEN || (deg.noNew && best !== lastBody)) { U.uReflLevel.value = -1e9; lastBody = null; return; }
     frameN++;
     const me = main.matrixWorld.elements;
     let moved = false;
     for (let k = 0; k < 16; k++) if (Math.abs(me[k] - lastPose[k]) > 1e-4) { moved = true; break; }
     const now = performance.now();
-    const every = scr < REFL_SMALL_SCREEN ? 4 : 2;
-    if (best === lastBody && (moved ? frameN % every !== 0 : now - lastT < REFL_STILL_MS)) { stats.skipped++; return; }
+    const every = scr < REFL_SMALL_SCREEN ? deg.every * 2 : deg.every;
+    if (best === lastBody && (moved ? frameN % every !== 0 : now - lastT < deg.still)) { stats.skipped++; return; }
     lastBody = best; lastT = now;
     lastPose.set(me);
     render(main, best);
   }, 95);
-  // one render during loading from above the largest body (compiles / uploads what the pass needs)
-  stats.warm = () => {
+  // one render during loading from above the largest body (compiles / uploads what the pass needs). all = true
+  // (engine.warmScene, while every object is shown and unculled): nothing is left out for distance either, so every
+  // object's first draw into this target happens now — the first reflection while exploring (the tour passes the
+  // pond) otherwise stalled for 0.3–1.4 s. The prepared cull lists are kept then.
+  stats.warm = (all = false) => {
     const e = list.reduce((a, b) => (b.r > a.r ? b : a), list[0]);
     if (!e) return;
     const c = new THREE.PerspectiveCamera(ctx.camera?.fov ?? 55, ctx.camera?.aspect ?? 1.6, ctx.camera?.near ?? 0.5, ctx.camera?.far ?? 6000);
     c.position.set(e.b.center[0] + e.r + 30, e.b.level + 25, e.b.center[1] + e.r + 30);
     c.lookAt(e.b.center[0], e.b.level, e.b.center[1]);
     c.updateMatrixWorld();
-    render(c, e);
+    render(c, e, all);
     lastBody = null;
-    cullFor.clear(); // (made while everything was visible and unculled for the warm-up)
+    U.uReflLevel.value = -1e9;
+    if (!all) cullFor.clear(); // (made while everything was visible and unculled for the warm-up)
   };
   // after the warm-up (visibility restored): the far-mesh lists of every body, so no first visit computes them
-  stats.prepare = () => { for (const e of list) farList(e); };
+  stats.prepare = () => { for (const e of list) { farList(e); farList(e, DEG[2].far); } };
   // meshes farther than REFL_FAR from a water body (bounding spheres, world space): hidden during its pass. Made
   // once per body after loading (stats.prepare, from world/warmup.js); objects added later are simply not culled.
   const _sph = new THREE.Sphere();
   const cullFor = new Map();
-  function farList(e) {
+  function farList(e, far = REFL_FAR) {
     const scene = ctx.scene;
-    let l = cullFor.get(e);
+    const key = far === REFL_FAR ? e : `${far}:${list.indexOf(e)}`;
+    let l = cullFor.get(key);
     if (l) return l;
     l = [];
     const c = e.sphere.center;
@@ -348,13 +361,13 @@ function createReflection(ctx, bodies, mat, water) {
         if (o.isInstancedMesh) { if (!o.boundingSphere) o.computeBoundingSphere(); _sph.copy(o.boundingSphere); }
         else { if (!o.geometry.boundingSphere) o.geometry.computeBoundingSphere(); _sph.copy(o.geometry.boundingSphere); }
         _sph.applyMatrix4(o.matrixWorld);
-        if (_sph.center.distanceTo(c) - _sph.radius > REFL_FAR) l.push(o);
+        if (_sph.center.distanceTo(c) - _sph.radius > far) l.push(o);
       });
     }
-    cullFor.set(e, l);
+    cullFor.set(key, l);
     return l;
   }
-  function render(main, best) {
+  function render(main, best, all = false) {
     const renderer = ctx.renderer, scene = ctx.scene;
     const t0 = performance.now();
     camPos.setFromMatrixPosition(main.matrixWorld);
@@ -368,7 +381,8 @@ function createReflection(ctx, bodies, mat, water) {
     cam.position.copy(view);
     cam.up.set(0, 1, 0).applyMatrix4(rot).reflect(N);
     cam.lookAt(target);
-    cam.near = main.near; cam.far = Math.min(main.far, REFL_FAR);
+    const far = deg?.far ?? REFL_FAR;
+    cam.near = main.near; cam.far = all ? main.far : Math.min(main.far, far);
     cam.fov = main.fov; cam.aspect = main.aspect; cam.zoom = main.zoom;
     cam.updateMatrixWorld();
     cam.updateProjectionMatrix();
@@ -389,7 +403,7 @@ function createReflection(ctx, bodies, mat, water) {
     water.visible = false;
     skipped.length = 0;
     for (const o of scene.children) if (o.visible && REFL_SKIP.has(o.name)) { o.visible = false; skipped.push(o); }
-    for (const o of farList(best)) if (o.visible) { o.visible = false; skipped.push(o); }
+    if (!all) for (const o of farList(best, far)) if (o.visible) { o.visible = false; skipped.push(o); }
     renderer.xr.enabled = false;
     renderer.shadowMap.autoUpdate = false;
     try {

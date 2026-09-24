@@ -26,15 +26,107 @@ function flagAddedObjects() {
   addPatched = true;
   const P = THREE.Object3D.prototype;
   const add = P.add, attach = P.attach;
+  const dirtyUp = (p) => { for (; p; p = p.parent) if (p.__static) p.__static.dirty = true; };
   P.add = function (...objects) {
     const r = add.apply(this, objects);
     for (const o of objects) if (o && o.isObject3D) o.matrixWorldNeedsUpdate = true;
+    dirtyUp(this);
     return r;
   };
   P.attach = function (object) {
     const r = attach.call(this, object);
     if (object && object.isObject3D) object.matrixWorldNeedsUpdate = true;
+    dirtyUp(this);
     return r;
+  };
+}
+
+// Static subtrees. Even without the forced pass, three's updateMatrixWorld still walks every object of the scene
+// on every render (main pass + water reflection): ~2400 calls, ~0.35 ms per walk on a fast desktop, for a world
+// where only the sun lights move. A top-level subtree marked static skips that walk: per frame it only checks its
+// matrixAutoUpdate objects (their position / rotation / scale — e.g. a landmark part that a module animates) and
+// updates the ones that changed, with their descendants. Anything added below it (Object3D.add / attach, patched
+// above) makes it walk once again; the engine's forced update once a second places everything regardless (a module
+// that writes .matrix directly or sets matrixWorldNeedsUpdate by hand on a non-auto object is placed then).
+const baseUMW = THREE.Object3D.prototype.updateMatrixWorld;
+function collectAutos(root) {
+  const autos = [];
+  root.traverse((o) => { if (o.matrixAutoUpdate) autos.push(o); });
+  const cache = new Float64Array(autos.length * 10);
+  autos.forEach((o, i) => writeTRS(o, cache, i * 10));
+  return { autos, cache };
+}
+function writeTRS(o, c, k) {
+  const p = o.position, q = o.quaternion, s = o.scale;
+  c[k] = p.x; c[k + 1] = p.y; c[k + 2] = p.z; c[k + 3] = q.x; c[k + 4] = q.y; c[k + 5] = q.z; c[k + 6] = q.w; c[k + 7] = s.x; c[k + 8] = s.y; c[k + 9] = s.z;
+}
+function staticUMW(force) {
+  const st = this.__static;
+  if (force || st.dirty || this.matrixWorldNeedsUpdate) {
+    baseUMW.call(this, force);
+    if (st.dirty) { const a = collectAutos(this); st.autos = a.autos; st.cache = a.cache; st.dirty = false; }
+    else for (let i = 0; i < st.autos.length; i++) writeTRS(st.autos[i], st.cache, i * 10);
+    return;
+  }
+  const A = st.autos, c = st.cache;
+  for (let i = 0; i < A.length; i++) {
+    const o = A[i], k = i * 10, p = o.position, q = o.quaternion, s = o.scale;
+    if (p.x !== c[k] || p.y !== c[k + 1] || p.z !== c[k + 2] || q.x !== c[k + 3] || q.y !== c[k + 4] || q.z !== c[k + 5] || q.w !== c[k + 6] ||
+      s.x !== c[k + 7] || s.y !== c[k + 8] || s.z !== c[k + 9] || o.matrixWorldNeedsUpdate) {
+      writeTRS(o, c, k);
+      if (o.parent) baseUMW.call(o, true);      // (autos are in traversal order: a moved parent was placed first)
+    }
+  }
+}
+function markStatic(root) {
+  if (root.__static) return;
+  const a = collectAutos(root);
+  root.__static = { autos: a.autos, cache: a.cache, dirty: false };
+  root.updateMatrixWorld = staticUMW;
+}
+
+// Opaque draw order. three sorts opaque items by material id, then depth, so materials sharing a program are
+// scattered through the list and every program switch re-uploads the camera and all light / shadow uniforms (the
+// largest part of setProgram). Here: program first, then material, then depth — same per-material batching and
+// front-to-back order within a material, a fraction of the program switches. Materials whose relative draw order
+// can matter for opaque items (no depth write / test, colour write off, non-normal blending) split the list into
+// segments, so everything keeps its order relative to them.
+function isSpecial(m) {
+  return !m.depthWrite || !m.depthTest || !m.colorWrite || m.blending !== THREE.NormalBlending;
+}
+function makeOpaqueSort(renderer) {
+  let epoch = 1, lastEpochAt = 0;
+  const specials = [];              // sorted ids of special materials seen so far
+  const keyOf = (m) => {
+    if (m.__rkE === epoch) return m.__rk;
+    let lo = 0, hi = specials.length;
+    if (isSpecial(m) && !specials.includes(m.id)) {
+      specials.push(m.id); specials.sort((a, b) => a - b);
+      epoch++;                      // every segment after it moved
+    }
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (specials[mid] < m.id) lo = mid + 1; else hi = mid; }
+    const seg = lo * 2 + (specials[lo] === m.id ? 1 : 0);
+    const prog = renderer.properties.get(m).currentProgram;
+    const k = seg * 1048576 + (prog ? prog.id % 1048576 : 0);
+    if (m.__rkE === undefined) Object.defineProperties(m, { __rk: { value: k, writable: true }, __rkE: { value: epoch, writable: true } });
+    else { m.__rk = k; m.__rkE = epoch; }
+    return k;
+  };
+  return {
+    sort(a, b) {
+      if (a.groupOrder !== b.groupOrder) return a.groupOrder - b.groupOrder;
+      if (a.renderOrder !== b.renderOrder) return a.renderOrder - b.renderOrder;
+      const ma = a.material, mb = b.material;
+      if (ma !== mb) {
+        const d = keyOf(ma) - keyOf(mb);
+        if (d !== 0) return d;
+        return ma.id - mb.id;
+      }
+      if (a.z !== b.z) return a.z - b.z;
+      return a.id - b.id;
+    },
+    // (programs are only known after a material's first draw, and may change: re-key now and then)
+    refresh(now) { if (now - lastEpochAt > 1500) { lastEpochAt = now; epoch++; } },
   };
 }
 
@@ -61,6 +153,8 @@ export function createEngine(ctx, canvas) {
   renderer.shadowMap.enabled = !!q.shadows;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   renderer.info.autoReset = false;     // we reset once per frame so stats include shadow + post passes
+  const opaqueSort = makeOpaqueSort(renderer);
+  if (!params.has('nosort')) renderer.setOpaqueSort(opaqueSort.sort);
 
   const scene = new THREE.Scene();
   scene.background = new THREE.Color('#a9c8e8');   // replaced by the sky once env exists
@@ -180,6 +274,8 @@ export function createEngine(ctx, canvas) {
     const dt = Math.min(Math.max(raw, 0), 0.1);
     elapsed += dt;
     if (worldStatic && ++safetyN >= SAFETY_FRAMES) { safetyN = 0; scene.updateMatrixWorld(true); }
+    opaqueSort.refresh(t0);
+    lodTick();
     ctx.tick(dt, elapsed);
     renderFrame(dt);
     // our own main-thread time for this frame (update callbacks + three's draw submission); compared with the
@@ -194,26 +290,38 @@ export function createEngine(ctx, canvas) {
   }
 
   // ---------------------------------------------------------------- adaptive quality
-  // Keep ~60 fps. Every 2.5 s the average frame interval is compared with the average time our own JS takes per
-  // frame (ctx.tick + render — mostly three's draw-call submission):
+  // Keep ~60 fps. Every 2.5 s the window's median frame interval (and share of dropped frames, > 20 ms) is compared
+  // with the median time our own JS takes per frame (ctx.tick + render — mostly three's draw-call submission). Two
+  // slow windows in a row (median > 17.5 ms, or ≥ 20 % dropped frames) step down:
   //  · GPU-bound (JS < ½ of the interval): walk down the GPU ladder — pixel ratio (HiDPI: 2 → 1.5 → 1.25 → 1), then
   //    AO (post), then a render scale below 1 (0.85 → 0.75), which also gives 'low'/'medium' a real fallback.
   //  · CPU-bound (JS ≥ ¾ of the interval): resolution and AO would only blur the picture for nothing. Instead raise the
-  //    CPU degrade level 1..3 and emit 'perf:degrade' { level, cpu, gpu, pixelRatio, ao }: env renders the shadow map
-  //    less often; other modules may shrink update radii / refresh rates. When nothing is left, the UI suggests a lower
-  //    preset once.  · In between: CPU levers first (they also save GPU time), then GPU levers.
-  // Recovery after a stretch of fast frames; with vsync at 60 Hz frame times can't show headroom, so after a while at
-  // vsync rate one step up is probed, and the probe interval doubles every time it fails.
+  //    CPU degrade level 1..3 and emit 'perf:degrade' { level, cpu, gpu, pixelRatio, ao, levers }: the modules drop
+  //    invisible-ish costs first (CPU_LEVERS: water reflection cadence → off, shadow refresh cadence, minimap rate,
+  //    out-of-view NPC rate, near-ground tile pacing, landmark detail ranges). When nothing is left, the UI suggests a
+  //    lower preset once.  · In between: CPU levers first (they also save GPU time), then GPU levers.
+  // Back up: picture quality first, then the CPU levers — after two windows with headroom (vsync rate, < 4 % dropped
+  // frames, our JS < 55 % of the frame; a step up that is slow again within 20 s doubles the windows needed), after
+  // fast frames on a > 60 Hz display, or probing: after a while at vsync rate one step up is tried, and the probe
+  // interval doubles every time it fails.
   const RES_STEPS = [2, 1.5, 1.25, 1];
   const SUB_STEPS = [0.85, 0.75];
   const CPU_MAX = 3;
-  const perf = { sum: 0, js: 0, n: 0, slow: 0, fast: 0, vsync: 0, skip: 0, probing: false, probeWait: 20, gpu: 0, cpu: 0, hinted: false, avg: 0, share: 0, gpuCheck: 0, gpuBlock: 0 };
+  // What each CPU level asks of the modules (they listen to 'perf:degrade' and read .cpu). Invisible costs first;
+  // nothing switches at eye level while it is on screen (LOD ranges only change for objects not near a switch).
+  const CPU_LEVERS = [
+    'full rate',
+    'water reflection 1/4 frames · shadow refresh 45 ms · minimap 20 Hz · NPCs out of view at ¼ rate · ground tiles 2 ms',
+    'water reflection 1/6 frames, 400 m · shadow refresh 60 ms · minimap 12 Hz · landmark / building detail range ×0.85 · glow every 2nd frame · ground tiles 1.5 ms',
+    'water reflection off (one on screen fades to 1/8 frames first) · shadow refresh 90 ms · minimap 8 Hz · landmark / building detail range ×0.7 · glow every 2nd frame · ground tiles 1 ms',
+  ];
+  const perf = { sum: 0, js: 0, n: 0, drop: 0, slow: 0, fast: 0, vsync: 0, skip: 0, probing: false, probeWait: 20, gpu: 0, cpu: 0, hinted: false, avg: 0, share: 0, dropFrac: 0, gpuCheck: 0, gpuBlock: 0, head: 0, headNeed: 2, upAt: -1e9 };
   const winRaw = new Float32Array(1024), winJs = new Float32Array(1024), sortBuf = new Float32Array(1024);
-  function median(a, n) {
+  function median(a, n, q = 0.5) {
     if (!n) return 0;
     sortBuf.set(a.subarray(0, n));
     const s = sortBuf.subarray(0, n).sort();
-    return s[n >> 1];
+    return s[Math.min(n - 1, Math.floor(n * q))];
   }
   let aoWanted = true;       // engine.setAO() override
   let qualityBusy = false;   // setQuality() in progress
@@ -237,11 +345,47 @@ export function createEngine(ctx, canvas) {
     post?.setAO(aoWanted && s.ao);
   }
   function emitPerf() {
-    ctx.events?.emit?.('perf:degrade', { level: perf.cpu, cpu: perf.cpu, gpu: perf.gpu, pixelRatio: renderer.getPixelRatio(), ao: !!post?.aoEnabled });
+    ctx.events?.emit?.('perf:degrade', { level: perf.cpu, cpu: perf.cpu, gpu: perf.gpu, pixelRatio: renderer.getPixelRatio(), ao: !!post?.aoEnabled, levers: CPU_LEVERS[perf.cpu] });
   }
   function resetPerf() {
-    Object.assign(perf, { sum: 0, js: 0, n: 0, slow: 0, fast: 0, vsync: 0, skip: 0, probing: false, probeWait: 20, gpu: 0, cpu: 0, gpuCheck: 0, gpuBlock: 0 });
+    Object.assign(perf, { sum: 0, js: 0, n: 0, drop: 0, slow: 0, fast: 0, vsync: 0, skip: 0, probing: false, probeWait: 20, gpu: 0, cpu: 0, gpuCheck: 0, gpuBlock: 0, head: 0, headNeed: 2, upAt: -1e9 });
   }
+  // Landmark detail ranges (CPU levels 2–3): every THREE.LOD's switch distances (and ctx.lodScale, which the
+  // distance-culled detail groups read) shrink ×0.85 / ×0.7. Applied per LOD only while the camera is clear of every
+  // threshold that moves — nothing switches at the moment the level changes; it simply switches nearer from then on.
+  const LOD_SCALE = [1, 1, 0.85, 0.7];
+  const lodCtl = { list: null, scale: 1, pending: false, n: 0 };
+  ctx.lodScale = 1;
+  const _lv = new THREE.Vector3(), _cv = new THREE.Vector3();
+  function lodTick() {
+    if (!lodCtl.pending || (++lodCtl.n & 7)) return;
+    if (!lodCtl.list) {
+      lodCtl.list = [];
+      scene.traverse((o) => { if (o.isLOD && o.levels.length > 1) lodCtl.list.push({ o, base: o.levels.map((l) => l.distance), cur: 1 }); });
+    }
+    _cv.setFromMatrixPosition(camera.matrixWorld);
+    let left = 0;
+    for (const L of lodCtl.list) {
+      if (L.cur === lodCtl.scale) continue;
+      const d = _lv.setFromMatrixPosition(L.o.matrixWorld).distanceTo(_cv) / (camera.zoom || 1);
+      let clear = true;
+      for (let i = 1; i < L.base.length; i++) {
+        const a = L.base[i] * L.cur, b = L.base[i] * lodCtl.scale, h = L.o.levels[i].hysteresis || 0;
+        if (d >= Math.min(a, b) * (1 - h) - 2 && d <= Math.max(a, b) + 2) { clear = false; break; }
+      }
+      if (!clear) { left++; continue; }
+      for (let i = 0; i < L.base.length; i++) L.o.levels[i].distance = L.base[i] * lodCtl.scale;
+      L.cur = lodCtl.scale;
+    }
+    lodCtl.pending = left > 0;
+  }
+  ctx.events?.on?.('perf:degrade', (p) => {
+    const lvl = Math.max(0, Math.min(LOD_SCALE.length - 1, Math.round(Number(p?.cpu) || 0)));
+    const s = LOD_SCALE[lvl];
+    if (s !== lodCtl.scale) { lodCtl.scale = s; lodCtl.pending = true; ctx.lodScale = s; }
+    post?.setBloomEvery?.(lvl >= 2 ? 2 : 1);      // (the glow of sun glints / night lights: every other frame)
+  });
+
   function hint() {
     if (perf.hinted || ctx.quality.level === 'low') return;
     perf.hinted = true;
@@ -250,20 +394,34 @@ export function createEngine(ctx, canvas) {
 
   function autoDegrade(raw, js) {
     if (shotMode || elapsed < 8 || document.hidden || qualityBusy) return;
-    if (raw <= 0 || raw > 0.5) { perf.sum = 0; perf.js = 0; perf.n = 0; return; }   // stall / tab switch: restart
+    if (raw <= 0 || raw > 0.5) { perf.sum = 0; perf.js = 0; perf.n = 0; perf.drop = 0; return; }   // stall / tab switch: restart
     if (perf.n < winRaw.length) { winRaw[perf.n] = raw; winJs[perf.n] = Math.min(js, raw); }
     perf.sum += raw; perf.js += Math.min(js, raw); perf.n++;
     if (perf.sum < 2.5) return;
     // The window's MEDIAN frame (and our median JS time): a few one-off hitches (a panel opening, a GC) must not
     // cost resolution or effects — lowering them would not help against hitches anyway, and the switch itself
-    // (render targets re-allocated) is one. Sustained slowness moves the median.
+    // (render targets re-allocated) is one. Sustained slowness moves the median — or, on a machine that alternates
+    // between 60 and 30 fps, the share of dropped frames (≥ 20 % of the window).
     const n = Math.min(perf.n, winRaw.length);
-    const avg = median(winRaw, n), share = Math.min(1, median(winJs, n) / Math.max(avg, 1e-6));
-    perf.sum = 0; perf.js = 0; perf.n = 0;
-    perf.avg = avg; perf.share = share;
+    const avg = median(winRaw, n), mjs = median(winJs, n), share = Math.min(1, mjs / Math.max(avg, 1e-6));
+    // dropped frame: 1.5 display intervals (the window's fast frames: 25 ms at 60 Hz, 30 ms at 50 Hz), and never
+    // faster than 50 fps on high-refresh displays
+    const base = Math.max(1 / 250, median(winRaw, n, 0.1));
+    const dropAt = Math.max(0.02, 1.5 * base);
+    let drops = 0;
+    for (let i = 0; i < n; i++) if (winRaw[i] > dropAt) drops++;
+    const dropFrac = drops / Math.max(1, n);
+    perf.sum = 0; perf.js = 0; perf.n = 0; perf.drop = 0;
+    perf.avg = avg; perf.share = share; perf.dropFrac = dropFrac;
     if (perf.skip > 0) { perf.skip--; return; }    // settling after a change
     const ms = (avg * 1000).toFixed(1), pct = Math.round(share * 100);
-    const kind = share >= 0.75 ? 'CPU-bound' : share >= 0.5 ? 'CPU+GPU' : 'GPU-bound';
+    // With vsync a frame whose JS misses the refresh deadline waits for the next one: 20 ms of JS shows as a 33 ms
+    // frame (share 0.6) although the GPU idles. So our JS is also compared with the display interval (the window's
+    // fast frames): JS that alone fills ≥ 80 % of it is CPU-bound — lowering the resolution would not help there
+    // (and re-allocating the render targets is a hitch of its own).
+    const cpuBound = share >= 0.75 || mjs >= 0.8 * base;
+    const kind = cpuBound ? 'CPU-bound' : share >= 0.5 ? 'CPU+GPU' : 'GPU-bound';
+    const slow = avg > 0.0175 || dropFrac >= 0.2;
     // A GPU step must pay for itself: if the frames did not get faster, the GPU was not the bottleneck (e.g. the
     // browser blocked inside GL calls) — undo it and leave the resolution alone for two minutes.
     if (perf.gpuCheck) {
@@ -276,16 +434,18 @@ export function createEngine(ctx, canvas) {
         return;
       }
     }
-    if (avg > 0.0175) {
-      perf.fast = 0;
+    if (slow) {
+      perf.fast = 0; perf.head = 0;
       if (++perf.slow < 2 && !perf.probing) return;   // a single slow window (hitch) is ignored
       perf.slow = 0; perf.vsync = 0;
       if (perf.probing) perf.probeWait = Math.min(perf.probeWait * 2, 320);
+      // stepped up on "headroom" less than 20 s ago and slow again: ask for more headroom next time
+      if (elapsed - perf.upAt < 20) perf.headNeed = Math.min(perf.headNeed * 2, 16);
       perf.probing = false;
       const L = gpuLadder();
       const canGpu = perf.gpu < L.length - 1 && elapsed >= perf.gpuBlock, canCpu = perf.cpu < CPU_MAX;
       let what = null;
-      if (share >= 0.75) what = canCpu ? 'cpu' : null;                           // CPU-bound
+      if (cpuBound) what = canCpu ? 'cpu' : null;                                // CPU-bound
       else if (share >= 0.5) what = canCpu ? 'cpu' : canGpu ? 'gpu' : null;     // both
       else what = canGpu ? 'gpu' : canCpu ? 'cpu' : null;                       // GPU-bound
       if (what === 'gpu') {
@@ -300,7 +460,7 @@ export function createEngine(ctx, canvas) {
         console.info(`[engine] average frame ${ms} ms, our JS ${pct}% of it (${kind}) — ${did.join(', ')}`);
       } else if (what === 'cpu') {
         perf.cpu++;
-        console.info(`[engine] average frame ${ms} ms, our JS ${pct}% of it (${kind}) — CPU degrade level ${perf.cpu}`);
+        console.info(`[engine] median frame ${ms} ms, ${Math.round(dropFrac * 100)}% dropped, our JS ${pct}% of it (${kind}) — CPU degrade level ${perf.cpu}: ${CPU_LEVERS[perf.cpu]}`);
       } else {
         hint();
         return;
@@ -311,19 +471,27 @@ export function createEngine(ctx, canvas) {
     }
     perf.slow = 0;
     if (perf.probing) { perf.probing = false; perf.probeWait = 20; }   // probe held: reset backoff
+    if (elapsed - perf.upAt > 60) perf.headNeed = 2;                    // stable for a minute: normal again
     if (perf.gpu === 0 && perf.cpu === 0) return;
     // on the way back up: picture quality first, then the CPU levers
-    const up = () => {
+    const up = (why) => {
       if (perf.gpu > 0) { perf.gpu--; applyLevels(); } else perf.cpu--;
-      perf.skip = 1;
+      perf.skip = 1; perf.upAt = elapsed; perf.head = 0;
+      console.info(`[engine] median frame ${ms} ms, our JS ${pct}% of it — ${why}: back to CPU level ${perf.cpu}, GPU level ${perf.gpu}`);
       emitPerf();
     };
+    // Headroom: at vsync rate with (almost) no dropped frames while our own JS uses little of the frame. With vsync
+    // the interval cannot show spare time, our JS time can: a CPU-bound laptop that got faster (plugged in, the
+    // view got simpler) comes back up within seconds instead of waiting for the next probe.
+    if (dropFrac < 0.04 && mjs < 0.55 * Math.max(avg, 1 / 60)) {
+      if (++perf.head >= perf.headNeed) { up('headroom'); return; }
+    } else perf.head = 0;
     if (avg < 0.012) {
       perf.vsync = 0;
-      if (++perf.fast >= 2) { perf.fast = 0; up(); }
+      if (++perf.fast >= 2) { perf.fast = 0; up('fast frames'); }
     } else {
       perf.fast = 0;
-      if ((perf.vsync += 2.5) >= perf.probeWait) { perf.vsync = 0; perf.probing = true; up(); }
+      if ((perf.vsync += 2.5) >= perf.probeWait) { perf.vsync = 0; perf.probing = true; up('probing'); }
     }
   }
 
@@ -506,6 +674,13 @@ export function createEngine(ctx, canvas) {
     flagAddedObjects();
     scene.updateMatrixWorld(true);
     scene.matrixAutoUpdate = false;       // (the scene root itself never moves)
+    // every top-level subtree except the lights and the sky objects env places by hand (see markStatic)
+    if (!params.has('nostatic')) {
+      for (const c of scene.children) {
+        if (c.isLight || c.isCamera || c.userData?.dynamicRoot || /^(sky|stars|moon|snow|sun|sunNear|sunTarget|sunNearTarget)$/.test(c.name || '')) continue;
+        markStatic(c);
+      }
+    }
   }
 
   // One complete frame (per-frame updates + render) while the loop is not running yet — the loading screen still
@@ -514,6 +689,13 @@ export function createEngine(ctx, canvas) {
     elapsed += dt;
     try { ctx.tick(dt, elapsed); } catch (e) { console.warn('[engine] warm-up tick failed', e); }
     renderFrame(dt);
+  }
+  // Per-frame updates only (no render), on the engine's own clock — loading-time probes (world/staticbatch.js)
+  // watch what the modules change from frame to frame.
+  function tickOnly(dt = 1 / 60) {
+    if (running) return;
+    elapsed += dt;
+    ctx.tick(dt, elapsed);
   }
   // Wait until the GPU has executed everything queued so far (shader variants, buffer / texture uploads, the warm-up
   // draws): a 1-pixel read-back is a full round trip through the command buffer.
@@ -542,10 +724,22 @@ export function createEngine(ctx, canvas) {
       o.autoUpdate = false;
       for (const l of o.levels) l.object.visible = true;
     });
-    let n = 0, unhidden = 0;
+    let n = 0, unhidden = 0, emptied = 0;
+    // (three skips a draw with nothing in it — an instanced mesh with count 0, a geometry with an empty draw range —
+    // so e.g. a tree tier or a car type that has no instance near the start view was never drawn, and ANGLE compiled
+    // its shader variant for the instanced vertex layout in the frame the first instance appeared: 0.3–1.6 s stalls
+    // at x2 CPU in the tour / walk / zoom phases. One (degenerate) instance / triangle each for this frame.)
+    const counts = [], ranges = [];
     scene.traverse((o) => {
       if (o === scene || o.isLight || o.isCamera) return;
       const drawable = o.isMesh || o.isPoints || o.isLine || o.isSprite;
+      if (o.isInstancedMesh && o.count === 0 && o.instanceMatrix?.count > 0) { counts.push(o); o.count = 1; emptied++; }
+      const g = drawable ? o.geometry : null;
+      if (g?.drawRange && g.drawRange.count === 0 && !ranges.includes(g)) {
+        const avail = g.index ? g.index.count : g.attributes?.position?.count ?? 0;
+        const need = o.isPoints ? 1 : o.isLine ? 2 : 3;
+        if (avail - g.drawRange.start >= need) { ranges.push(g); g.drawRange.count = need; emptied++; }
+      }
       if (o.visible && !(drawable && o.frustumCulled)) return;
       objs.push(o, o.visible, o.frustumCulled);
       if (!o.visible) unhidden++;
@@ -556,9 +750,13 @@ export function createEngine(ctx, canvas) {
     scene.traverse((o) => { if (o.isLight && o.castShadow && o.shadow) { lights.push(o); o.shadow.needsUpdate = true; } });
     renderer.shadowMap.needsUpdate = true;
     try { renderFrame(0); } catch (e) { console.warn('[engine] warm-up draw failed', e); }
+    // the water reflection's own target too (a separate pass; every object's first draw into it)
+    try { ctx.water?.reflection?.warm?.(true); } catch (e) { console.warn('[engine] reflection warm-up failed', e); }
     for (let i = 0; i < objs.length; i += 3) { objs[i].visible = objs[i + 1]; objs[i].frustumCulled = objs[i + 2]; }
     for (const { o, auto, vis } of lods) { o.autoUpdate = auto; o.levels.forEach((l, i) => { l.object.visible = vis[i]; }); }
-    return { objects: n, unhidden, lods: lods.length, calls: frameInfo.calls, triangles: frameInfo.triangles };
+    for (const o of counts) o.count = 0;
+    for (const g of ranges) g.drawRange.count = 0;
+    return { objects: n, unhidden, emptied, lods: lods.length, calls: frameInfo.calls, triangles: frameInfo.triangles };
   }
 
   const engine = {
@@ -671,6 +869,7 @@ export function createEngine(ctx, canvas) {
       return { frames: Math.round(t1 - t0), everything: Math.round(t2 - t1), settle: Math.round(performance.now() - t2), programs, ...all };
     },
     hiddenFrame,
+    tickOnly,
     gpuSync,
     resize,
     get postActive() { return !!post; },

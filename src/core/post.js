@@ -21,10 +21,17 @@ class SoftBloomPass extends UnrealBloomPass {
     super(resolution, strength, radius, threshold);
     this.highPassUniforms.smoothWidth.value = 0.8;
     this.output = this.renderTargetsHorizontal[0].texture;
+    this.every = 1;          // re-render the glow every n-th frame (engine CPU degrade: its 12 passes are draw calls)
+    this.frameN = 0;
+    this.valid = false;      // output holds a glow (not right after a resize)
   }
+  setSize(width, height) { super.setSize(width, height); this.valid = false; }
   // Same as UnrealBloomPass.render minus the final additive blend into readBuffer.
   render(renderer, writeBuffer, readBuffer) {
     if (this.strength <= 0.001) return;
+    // (on a skipped frame the previous glow stays: it trails the sun glints / lights by one frame)
+    if (this.every > 1 && this.valid && (++this.frameN % this.every) !== 0) return;
+    this.valid = true;
     renderer.getClearColor(this._oldClearColor);
     this.oldClearAlpha = renderer.getClearAlpha();
     const oldAutoClear = renderer.autoClear;
@@ -383,6 +390,7 @@ export function createPost(renderer, scene, camera, { width, height, samples = 4
     get aoEnabled() { return final.aoEnabled; },
     setAO(on) { final.aoEnabled = !!on; },
     setBloom(on) { bloom.enabled = !!on; },
+    setBloomEvery(n) { bloom.every = Math.max(1, Math.round(n) || 1); },
     // Night lights glow, daylight only blooms the sun / hot specular glints (a touch more glare when the solar disc
     // itself is on screen).
     setNight(nf, sunGlare = false) {

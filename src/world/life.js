@@ -491,6 +491,10 @@ export async function createLife(ctx) {
   const pS = new Float32Array(nWalk), pSpeed = new Float32Array(nWalk), pLat = new Float32Array(nWalk);
   const pYaw = new Float32Array(nPeople), pScale = new Float32Array(nPeople);
   const pX = new Float32Array(nWalk), pZ = new Float32Array(nWalk);   // current positions (debug / probes)
+  // Walkers that were not drawn last frame (out of view, casting no shadow into it) are simulated at a lower rate
+  // with the accumulated time — nobody sees them move. Each frame a cheap check at their last position still
+  // catches the ones the camera turned towards: those are updated (and drawn) right away.
+  const pY = new Float32Array(nWalk), pAcc = new Float32Array(nWalk), pDrawn = new Uint8Array(nWalk).fill(1);
   const standMat = new Float32Array(Math.max(1, standers.length) * 16);
   const tmpP0 = { x: 0, z: 0, dx: 0, dz: 0, t: 0 };
   for (let i = 0; i < nWalk; i++) {
@@ -573,6 +577,9 @@ export async function createLife(ctx) {
   // Walkers far from what the camera looks at are moved to a sidewalk / path near it (rate-limited, never popping
   // into view close by), so the crowd follows the viewer around the 4 km map instead of thinning out over it.
   const PED_KEEP = q.level === 'low' ? 260 : 380, PED_SPAWN = [45, q.level === 'low' ? 230 : 330];
+  // out-of-view NPCs: simulated every npcSlow-th frame (CPU degrade level 1+: every 4th)
+  let npcFrame = 0, npcSlow = 2;
+  ctx.events?.on?.('perf:degrade', (ev) => { npcSlow = (Number(ev?.cpu) || 0) >= 1 ? 4 : 2; });
   const recycle = [];
   const P_ATTRS = [pAttr.shirt, pAttr.pants, pAttr.look, pAttr.anim]; // (per-frame upload ranges: no array literals in the loop)
   function respawnPed(i) {
@@ -593,15 +600,19 @@ export async function createLife(ctx) {
     }
     return false;
   }
-  function updatePeople(dt) {
+  function updatePeople(dt0) {
     const arr = pMesh.instanceMatrix.array;
     let c = 0;
     recycle.length = 0;
+    npcFrame++;
     for (let i = 0; i < nWalk; i++) {
       {
         const fx = pX[i] - focus.x, fz = pZ[i] - focus.z;
-        if (fx * fx + fz * fz > PED_KEEP * PED_KEEP && recycle.length < 12) { recycle.push(i); continue; }
+        if (fx * fx + fz * fz > PED_KEEP * PED_KEEP && recycle.length < 12) { recycle.push(i); pAcc[i] = 0; pDrawn[i] = 1; continue; }
       }
+      let dt = dt0;
+      if (!pDrawn[i] && (npcFrame + i) % npcSlow !== 0 && pAcc[i] < 0.5 && !personShown(pX[i], pY[i], pZ[i])) { pAcc[i] += dt0; continue; }
+      dt += pAcc[i]; pAcc[i] = 0;
       let e = pedEdges[pEdge[i]];
       pS[i] += pSpeed[i] * dt;
       let guard = 0;
@@ -631,8 +642,9 @@ export async function createLife(ctx) {
       const lat = Math.min(pLat[i], e.halfW);
       const x = tmpP.x - Math.cos(pYaw[i]) * lat, z = tmpP.z + Math.sin(pYaw[i]) * lat;
       const y = e.ys ? e.ys[k - 1] + (e.ys[k] - e.ys[k - 1]) * tmpP.t : groundAt(ctx, x, z);
-      pX[i] = x; pZ[i] = z;
-      if (!personShown(x, y, z)) continue;
+      pX[i] = x; pZ[i] = z; pY[i] = y;
+      if (!personShown(x, y, z)) { pDrawn[i] = 0; continue; }
+      pDrawn[i] = 1;
       const s = pScale[i];
       composeMatrix(arr, c * 16, x, y, z, pYaw[i], s, s, s);
       putPerson(c++, i);
@@ -708,6 +720,7 @@ export async function createLife(ctx) {
   const cCol = new Float32Array(Math.max(1, N) * 3);
   const typeNames = ['sedan', 'suv', 'pickup', 'bus'];
   const carLen = new Float32Array(N);
+  const cY = new Float32Array(N), cAcc = new Float32Array(N), cDrawn = new Uint8Array(N).fill(1);   // (see pDrawn)
 
   function pickNextEdge(i, node, fromEdge, hx, hz) {
     const list = rNodes[node].edges;
@@ -899,15 +912,30 @@ export async function createLife(ctx) {
       ca.clearUpdateRanges(); ca.addUpdateRange(0, c * 3); ca.needsUpdate = true;
     }
   }
-  function updateCars(dt) {
+  // spatial hash of the cars (built once per frame) for the car-following check — it was an all-pairs loop
+  const CAR_CELL = 40, CAR_HASH = 1023;
+  const carHead = new Int32Array(CAR_HASH + 1), carNext = new Int32Array(Math.max(1, N));
+  const carHash = (gx, gz) => ((gx * 73856093) ^ (gz * 19349663)) & CAR_HASH;
+  function updateCars(dt0) {
     const night = ctx.env?.state?.nightFactor ?? 0;
     for (let t = 0; t < 4; t++) { fillN[t] = 0; fillF[t] = 0; }
+    carHead.fill(-1);
+    for (let j = 0; j < N; j++) { const h = carHash(Math.floor(cX[j] / CAR_CELL), Math.floor(cZ[j] / CAR_CELL)); carNext[j] = carHead[h]; carHead[h] = j; }
     let nPool = 0, moved = 0;
     for (let i = 0; i < N; i++) {
       if (cType[i] !== 3 && moved < 6) {
         const fx = cX[i] - focus.x, fz = cZ[i] - focus.z;
-        if (fx * fx + fz * fz > CAR_KEEP * CAR_KEEP && spawnCarNear(i)) moved++;
+        if (fx * fx + fz * fz > CAR_KEEP * CAR_KEEP && spawnCarNear(i)) { moved++; cAcc[i] = 0; cDrawn[i] = 1; }
       }
+      let dt = dt0;
+      if (!cDrawn[i] && (npcFrame + i) % npcSlow !== 0 && cAcc[i] < 0.5) {
+        // out of view last frame and not due: skipped unless it would be drawn at its last position now
+        const bus = cType[i] === 3, x = cX[i], y = cY[i], z = cZ[i];
+        const ddx = x - cam.x, ddy = y - cam.y, ddz = z - cam.z, d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+        const vis = d2 < CAR_FAR2 && cull.inView(x, y + 1, z, bus ? 7.5 : 3.5);
+        if (!vis && !(d2 < CAR_NEAR2 && shadows && cull.inShadow(x, y, z, bus ? 9 : 5))) { cAcc[i] += dt0; continue; }
+      }
+      dt += cAcc[i]; cAcc[i] = 0;
       const e = rEdges[cE[i]];
       // ---- target speed: road class, curvature ahead, car ahead, bus stops
       let vt = cType[i] === 3 ? Math.min(e.vmax, 10.5) : e.vmax;
@@ -918,15 +946,20 @@ export async function createLife(ctx) {
       vt *= Math.max(0.3, 1 - curve * 1.1);
       const hx = cHX[i], hz = cHZ[i];
       const xi = cX[i], zi = cZ[i], li = carLen[i];
-      for (let j = 0; j < N; j++) {
-        if (j === i) continue;
-        const dx = cX[j] - xi, dz = cZ[j] - zi;
-        const along = dx * hx + dz * hz;
-        if (along <= 0 || along > 28) continue;
-        const side = Math.abs(dx * hz - dz * hx);
-        if (side > 1.8 || hx * cHX[j] + hz * cHZ[j] < 0.3) continue;
-        const gap = along - (carLen[j] + li) / 2 - 2.5;
-        vt = Math.min(vt, Math.max(0, gap * 0.9));
+      // cars ahead within 28 m: only the 3×3 grid cells around (see carGrid; cells are 40 m, so a car that moved a
+      // little since the grid was built is still found)
+      const gx = Math.floor(xi / CAR_CELL), gz = Math.floor(zi / CAR_CELL);
+      for (let ox = -1; ox <= 1; ox++) for (let oz = -1; oz <= 1; oz++) {
+        for (let j = carHead[carHash(gx + ox, gz + oz)]; j >= 0; j = carNext[j]) {
+          if (j === i) continue;
+          const dx = cX[j] - xi, dz = cZ[j] - zi;
+          const along = dx * hx + dz * hz;
+          if (along <= 0 || along > 28) continue;
+          const side = Math.abs(dx * hz - dz * hx);
+          if (side > 1.8 || hx * cHX[j] + hz * cHZ[j] < 0.3) continue;
+          const gap = along - (carLen[j] + li) / 2 - 2.5;
+          vt = Math.min(vt, Math.max(0, gap * 0.9));
+        }
       }
       if (cType[i] === 3) {
         cStopCool[i] = Math.max(0, cStopCool[i] - dt);
@@ -968,12 +1001,14 @@ export async function createLife(ctx) {
       cX[i] = x; cZ[i] = z;
       routePoint(i, cS[i]);
       const y = routeY(x, z);
+      cY[i] = y;
       // ---- visibility / LOD (only instances in view, or casting a shadow into it, are drawn)
       const bus = cType[i] === 3;
       const ddx = x - cam.x, ddy = y - cam.y, ddz = z - cam.z, d2 = ddx * ddx + ddy * ddy + ddz * ddz;
       const vis = d2 < CAR_FAR2 && cull.inView(x, y + 1, z, bus ? 7.5 : 3.5);
       const near = d2 < CAR_NEAR2 && (vis || (shadows && cull.inShadow(x, y, z, bus ? 9 : 5)));
-      if (!near && !vis) continue;
+      if (!near && !vis) { cDrawn[i] = 0; continue; }
+      cDrawn[i] = 1;
       const t = cType[i];
       const m = near || bus ? vNear[t] : vFar[t];
       const slot = near || bus ? fillN[t]++ : fillF[t]++;

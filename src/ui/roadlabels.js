@@ -617,7 +617,8 @@ export function createRoadLabels(ctx, { root, labels, before = null }) {
       // line of sight against buildings and hills (cached, a few fresh tests per pass; a result stays valid while
       // the camera has not moved — the world is static)
       const cp = cam.position;
-      if (clock - a.occT > OCC_TTL && Math.abs(cp.x - a.ocx) + Math.abs(cp.y - a.ocy) + Math.abs(cp.z - a.ocz) > 0.3) {
+      // never-tested anchors (occ -1) must be tested; NaN positions would otherwise make "moved" always false
+      if (a.occ === -1 || (clock - a.occT > OCC_TTL && Math.abs(cp.x - a.ocx) + Math.abs(cp.y - a.ocy) + Math.abs(cp.z - a.ocz) > 0.3)) {
         if (occBudget <= 0) continue;
         occBudget--;
         a.occ = occluded(a, cam) ? 1 : 0;

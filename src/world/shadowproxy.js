@@ -10,7 +10,8 @@
 // (three tests layers against the main camera in the shadow pass too, so a shadow-only layer would not work.)
 // Not merged (they keep casting themselves): instanced / skinned meshes, alpha-tested or displaced materials,
 // custom depth materials, multi-material meshes, anything inside a THREE.LOD, anything hidden right now (distance-
-// or season-toggled parts) and anything flagged userData.noShadowProxy (on the object or an ancestor).
+// or season-toggled parts) and anything flagged userData.noShadowProxy or userData.dynamic (on the object or an
+// ancestor; staticbatch.js probeDynamic flags what it sees changing by day / night).
 import * as THREE from 'three';
 
 const CELL = 500;
@@ -36,7 +37,7 @@ export function buildShadowProxies(ctx, roots) {
   let sources = 0;
   const _v = new THREE.Vector3(), _c = new THREE.Vector3();
   const walk = (o, ok) => {
-    ok = ok && o.visible && !o.isLOD && !o.userData?.noShadowProxy;
+    ok = ok && o.visible && !o.isLOD && !o.userData?.noShadowProxy && !o.userData?.dynamic;
     if (!ok) return;
     if (qualifies(o)) {
       const g = o.geometry;

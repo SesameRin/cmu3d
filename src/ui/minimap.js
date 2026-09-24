@@ -62,12 +62,17 @@ export function createMinimap(ctx, { root, catalog, getSelected, toast }) {
   const levelImgs = new Map();     // level → { c, x0, z0, mpp, dpr, w, h } covering the whole map
   const buf = { c: document.createElement('canvas'), x0: 0, z0: 0, mpp: 0, dpr: 0, w: 0, h: 0, valid: false };
   const names = { c: document.createElement('canvas'), cx: NaN, cz: NaN, mpp: 0, cw: 0, ch: 0, dpr: 0, t: -1e9 };
-  const NAMES_MS = 160;
   let lmRecs = null, lmN = -1;     // the catalogue's landmark records (dots)
   let prevFx = NaN, prevFz = NaN;
   const lastSig = new Float64Array(10).fill(NaN);
   let lastDraw = -1e9;
-  const DRAW_MS = 32;
+  // redraw interval per CPU degrade level (engine 'perf:degrade'): ~30 → 20 → 12 → 8 Hz; road names likewise
+  const DRAW_MS_L = [32, 50, 83, 125], NAMES_MS_L = [160, 250, 400, 600];
+  let DRAW_MS = DRAW_MS_L[0], NAMES_MS = NAMES_MS_L[0];
+  ctx.events?.on?.('perf:degrade', (e) => {
+    const l = Math.max(0, Math.min(DRAW_MS_L.length - 1, Math.round(Number(e?.cpu) || 0)));
+    DRAW_MS = DRAW_MS_L[l]; NAMES_MS = NAMES_MS_L[l];
+  });
   let dirty = true;
 
   function applyState() {

@@ -477,6 +477,78 @@ export function createUI(ctx) {
     setTimeout(() => safe('welcome', showWelcomeCard), force ? 300 : 1400);
   }
 
+  // Chrome compiles its own (Skia) GPU programs the first time a kind of page content is rasterized or composited —
+  // a text shadow, a gradient pin, a rotated road name, a frosted panel… On a slow CPU each took 0.3–1.2 s, in the
+  // middle of exploring (the first lawn label on screen, the first tour card). Loading time: one of every label
+  // style (plain / flipped / hovered), the road-name ranks (level and rotated) and the floating panels are shown
+  // for a few frames above the loading screen at 2 % opacity, then removed.
+  async function warmRaster() {
+    if (params.has('noui') || params.has('shot')) return;
+    const layer = document.createElement('div');
+    layer.setAttribute('aria-hidden', 'true');
+    layer.style.cssText = 'position:fixed;inset:0;z-index:2147483000;pointer-events:none;overflow:hidden';
+    let i = 0;
+    const W = Math.max(400, innerWidth - 260), H = Math.max(300, innerHeight - 120);
+    const add = (el, extra = '') => {
+      // (labels sit on half pixels: both whole and half offsets)
+      const x = 40 + ((i * 173) % W) + (i % 2) * 0.5, y = 50 + ((Math.floor(i / 6) * 61) % H) + (i % 3 === 0 ? 0.5 : 0);
+      i++;
+      el.style.position = 'absolute'; el.style.left = '0'; el.style.top = '0'; el.style.display = 'block';
+      el.style.opacity = '0.02'; el.style.pointerEvents = 'none';
+      el.style.transform = `translate3d(${x}px,${y}px,0)${extra}`;
+      layer.appendChild(el);
+    };
+    const per = new Map();
+    for (const el of root.querySelectorAll('.lbl')) {
+      const n = per.get(el.className) || 0;
+      if (n >= 2) continue;
+      per.set(el.className, n + 1);
+      for (const v of ['', 'flip', 'hover']) {
+        const c = el.cloneNode(true);
+        if (v) c.classList.add(v);
+        add(c);
+      }
+      // a label hanging below its anchor with a long stem is a tall layer (several raster tiles): its own programs
+      if (el.classList.contains('lbl-landmark')) {
+        for (const stem of [48, 160, 420]) {
+          const c = el.cloneNode(true);
+          c.classList.add('flip');
+          c.style.setProperty('--stem', `${stem}px`);
+          add(c);
+        }
+      }
+    }
+    for (const r of ['r1', 'r2', 'r3', 'rt']) {
+      for (const deg of [0, 17.5, -31]) {
+        const c = document.createElement('div');
+        c.className = `rlbl ${r}`;
+        const inner = document.createElement('div');
+        inner.className = 'rlbl-in';
+        inner.innerHTML = '<b>福布斯大道</b><small>Forbes Ave</small>';
+        c.appendChild(inner);
+        add(c, deg ? ` rotate(${deg}deg)` : '');
+      }
+    }
+    for (const [sel, cls] of [['.tooltip', 'show'], ['.loc', 'show'], ['.tour', 'open'], ['.walk-hint', 'show']]) {
+      const el = root.querySelector(sel);
+      if (!el) continue;
+      const c = el.cloneNode(true);
+      c.classList.add(cls);
+      c.removeAttribute('id');
+      add(c);
+    }
+    // a toast (frosted pill; e.g. the "lower quality" hint appears in the middle of exploring) — in and fading out
+    for (const cls of ['in', 'out']) {
+      const t = document.createElement('div');
+      t.className = `toast ${cls}`;
+      t.innerHTML = `<span class="toast-ico">${icon('warn')}</span><span>画面较卡 · 可在「设置 → 画质」中选择较低画质</span>`;
+      add(t);
+    }
+    root.appendChild(layer);
+    await new Promise((res) => { let k = 0; const f = () => (++k >= 4 ? res() : requestAnimationFrame(f)); requestAnimationFrame(f); setTimeout(res, 800); });
+    layer.remove();
+  }
+
   // ---------------------------------------------------------------- public API
   ctx.ui = {
     // Loading time (main.js): everything the first minutes of exploring would otherwise build lazily — label boxes
@@ -495,6 +567,7 @@ export function createUI(ctx) {
         void info.el.offsetHeight;
         info.hide(true);
       });
+      try { await warmRaster(); } catch (e) { console.warn('[ui] raster warm-up failed', e); }
       detail?.('拾取网格');
       try { await picking?.prepare?.(() => ctx.yield()); } catch (e) { console.warn('[ui] pick grids failed', e); }
       detail?.('');

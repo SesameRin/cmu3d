@@ -50,6 +50,7 @@
 // orbit at its last sane pose.
 import * as THREE from 'three';
 import { pointInRing } from '../core/heightfield.js';
+import { firstPickHit } from '../ui/raycast.js';
 import { createOrbit, ORBIT_LIMITS } from './orbit.js';
 import { createWalk, WALK } from './walk.js';
 import { createFly, FLY } from './fly.js';
@@ -292,15 +293,17 @@ function createWorld(ctx) {
   function pickRay(origin, dirN, maxDist, out) {
     let best = rayTerrain(origin, dirN, maxDist, out);
     let bestD = best ? best.distanceTo(origin) : maxDist;
-    const objs = ctx.pick?.objects?.() || [];
     const walk = ctx.walkables?.meshes || [];
-    if (objs.length || walk.length) {
+    if (ctx.pick?.items?.size || walk.length) {
       sceneRay.set(origin, dirN);
       sceneRay.near = 0;
       sceneRay.far = bestD;
       sceneHits.length = 0;
       try {
-        if (objs.length) sceneRay.intersectObjects(objs, true, sceneHits);
+        // pickable scene: the picking raycaster (per-mesh triangle grids — the merged building / landmark batches
+        // are too big for a brute-force three raycast at the start of every zoom burst)
+        const h = ctx.pick?.items?.size ? firstPickHit(ctx, sceneRay) : null;
+        if (h && h.distance < bestD) { bestD = h.distance; best = out.copy(h.point); sceneRay.far = bestD; }
         if (walk.length) sceneRay.intersectObjects(walk, false, sceneHits);
       } catch (err) { console.warn('[controls] scene raycast failed', err); }
       for (const h of sceneHits) if (h.distance < bestD) { bestD = h.distance; best = out.copy(h.point); }
