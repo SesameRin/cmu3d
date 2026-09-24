@@ -7,7 +7,7 @@
 //    canopies, ledges and storefront cornices (building surface buffer), bay windows, mansard dormers, fire escapes.
 import * as THREE from 'three';
 import { pointInRing } from '../core/heightfield.js';
-import { emitQuad, emitFrameBox, emitWalls, emitCap, emitRingWall, signedArea, offsetRing } from './building-geometry.js';
+import { emitQuad, emitFrameBox, emitWalls, emitCap, emitRingWall, signedArea, offsetRing, setBounds } from './building-geometry.js';
 import { businessStyle, signText, GENERIC_SIGNS } from './signage.js';
 
 const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
@@ -43,12 +43,13 @@ export function createStreetIndex(data) {
       }
     }
   }
+  let stamp = 0; // (a segment spanning several cells is visited once per query)
   function each(x, z, r, fn) {
-    const seen = new Set();
+    const q = ++stamp;
     for (let gx = Math.floor((x - r) / G); gx <= Math.floor((x + r) / G); gx++) {
       for (let gz = Math.floor((z - r) / G); gz <= Math.floor((z + r) / G); gz++) {
         const list = grid.get(gx + ',' + gz);
-        if (list) for (const s of list) if (!seen.has(s)) { seen.add(s); fn(s); }
+        if (list) for (const s of list) if (s.q !== q) { s.q = q; fn(s); }
       }
     }
   }
@@ -180,7 +181,7 @@ export function runFrontage(run, street, fp, selfId, parentId = null) {
 
 // ---------------------------------------------------------------- businesses
 export const SHOP_POI = new Set(['restaurant', 'cafe', 'fast_food', 'bank', 'bar', 'pub', 'pharmacy', 'shop', 'ice_cream', 'atm']);
-const NOT_BUSINESS = /^\d|square\b|apartments?|hall\b|building|house\b|center|centre|church|institute|school|tower|garage|parking|university|college|library|museum|hospital|office|dorm|residence|lofts?\b|annex|laborator|chapel|temple|synagogue|condominium|court\b|place\b|plaza\b/i;
+const NOT_BUSINESS = /^\d|armory|cathedral|orthodox|academy|mansions?\b|maintenance|commons\b|carousel|mikvah|boiler|plant\b|ministr|parish|salvation army|club\b|funeral|caring|health care|square\b|apartments?|hall\b|building|house\b|center|centre|church|institute|school|tower|garage|parking|university|college|library|museum|hospital|office|dorm|residence|lofts?\b|annex|laborator|chapel|temple|synagogue|condominium|court\b|place\b|plaza\b/i;
 
 // Named shop POIs inside / at the walls of the building; else a business-like building name.
 export function findBusinesses(b, ring, shopPois, nearDist = 6) {
@@ -299,46 +300,72 @@ export function planStorefronts({ b, runs, fronts, businesses, mode, bay = 6, se
 
 // ---------------------------------------------------------------- atlas buffers (signs, blades, café furniture)
 export class AtlasBuffer {
-  constructor() { this.p = []; this.n = []; this.uv = []; this.idx = []; }
-  get empty() { return this.idx.length === 0; }
-  _v(x, y, z, nx, ny, nz, u, v) { this.p.push(x, y, z); this.n.push(nx, ny, nz); this.uv.push(u, v); return this.p.length / 3 - 1; }
+  constructor(cap = 1024) {
+    this.nv = 0; this.ni = 0; this.tris = 0;
+    this.p = new Float32Array(cap * 3); this.n = new Float32Array(cap * 3); this.uv = new Float32Array(cap * 2); this.idx = new Uint32Array(cap * 2);
+  }
+  get empty() { return this.ni === 0; }
+  _grow(nv, ni) {
+    if (this.nv + nv > this.p.length / 3) {
+      const cap = Math.max(this.p.length / 3 * 2, this.nv + nv);
+      const P = new Float32Array(cap * 3); P.set(this.p); this.p = P;
+      const N = new Float32Array(cap * 3); N.set(this.n); this.n = N;
+      const U = new Float32Array(cap * 2); U.set(this.uv); this.uv = U;
+    }
+    if (this.ni + ni > this.idx.length) { const I = new Uint32Array(Math.max(this.idx.length * 2, this.ni + ni)); I.set(this.idx); this.idx = I; }
+  }
+  _v(x, y, z, nx, ny, nz, u, v) {
+    const k = this.nv++;
+    const p = this.p, n = this.n, t = this.uv;
+    p[k * 3] = x; p[k * 3 + 1] = y; p[k * 3 + 2] = z;
+    n[k * 3] = nx; n[k * 3 + 1] = ny; n[k * 3 + 2] = nz;
+    t[k * 2] = u; t[k * 2 + 1] = v;
+    return k;
+  }
+  _t(a, b, c) { const I = this.idx, j = this.ni; I[j] = a; I[j + 1] = b; I[j + 2] = c; this.ni = j + 3; }
   // P: 4 points CCW seen from the front; UV: 4 [u, v] (or one [u, v] for all)
   quad(P, UV, double = false) {
     const [a, b, c] = P;
     const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2], vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
     let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
     const l = Math.hypot(nx, ny, nz) || 1; nx /= l; ny /= l; nz /= l;
-    const uvAt = (k) => (Array.isArray(UV[0]) ? UV[k] : UV);
-    const i = P.map((p, k) => this._v(p[0], p[1], p[2], nx, ny, nz, uvAt(k)[0], uvAt(k)[1]));
-    this.idx.push(i[0], i[1], i[2], i[0], i[2], i[3]);
+    const one = !Array.isArray(UV[0]);
+    this._grow(double ? 8 : 4, double ? 12 : 6);
+    const b0 = this.nv;
+    for (let k = 0; k < 4; k++) { const q = P[k], w = one ? UV : UV[k]; this._v(q[0], q[1], q[2], nx, ny, nz, w[0], w[1]); }
+    this._t(b0, b0 + 1, b0 + 2); this._t(b0, b0 + 2, b0 + 3);
     if (double) {
-      const j = P.map((p, k) => this._v(p[0], p[1], p[2], -nx, -ny, -nz, uvAt(k)[0], uvAt(k)[1]));
-      this.idx.push(j[0], j[2], j[1], j[0], j[3], j[2]);
+      for (let k = 0; k < 4; k++) { const q = P[k], w = one ? UV : UV[k]; this._v(q[0], q[1], q[2], -nx, -ny, -nz, w[0], w[1]); }
+      this._t(b0 + 4, b0 + 6, b0 + 5); this._t(b0 + 4, b0 + 7, b0 + 6);
     }
   }
   tri(A, B, C, uv, double = false) { this.quad([A, B, C, C], uv, double); }
-  // oriented box in a wall frame (s along, d out, y up), solid colour uv; faces: sides + top (+ bottom)
-  box(f, s0, s1, d0, d1, y0, y1, uv, bottom = false) {
-    const P = (s, d, y) => [f.ox + f.tx * s + f.nx * d, y, f.oz + f.tz * s + f.nz * d];
-    const q = (a, b, c, d) => this.quad([a, b, c, d], uv);
-    // winding: choose per face by the outward direction (quad() derives the normal from the winding)
-    const face = (pts, out) => {
-      const [a, b, c] = pts;
-      const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2], vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
-      const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
-      if (nx * out[0] + ny * out[1] + nz * out[2] < 0) pts.reverse();
-      q(...pts);
-    };
-    const T = [f.tx, 0, f.tz], N = [f.nx, 0, f.nz];
-    face([P(s0, d1, y0), P(s1, d1, y0), P(s1, d1, y1), P(s0, d1, y1)], N);
-    face([P(s0, d0, y0), P(s1, d0, y0), P(s1, d0, y1), P(s0, d0, y1)], N.map((v) => -v));
-    face([P(s1, d0, y0), P(s1, d1, y0), P(s1, d1, y1), P(s1, d0, y1)], T);
-    face([P(s0, d0, y0), P(s0, d1, y0), P(s0, d1, y1), P(s0, d0, y1)], T.map((v) => -v));
-    face([P(s0, d0, y1), P(s1, d0, y1), P(s1, d1, y1), P(s0, d1, y1)], [0, 1, 0]);
-    if (bottom) face([P(s0, d0, y0), P(s1, d0, y0), P(s1, d1, y0), P(s0, d1, y0)], [0, -1, 0]);
+  // one solid-colour face (4 corners in any rotational order) wound so that its normal is (nx, ny, nz)
+  _face(ax, ay, az, bx, by, bz, cx, cy, cz, dx, dy, dz, nx, ny, nz, u, v) {
+    this._grow(4, 6);
+    const k = this.nv;
+    this._v(ax, ay, az, nx, ny, nz, u, v); this._v(bx, by, bz, nx, ny, nz, u, v);
+    this._v(cx, cy, cz, nx, ny, nz, u, v); this._v(dx, dy, dz, nx, ny, nz, u, v);
+    const ux = bx - ax, uy = by - ay, uz = bz - az, vx = cx - ax, vy = cy - ay, vz = cz - az;
+    const s = (uy * vz - uz * vy) * nx + (uz * vx - ux * vz) * ny + (ux * vy - uy * vx) * nz;
+    if (s >= 0) { this._t(k, k + 1, k + 2); this._t(k, k + 2, k + 3); } else { this._t(k, k + 2, k + 1); this._t(k, k + 3, k + 2); }
+  }
+  // Oriented box in a wall frame (s along, d out, y up), solid colour uv. Faces: 4 sides + top (+ bottom); skip =
+  // { back, top } drops faces that sit against a wall / under a ledge.
+  box(f, s0, s1, d0, d1, y0, y1, uv, bottom = false, skip = null) {
+    const tx = f.tx, tz = f.tz, nx = f.nx, nz = f.nz, ox = f.ox, oz = f.oz;
+    const X = (s, d) => ox + tx * s + nx * d, Z = (s, d) => oz + tz * s + nz * d;
+    const x00 = X(s0, d0), z00 = Z(s0, d0), x10 = X(s1, d0), z10 = Z(s1, d0), x11 = X(s1, d1), z11 = Z(s1, d1), x01 = X(s0, d1), z01 = Z(s0, d1);
+    const u = uv[0], v = uv[1];
+    this._face(x01, y0, z01, x11, y0, z11, x11, y1, z11, x01, y1, z01, nx, 0, nz, u, v);             // front (d1)
+    if (!skip?.back) this._face(x00, y0, z00, x10, y0, z10, x10, y1, z10, x00, y1, z00, -nx, 0, -nz, u, v); // back (d0)
+    this._face(x10, y0, z10, x11, y0, z11, x11, y1, z11, x10, y1, z10, tx, 0, tz, u, v);            // s1 end
+    this._face(x00, y0, z00, x01, y0, z01, x01, y1, z01, x00, y1, z00, -tx, 0, -tz, u, v);          // s0 end
+    if (!skip?.top) this._face(x00, y1, z00, x10, y1, z10, x11, y1, z11, x01, y1, z01, 0, 1, 0, u, v);
+    if (bottom) this._face(x00, y0, z00, x10, y0, z10, x11, y0, z11, x01, y0, z01, 0, -1, 0, u, v);
   }
   // polygon (3 or 4 points) wound so that its normal agrees with out
-  _face(pts, out, uv, double = false) {
+  _poly(pts, out, uv, double = false) {
     const [a, b, c] = pts;
     const ux = b[0] - a[0], uy = b[1] - a[1], uz = b[2] - a[2], vx = c[0] - a[0], vy = c[1] - a[1], vz = c[2] - a[2];
     const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
@@ -351,32 +378,60 @@ export class AtlasBuffer {
       const a0 = (k / seg) * Math.PI * 2, a1 = ((k + 1) / seg) * Math.PI * 2, am = (a0 + a1) / 2;
       const A = [cx + Math.cos(a0) * r, y0, cz + Math.sin(a0) * r], B = [cx + Math.cos(a1) * r, y0, cz + Math.sin(a1) * r];
       const A1 = [A[0], y1, A[2]], B1 = [B[0], y1, B[2]];
-      this._face([A, B, B1, A1], [Math.cos(am), 0, Math.sin(am)], uv);
-      if (top) this._face([[cx, y1, cz], A1, B1], [0, 1, 0], uv);
-      if (bottom) this._face([[cx, y0, cz], A, B], [0, -1, 0], uv);
+      this._poly([A, B, B1, A1], [Math.cos(am), 0, Math.sin(am)], uv);
+      if (top) this._poly([[cx, y1, cz], A1, B1], [0, 1, 0], uv);
+      if (bottom) this._poly([[cx, y0, cz], A, B], [0, -1, 0], uv);
     }
   }
   toMesh(material, name) {
     if (this.empty) return null;
-    const g = new THREE.BufferGeometry();
-    g.setAttribute('position', new THREE.Float32BufferAttribute(this.p, 3));
-    g.setAttribute('normal', new THREE.Float32BufferAttribute(this.n, 3));
-    g.setAttribute('uv', new THREE.Float32BufferAttribute(this.uv, 2));
-    g.setIndex(this.p.length / 3 > 65535 ? new THREE.Uint32BufferAttribute(this.idx, 1) : new THREE.Uint16BufferAttribute(this.idx, 1));
-    g.computeBoundingSphere(); g.computeBoundingBox();
+    const nv = this.nv, g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(this.p.slice(0, nv * 3), 3));
+    g.setAttribute('normal', new THREE.BufferAttribute(this.n.slice(0, nv * 3), 3));
+    g.setAttribute('uv', new THREE.BufferAttribute(this.uv.slice(0, nv * 2), 2));
+    g.setIndex(new THREE.BufferAttribute(nv > 65535 ? this.idx.slice(0, this.ni) : Uint16Array.from(this.idx.subarray(0, this.ni)), 1));
+    setBounds(g, this.p, nv);
     const m = new THREE.Mesh(g, material);
     m.name = name;
     // thin boards / small furniture: receive shadows only (casting would add a draw per shadow pass for little gain)
     m.castShadow = false; m.receiveShadow = true;
     m.matrixAutoUpdate = false; m.updateMatrix();
-    this.tris = this.idx.length / 3;
+    this.tris = this.ni / 3;
     this.p = this.n = this.uv = this.idx = null;
     return m;
   }
 }
 
+const HIDDEN_BACK_TOP = { back: true, top: true };
+
 // Screen-right direction on a vertical face with horizontal normal (nx, nz): text runs this way.
 const rightOf = (nx, nz) => [nz, -nx];
+
+// Fascia sign of one storefront group: cleaned text, board width / height (m). main = the group's longest straight piece.
+function signSize(biz, st, main, f, near) {
+  const text = signText(st.text || biz.name);
+  const bh = clamp(0.74 * f, 0.55, 0.8);
+  const bw = Math.min(main.len - (st.blade && !biz.generic && near ? 2.2 : 0.2), biz.fromName ? 12 : 9, Math.max(2.4, text.length * bh * 0.62 + 1.2));
+  return { text, bw, bh };
+}
+
+// Register the atlas cells (fascia boards, blade signs) that emitStorefrontRun will draw for this run — the atlas is
+// packed before the (lazy) detail pass runs. Same selection rules as emitStorefrontRun.
+export function requestStorefrontSigns({ plan, shopH, signage, near }) {
+  const f = shopH / 4.5;
+  for (const grp of plan.groups) {
+    const biz = grp.biz;
+    if (!biz) continue;
+    const segs = runSegs(plan.run, grp.s0 + 0.4, grp.s1 - 0.4);
+    if (!segs.length) continue;
+    const main = segs.reduce((p, q) => (q.len > p.len ? q : p));
+    const st = businessStyle(biz);
+    const { text, bw } = signSize(biz, st, main, f, near);
+    if (bw < 1.2) continue;
+    signage.board(text, st);
+    if (near && st.blade && !biz.generic) signage.blade(text, st);
+  }
+}
 
 // ---------------------------------------------------------------- storefront geometry
 /**
@@ -432,10 +487,8 @@ export function emitStorefrontRun(o) {
     }
     if (!biz) continue;
     // ---- fascia sign board (atlas: far LOD)
-    const text = signText(st.text || biz.name);
-    const bh = clamp(0.74 * f, 0.55, 0.8);
+    const { text, bw, bh } = signSize(biz, st, main, f, o.near);
     const yb = g + 3.98 * f - bh / 2;
-    const bw = Math.min(main.len - (st.blade && !biz.generic && o.near ? 2.2 : 0.2), biz.fromName ? 12 : 9, Math.max(2.4, text.length * bh * 0.62 + 1.2));
     if (bw < 1.2) continue;
     const cell = signage.board(text, st);
     const sc = main.len / 2;
@@ -619,7 +672,7 @@ export function emitCorniceDetail(buf, uv, segs, yTop, opts = {}) {
   const out = opts.out ?? 0.55, ch = opts.corona ?? 0.3, fh = opts.frieze ?? 0.55;
   for (const s of segs) {
     if (s.len < 0.8) continue;
-    const box = (s0, s1, d0, d1, y0, y1) => buf.box(s, s0, s1, d0, d1, y0, y1, uv, true);
+    const box = (s0, s1, d0, d1, y0, y1) => buf.box(s, s0, s1, d0, d1, y0, y1, uv, true, HIDDEN_BACK_TOP); // (back against the frieze, top under the corona)
     if (opts.dentil) {
       for (let x = 0.14; x < s.len - 0.12; x += 0.26) box(x, x + 0.12, 0.06, 0.19, yTop - ch - 0.15, yTop - ch);
     } else {

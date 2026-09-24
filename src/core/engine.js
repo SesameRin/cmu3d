@@ -410,19 +410,23 @@ export function createEngine(ctx, canvas) {
   // Every texture the scene's materials reference: material maps, ShaderMaterial uniforms, custom depth materials and
   // the uniforms onBeforeCompile hooks added (three keeps the compiled shader's uniforms in the material properties,
   // so this finds them once the material has been compiled — e.g. the buildings' facade texture arrays).
+  const texOwner = new WeakMap();   // texture → 'material.slot' (diagnostics for slow uploads)
   function sceneTextures(root) {
     const set = new Set();
+    let owner = '';
+    const add = (t, k) => { if (!set.has(t)) { set.add(t); if (!texOwner.has(t)) texOwner.set(t, owner + '.' + k); } };
     const addUniforms = (u) => {
       if (!u) return;
       for (const k in u) {
         const v = u[k]?.value;
-        if (v?.isTexture) set.add(v);
-        else if (Array.isArray(v)) for (const t of v) if (t?.isTexture) set.add(t);
+        if (v?.isTexture) add(v, k);
+        else if (Array.isArray(v)) for (const t of v) if (t?.isTexture) add(t, k);
       }
     };
     const addMat = (m) => {
       if (!m) return;
-      for (const k in m) { const v = m[k]; if (v && v.isTexture) set.add(v); }
+      owner = m.name || m.type;
+      for (const k in m) { const v = m[k]; if (v && v.isTexture) add(v, k); }
       addUniforms(m.uniforms);
       addUniforms(renderer.properties?.get(m)?.uniforms);
     };
@@ -434,6 +438,7 @@ export function createEngine(ctx, canvas) {
   }
   // Upload every pending texture now (the first frame would otherwise do it: texSubImage2D/3D was the largest part of
   // the post-loading freeze). Returns the number uploaded.
+  const slowUploads = [];   // the slowest texture uploads of the last precompile (name, size, ms) — diagnostics
   function uploadTextures(root) {
     let n = 0;
     for (const t of sceneTextures(root)) {
@@ -442,7 +447,15 @@ export function createEngine(ctx, canvas) {
       const img = t.image;
       if (!img || img.complete === false || (Array.isArray(img) && img.some((x) => !x))) continue;
       if (renderer.properties?.get(t).__version === t.version) continue;
+      const w = img.width ?? img[0]?.width ?? 0, h = img.height ?? img[0]?.height ?? 0;
+      const t0 = performance.now();
       try { renderer.initTexture(t); n++; } catch (e) { console.warn('[engine] texture upload failed', t.name || t.uuid, e); }
+      const ms = performance.now() - t0;
+      if (ms > 4) {
+        slowUploads.push([t.name || texOwner.get(t) || (img.constructor?.name ?? '?'), `${w}x${h}${t.isDataArrayTexture ? 'x' + (img.depth ?? '?') : ''}`, Math.round(ms)]);
+        slowUploads.sort((a, b) => b[2] - a[2]);
+        slowUploads.length = Math.min(slowUploads.length, 10);
+      }
     }
     return n;
   }
@@ -469,13 +482,16 @@ export function createEngine(ctx, canvas) {
     // this after big init steps (best once the light setup is final, i.e. after the landmarks — a light added later
     // changes every lit program) so the final precompile() mostly finds everything ready. Cheap once programs are
     // cached (~10 ms for the whole scene). Only call it for finished subtrees (textures are uploaded as they are).
-    warm(root = scene) {
+    // { upload: false } only issues the compiles: texture uploads queue behind the compiles in the GPU process and
+    // would block the main thread until those are done, so an early warm-up during loading (main.js, right after the
+    // landmarks — the light setup is final then) should leave the uploads to precompile().
+    warm(root = scene, { upload = true } = {}) {
       if (!root) return;
       // relief normal maps for materials built from the shared surface / facade textures (before their programs
       // are compiled: the normal map is part of the program key)
       try { ctx.materials?.enhance?.(root); } catch (e) { console.warn('[engine] material relief failed', e); }
       try { issueCompiles(root, null, false)?.dispose(); } catch (e) { console.warn('[engine] warm-up compile failed', e); }
-      try { uploadTextures(root); } catch (e) { console.warn('[engine] warm-up texture upload failed', e); }
+      if (upload) try { uploadTextures(root); } catch (e) { console.warn('[engine] warm-up texture upload failed', e); }
     },
     // Get everything the first frames need onto the GPU before the loading screen goes away:
     //  1. compile every program in parallel where KHR_parallel_shader_compile exists (scene for its real target,
@@ -525,6 +541,7 @@ export function createEngine(ctx, canvas) {
       engine.precompileStats = {
         issue: Math.round(tUp - tIssue), upload: Math.round(tWait - tUp), textures: uploaded, wait: Math.round(t0 - tWait),
         firstUse: Math.round(t1 - t0), warmFrame: Math.round(performance.now() - t1), programs: renderer.info.programs?.length ?? 0,
+        slowUploads: slowUploads.slice(),
       };
       const bad = res.find((r) => r.status === 'rejected');
       if (bad) throw bad.reason;

@@ -20,7 +20,7 @@ const project = (lat, lon) => [
   +((lon - ORIGIN.lon) * M_PER_DEG_LON).toFixed(2),
   +(-(lat - ORIGIN.lat) * M_PER_DEG_LAT).toFixed(2),
 ];
-const BBOX = { s: 40.4345, w: -79.9575, n: 40.4505, e: -79.9325 };
+const BBOX = { s: 40.4345, w: -79.9575, n: 40.4625, e: -79.9180 };
 const [minX, maxZ] = project(BBOX.s, BBOX.w);
 const [maxX, minZ] = project(BBOX.n, BBOX.e);
 

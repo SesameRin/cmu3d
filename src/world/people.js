@@ -2,7 +2,7 @@
 //
 // Person geometry (one merged mesh, +Z forward, feet at y = 0, ~1.72 m):
 //   aPart: 0 shirt · 1 trousers · 2 skin · 3 hair · 4 shoes · 5 backpack (optional) · 6 long hair (optional)
-//   aLimb: 0 body · 1 left leg · 2 right leg · 3 left arm · 4 right arm   (rotated about hip / shoulder pivots)
+//   aLimb: 0 body · 1/2 thighs · 3/4 upper arms · 5/6 shins (bent at the knee) · 7/8 forearms (bent at the elbow)
 // Per-instance: iShirt, iPants (rgb, linear), iLook = (skinTone, hairTone, hasBackpack, hasLongHair),
 //               iAnim = (phaseOffset, strideFrequency Hz, swingAmplitude)
 // The walk cycle phase is uTime * freq, so the CPU never touches animation state after spawning. uTime is the
@@ -29,47 +29,69 @@ function prep(g, part, limb, color = null) {
 const at = (g, x, y, z) => { g.translate(x, y, z); return g; };
 
 // ------------------------------------------------------------------ person
+// aLimb: 0 body · 1/2 left/right thigh · 3/4 left/right upper arm · 5/6 left/right shin (+ shoe) · 7/8 left/right
+// forearm (+ hand). Shins bend at the knee and forearms at the elbow before the whole limb swings at hip / shoulder.
 export function personGeometry() {
   const p = [];
-  for (const [side, limb] of [[1, 1], [-1, 2]]) {
+  for (const [side, thigh, shin] of [[1, 1, 5], [-1, 2, 6]]) {
     const x = 0.095 * side;
-    p.push(prep(at(new THREE.CylinderGeometry(0.078, 0.058, 0.84, 7), x, 0.5, 0), 1, limb));      // leg
-    p.push(prep(at(new THREE.BoxGeometry(0.1, 0.07, 0.24), x, 0.035, 0.035), 4, limb));             // shoe
+    p.push(prep(at(new THREE.CylinderGeometry(0.083, 0.066, 0.45, 7), x, 0.72, 0), 1, thigh));     // thigh
+    p.push(prep(at(new THREE.CylinderGeometry(0.064, 0.05, 0.46, 7), x, 0.27, 0), 1, shin));       // shin
+    const shoe = new RoundedBoxGeometry(0.1, 0.075, 0.25, 1, 0.03);
+    p.push(prep(at(shoe, x, 0.037, 0.035), 4, shin));                                               // shoe
   }
   p.push(prep(at(new THREE.BoxGeometry(0.33, 0.2, 0.2), 0, 0.95, 0), 1, 0));                          // hips
   const torso = new THREE.CylinderGeometry(0.2, 0.165, 0.56, 9); torso.scale(1, 1, 0.62);
   p.push(prep(at(torso, 0, 1.23, 0), 0, 0));
   const sh = new THREE.SphereGeometry(0.2, 9, 4, 0, Math.PI * 2, 0, Math.PI / 2); sh.scale(1, 0.35, 0.62);
   p.push(prep(at(sh, 0, 1.5, 0), 0, 0));                                                              // shoulders
-  for (const [side, limb] of [[1, 3], [-1, 4]]) {
-    const x = 0.24 * side;
-    const arm = new THREE.CylinderGeometry(0.052, 0.042, 0.58, 6); arm.rotateZ(-0.06 * side);
-    p.push(prep(at(arm, x + 0.01 * side, 1.18, 0), 0, limb));                                       // sleeve/arm
-    p.push(prep(at(new THREE.SphereGeometry(0.046, 6, 4), x + 0.03 * side, 0.87, 0.01), 2, limb));   // hand
+  for (const [side, upper, fore] of [[1, 3, 7], [-1, 4, 8]]) {
+    const x = 0.245 * side;
+    p.push(prep(at(new THREE.CylinderGeometry(0.054, 0.047, 0.31, 6), x, 1.32, 0), 0, upper));        // sleeve (upper arm)
+    p.push(prep(at(new THREE.CylinderGeometry(0.046, 0.04, 0.27, 6), x + 0.004 * side, 1.04, 0), 0, fore)); // forearm
+    const hand = new THREE.SphereGeometry(0.046, 6, 4); hand.scale(0.8, 1.15, 1);
+    p.push(prep(at(hand, x + 0.006 * side, 0.87, 0.005), 2, fore));                                  // hand
   }
   p.push(prep(at(new THREE.CylinderGeometry(0.05, 0.055, 0.1, 6), 0, 1.56, 0), 2, 0));               // neck
   const head = new THREE.SphereGeometry(0.108, 10, 8); head.scale(0.92, 1.12, 1);
   p.push(prep(at(head, 0, 1.67, 0.01), 2, 0));
+  const nose = new THREE.ConeGeometry(0.018, 0.045, 4); nose.rotateX(Math.PI / 2); nose.translate(0, 1.655, 0.118);
+  p.push(prep(nose, 2, 0));
+  for (const s2 of [-1, 1]) {                                                                          // ears
+    const ear = new THREE.SphereGeometry(0.022, 5, 4); ear.scale(0.5, 1, 0.8);
+    p.push(prep(at(ear, 0.099 * s2, 1.665, 0.005), 2, 0));
+  }
   const hair = new THREE.SphereGeometry(0.116, 10, 6, 0, Math.PI * 2, 0, Math.PI * 0.52); hair.scale(0.94, 1.1, 1.02);
   p.push(prep(at(hair, 0, 1.685, -0.005), 3, 0));
   p.push(prep(at(new THREE.BoxGeometry(0.2, 0.26, 0.06), 0, 1.56, -0.085), 6, 0));                   // long hair
-  const pack = new THREE.BoxGeometry(0.28, 0.36, 0.12);
+  const pack = new RoundedBoxGeometry(0.28, 0.36, 0.13, 1, 0.04);
   p.push(prep(at(pack, 0, 1.24, -0.17), 5, 0));
   p.push(prep(at(new THREE.BoxGeometry(0.3, 0.03, 0.16), 0, 1.44, -0.13), 5, 0));                    // backpack straps
-  const g = mergeGeometries(p, false);
+  const g = mergeGeometries(p.map((q) => { if (q.attributes.normal === undefined) q.computeVertexNormals(); return q; }), false);
   g.computeBoundingSphere();
   return g;
 }
 
+// Walk cycle: hip / shoulder swing, knee flexion during the leg's swing phase (peaks as the foot passes under the
+// body), elbows slightly bent and bending more as the arm swings forward. rotL(v, a) rotates about +X in the y-z plane.
 const PERSON_VERT_ANIM = /* glsl */`
   float ph = uTime * iAnim.y * 6.2831853 + iAnim.x;
-  float sw = sin(ph) * iAnim.z;
-  float ang = 0.0, pivot = 0.0;
-  if (aLimb > 0.5 && aLimb < 1.5) { ang = sw * 0.46; pivot = 0.93; }
-  else if (aLimb > 1.5 && aLimb < 2.5) { ang = -sw * 0.46; pivot = 0.93; }
-  else if (aLimb > 2.5 && aLimb < 3.5) { ang = -sw * 0.4; pivot = 1.46; }
-  else if (aLimb > 3.5) { ang = sw * 0.4; pivot = 1.46; }
-  float ca = cos(ang), sa = sin(ang);
+  float sw = sin(ph) * iAnim.z, cph = cos(ph);
+  float ang = 0.0, pivot = 0.0, subA = 0.0, subP = 0.0;
+  int limb = int(aLimb + 0.5);
+  if (limb == 1 || limb == 5) { ang = sw * 0.46; pivot = 0.93; if (limb == 5) { subA = (0.08 + 0.95 * max(0.0, -cph)) * iAnim.z; subP = 0.5; } }
+  else if (limb == 2 || limb == 6) { ang = -sw * 0.46; pivot = 0.93; if (limb == 6) { subA = (0.08 + 0.95 * max(0.0, cph)) * iAnim.z; subP = 0.5; } }
+  else if (limb == 3 || limb == 7) { ang = -sw * 0.4; pivot = 1.46; if (limb == 7) { subA = -(0.28 + 0.4 * max(0.0, sw)); subP = 1.18; } }
+  else if (limb == 4 || limb == 8) { ang = sw * 0.4; pivot = 1.46; if (limb == 8) { subA = -(0.28 + 0.4 * max(0.0, -sw)); subP = 1.18; } }
+  float ca = cos(ang), sa = sin(ang), cb = cos(subA), sb = sin(subA);
+`;
+const PERSON_POSE = /* glsl */`
+  transformed.y -= subP;
+  transformed = vec3(transformed.x, transformed.y * cb - transformed.z * sb, transformed.y * sb + transformed.z * cb);
+  transformed.y += subP - pivot;
+  transformed = vec3(transformed.x, transformed.y * ca - transformed.z * sa, transformed.y * sa + transformed.z * ca);
+  transformed.y += pivot;
+  transformed.y += abs(cph) * 0.03 * iAnim.z;
 `;
 
 export function createPersonMaterial(shared) {
@@ -85,12 +107,10 @@ export function createPersonMaterial(shared) {
         varying float vPart; varying vec3 vShirt; varying vec3 vPants; varying vec4 vLook;`)
       .replace('#include <beginnormal_vertex>', `#include <beginnormal_vertex>
         ${PERSON_VERT_ANIM}
+        objectNormal = vec3(objectNormal.x, objectNormal.y * cb - objectNormal.z * sb, objectNormal.y * sb + objectNormal.z * cb);
         objectNormal = vec3(objectNormal.x, objectNormal.y * ca - objectNormal.z * sa, objectNormal.y * sa + objectNormal.z * ca);`)
       .replace('#include <begin_vertex>', `#include <begin_vertex>
-        transformed.y -= pivot;
-        transformed = vec3(transformed.x, transformed.y * ca - transformed.z * sa, transformed.y * sa + transformed.z * ca);
-        transformed.y += pivot;
-        transformed.y += abs(cos(ph)) * 0.03 * iAnim.z;
+        ${PERSON_POSE}
         if ((aPart > 4.5 && aPart < 5.5 && iLook.z < 0.5) || (aPart > 5.5 && iLook.w < 0.5)) transformed = vec3(0.0, 1.3, 0.0);
         vPart = aPart; vShirt = iShirt; vPants = iPants; vLook = iLook;`);
     sh.fragmentShader = sh.fragmentShader
@@ -105,7 +125,7 @@ export function createPersonMaterial(shared) {
         vec3 pc = pp < 0.5 ? vShirt : pp < 1.5 ? vPants : pp < 2.5 ? skin : pp < 3.5 ? hairC : pp < 4.5 ? vec3(0.03) : pp < 5.5 ? bag : hairC;
         diffuseColor.rgb = pc;`);
   };
-  mat.customProgramCacheKey = () => 'cmu-person-v1';
+  mat.customProgramCacheKey = () => 'cmu-person-v2';
   return mat;
 }
 
@@ -118,12 +138,10 @@ export function createPersonDepthMaterial(shared) {
         uniform float uTime; attribute float aPart; attribute float aLimb; attribute vec4 iLook; attribute vec3 iAnim;`)
       .replace('#include <begin_vertex>', `#include <begin_vertex>
         ${PERSON_VERT_ANIM}
-        transformed.y -= pivot;
-        transformed = vec3(transformed.x, transformed.y * ca - transformed.z * sa, transformed.y * sa + transformed.z * ca);
-        transformed.y += pivot;
+        ${PERSON_POSE}
         if ((aPart > 4.5 && aPart < 5.5 && iLook.z < 0.5) || (aPart > 5.5 && iLook.w < 0.5)) transformed = vec3(0.0, 1.3, 0.0);`);
   };
-  mat.customProgramCacheKey = () => 'cmu-person-depth-v1';
+  mat.customProgramCacheKey = () => 'cmu-person-depth-v2';
   return mat;
 }
 

@@ -1,15 +1,18 @@
-// Generic OSM buildings (≈1400): CMU campus + Oakland / Shadyside neighbourhood.
-// Contract: ARCHITECTURE.md §buildings.
+// Generic OSM buildings (≈10 000): CMU campus, Oakland, Shadyside (Walnut Street) and East Liberty (Penn / Highland /
+// Centre Avenue). Contract: ARCHITECTURE.md §buildings.
 //
 // Pipeline per building: infer a style (curated b.style wins) → spec (facade layer, colours, roof, parapet, plinth,
 // porches / entrances) → street typology for brick / commercial blocks (rowhouse, mixed-use, 1920s apartments,
 // modern infill; see applyTypology) → street frontage analysis (storefronts.js: which walls face a street, shop units,
-// businesses from POIs / names) → emit walls / roof / details into per-chunk buffers carrying a per-vertex tint,
-// texture-array layer and building index → one mesh per texture array (facade / surface) per 250 m chunk, i.e.
-// ~2 draw calls per chunk (see facades.js). Picking resolves the building index from the hit face; highlight is a
-// shader uniform (no geometry rebuild).
+// businesses from POIs / business-named buildings) → emit into per-chunk buffers carrying a per-vertex tint, ground
+// height, texture-array layer and building index → ONE mesh per chunk and level of detail: a single material samples
+// the facade and the surface texture arrays (see facades.js). Picking resolves the building index from the hit face;
+// highlight is a shader uniform (no geometry rebuild).
 // Shop signs (canvas-drawn names), blade signs, cornice brackets, fire escapes and café furniture sample one signage
-// atlas (signage.js) and are merged per chunk into a 'far' and a 'near' mesh, distance-culled every frame.
+// atlas (signage.js) and are merged per detail chunk into a 'far' and a 'near' mesh, distance-culled every frame.
+// Shopping streets: the Oakland main streets, plus every stretch of a named main street with ≥ 2 businesses within
+// 40 m (commercialInfo) — Walnut Street's shops, Penn / Highland / Centre Avenue in East Liberty — while residential
+// stretches of the same streets stay residential.
 //
 // UV note: wall u runs continuously along each straight-ish run of wall (runs break at corners > 28°) and is
 // stretched ±15 % so every run holds a whole number of window bays — windows are never cut by a corner.
@@ -17,13 +20,21 @@
 import * as THREE from 'three';
 import { buildingLevels, footprintFrame } from '../core/placement.js';
 import { pointInRing } from '../core/heightfield.js';
-import { GeoBuffer, Emitter, cleanRing, signedArea, emitWalls, emitCap, emitBox, emitWallQuad, emitRingWall, offsetRing, emitFrameBox } from './building-geometry.js';
-import { roofPlanes, envelope, envelopeKinks, limitRise, setRise, emitPitchedRoof, emitFlatRoof, emitRooftopUnits, emitDome, emitDeckBand, mansardFrontPlanes, emitBracketCornice } from './roofs.js';
+import { GeoBuffer, Emitter, GROUND_BIAS, cleanRing, signedArea, emitWalls, emitCap, emitBox, emitWallQuad, emitRingWall, offsetRing, emitFrameBox } from './building-geometry.js';
+import { roofPlanes, envelope, envelopeKinks, limitRise, setRise, emitPitchedRoof, emitFlatRoof, emitRooftopUnits, emitDome, emitDeckBand, mansardFrontPlanes, emitBracketCornice, emitChimney } from './roofs.js';
 import { createBuildingMaterials, FACADES, tintFor, NO_TINT } from './facades.js';
-import { createStreetIndex, createFootprintIndex, wallRuns, runFrontage, runPoint, runSegs, findBusinesses, nameBusiness, planStorefronts, emitStorefrontRun, emitBay, emitDormer, emitFireEscape, emitCorniceDetail, emitBoard, AtlasBuffer, SHOP_POI } from './storefronts.js';
+import { createStreetIndex, createFootprintIndex, wallRuns, runFrontage, runPoint, runSegs, findBusinesses, nameBusiness, planStorefronts, emitStorefrontRun, emitBay, emitDormer, emitFireEscape, emitCorniceDetail, emitBoard, AtlasBuffer, SHOP_POI, requestStorefrontSigns } from './storefronts.js';
 import { createSignage, businessStyle } from './signage.js';
 
+// Two levels of detail, both merged per spatial chunk:
+//  * BASE (built for every building at start-up): walls with their facade textures (storefront bands and bay windows
+//    included), pitched roof surfaces, flat decks, domes, stair penthouses. Drawn up to quality.drawDistance.
+//  * DETAIL: parapet copings and cornices, soffits / fascias / gutters / ridge caps, chimneys, rooftop equipment,
+//    porches, entrances, storefront trims + awnings, bracketed cornices, dormers, fire escapes, shop signs. Built at
+//    start-up only around the start view (LOD.init); everywhere else lazily — time-sliced, nearest first — once the
+//    camera comes within LOD.build, and drawn within LOD.show (its small shadows only within ~420 m).
 const CHUNK = 250;
+const BASE_CHUNK = 250; // (same grid as the detail chunks: tighter frustum / shadow culling than 500 m)
 const SIGN_FAR = 520;   // fascia signs + awning-free boards visible up to this distance (m) from their 250 m chunk
 const DETAIL_NEAR = 250; // blade signs, café furniture
 
@@ -188,50 +199,78 @@ export async function createBuildings(ctx) {
   const skip = ctx.skipBuildingIds || new Set();
   const outlineById = new Map(data.buildings.map((b) => [b.id, b])); // building:part parentId -> outline
 
-  // ---- commercial context: shop POIs and main shopping streets
+  // ---- commercial context: shop POIs, business-named buildings and the shopping streets (spatial grids: 10 k buildings)
   const shopPois = (data.pois || []).filter((p) => SHOP_POI.has(p.type));
-  const SHOP_STREETS = /^(South Craig Street|North Craig Street|Forbes Avenue|Oakland Avenue|South Bouquet Street|Atwood Street|Walnut Street|Murray Avenue)$/;
+  const GS = 100;
+  const gkey = (x, z) => Math.floor(x / GS) + ',' + Math.floor(z / GS);
+  function gridOf(items, xy) {
+    const g = new Map();
+    for (const it of items) { const [x, z] = xy(it); const k = gkey(x, z); let l = g.get(k); if (!l) g.set(k, (l = [])); l.push(it); }
+    return g;
+  }
+  function near(g, x, z, r, fn) { // fn(item) → true stops
+    for (let gx = Math.floor((x - r) / GS); gx <= Math.floor((x + r) / GS); gx++) {
+      for (let gz = Math.floor((z - r) / GS); gz <= Math.floor((z + r) / GS); gz++) {
+        const l = g.get(gx + ',' + gz);
+        if (l) for (const it of l) if (fn(it)) return true;
+      }
+    }
+    return false;
+  }
+  const poiGrid = gridOf(shopPois, (p) => [p.x, p.z]);
+  // Shopping streets: the Oakland main streets as a whole, elsewhere (Walnut Street in Shadyside, Penn / Highland /
+  // Broad in East Liberty, …) every stretch of a named main street with at least two businesses (shop POIs or
+  // business-named buildings) within 40 m — so residential stretches of the same streets stay residential.
+  const OAKLAND_SHOP = /^(South Craig Street|North Craig Street|Forbes Avenue|Oakland Avenue|South Bouquet Street|Atwood Street|Murray Avenue)$/;
+  const MAIN_ROADS = new Set(['primary', 'secondary', 'tertiary', 'trunk', 'unclassified']);
+  const BIZ_TYPES = new Set(['yes', 'retail', 'commercial']);
+  const bizNamed = (b) => !b.campus && !b.parentId && BIZ_TYPES.has(b.type || 'yes') && b.area >= 40 && b.area < 8000 && !!nameBusiness(b);
+  const bizGrid = gridOf([...shopPois.map((p) => [p.x, p.z]), ...data.buildings.filter(bizNamed).map((b) => b.centroid)], (p) => p);
   const shopSegs = [];
   for (const r of data.roads || []) {
-    if (!r.name || !SHOP_STREETS.test(r.name)) continue;
-    for (let i = 1; i < r.points.length; i++) shopSegs.push([r.points[i - 1][0], r.points[i - 1][1], r.points[i][0], r.points[i][1], (r.width || 10) / 2]);
+    if (!r.name || r.tunnel) continue;
+    const oak = OAKLAND_SHOP.test(r.name);
+    if (!oak && !MAIN_ROADS.has(r.type)) continue;
+    const half = (r.width || 10) / 2;
+    for (let i = 1; i < r.points.length; i++) {
+      const [ax, az] = r.points[i - 1], [bx, bz] = r.points[i];
+      const n = Math.max(1, Math.ceil(Math.hypot(bx - ax, bz - az) / 40));
+      for (let k = 0; k < n; k++) {
+        const x0 = ax + ((bx - ax) * k) / n, z0 = az + ((bz - az) * k) / n, x1 = ax + ((bx - ax) * (k + 1)) / n, z1 = az + ((bz - az) * (k + 1)) / n;
+        if (!oak) {
+          let c = 0;
+          near(bizGrid, (x0 + x1) / 2, (z0 + z1) / 2, 70, (p) => segDist(p[0], p[1], x0, z0, x1, z1) < 40 && ++c >= 2);
+          if (c < 2) continue;
+        }
+        shopSegs.push([x0, z0, x1, z1, half]);
+      }
+    }
   }
+  const segGrid = gridOf(shopSegs, (s) => [(s[0] + s[2]) / 2, (s[1] + s[3]) / 2]);
   function commercialInfo(b, ring) {
     // CMU-owned commercial blocks on Craig Street (e.g. 311 S Craig) still get a shopfront where a café sits at the wall
     if (b.campus && !(b.type === 'commercial' || b.type === 'retail')) return { commercial: false, shop: false };
+    const edgeDist = (x, z) => { let e = Infinity; for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) e = Math.min(e, segDist(x, z, ring[j][0], ring[j][1], ring[i][0], ring[i][1])); return e; };
     if (isInstitutional(b)) {
       // Pitt halls, dorms, schools, churches…: a street frontage alone is not retail, and an interior café / food court
       // (Posvar Hall, Litchfield Towers, the museum and library cafés) is not a storefront. Shopfronts only where a shop
       // POI sits within a few metres of an outer wall close to a street (Sennott Square on Forbes / Oakland Ave, the
       // Amos Hall Starbucks and Nordenberg Hall's PNC on Fifth Ave).
-      let shop = false;
-      for (const p of shopPois) {
-        if (Math.abs(p.x - b.centroid[0]) > 150 || Math.abs(p.z - b.centroid[1]) > 150) continue;
-        let edge = Infinity;
-        for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) edge = Math.min(edge, segDist(p.x, p.z, ring[j][0], ring[j][1], ring[i][0], ring[i][1]));
-        if (edge < 5 && roadDistance(p.x, p.z, 30) < 30) { shop = true; break; }
-      }
+      const shop = near(poiGrid, b.centroid[0], b.centroid[1], 150, (p) => edgeDist(p.x, p.z) < 5 && roadDistance(p.x, p.z, 30) < 30);
       return { commercial: false, shop };
     }
-    let poi = false;
-    for (const p of shopPois) {
-      if (Math.abs(p.x - b.centroid[0]) > 120 || Math.abs(p.z - b.centroid[1]) > 120) continue;
-      if (pointInRing(p.x, p.z, ring)) { poi = true; break; }
-      for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
-        if (segDist(p.x, p.z, ring[j][0], ring[j][1], ring[i][0], ring[i][1]) < 6) { poi = true; break; }
-      }
-      if (poi) break;
-    }
+    const poi = near(poiGrid, b.centroid[0], b.centroid[1], 120, (p) => pointInRing(p.x, p.z, ring) || edgeDist(p.x, p.z) < 6);
     let street = false;
     if (b.area >= 60 && b.area < 5000 && b.height < 45) {
-      outer: for (const s of shopSegs) {
-        if (Math.abs((s[0] + s[2]) / 2 - b.centroid[0]) > 250 || Math.abs((s[1] + s[3]) / 2 - b.centroid[1]) > 250) continue;
-        for (const [x, z] of ring) if (segDist(x, z, s[0], s[1], s[2], s[3]) < s[4] + 9) { street = true; break outer; }
-      }
+      let rad = 0;
+      for (const [x, z] of ring) rad = Math.max(rad, Math.hypot(x - b.centroid[0], z - b.centroid[1]));
+      street = near(segGrid, b.centroid[0], b.centroid[1], rad + 45, (s) => ring.some(([x, z]) => segDist(x, z, s[0], s[1], s[2], s[3]) < s[4] + 9));
     }
     const typed = b.type === 'retail' || b.type === 'commercial';
+    // a building carrying a business name (Walnut Street boutiques, Kelly's / Paris 66 on Highland Avenue, …)
+    const named = bizNamed(b);
     if (b.campus) return { commercial: false, shop: poi, poi };
-    return { commercial: poi || street || typed, shop: poi || street || b.type === 'retail', street, poi, typed };
+    return { commercial: poi || street || typed || named, shop: poi || street || named || b.type === 'retail', street, poi, typed, named };
   }
 
   // ---- de-duplicate identical outlines (e.g. a relation with courtyards + a plain way of the same building)
@@ -267,36 +306,37 @@ export async function createBuildings(ctx) {
   const signage = createSignage(ctx);
   // every shop POI belongs to ONE building: the one containing it, else the one with the nearest wall (< 6 m)
   const poiOwner = new Map();
+  const srcGrid = gridOf(src, (b) => b.centroid);
   for (const p of shopPois) {
     if (!p.name) continue;
     let best = null, bestD = 6;
-    for (const b of src) {
+    near(srcGrid, p.x, p.z, 90, (b) => {
       const ring = b.footprint;
-      if (Math.abs(b.centroid[0] - p.x) > 90 || Math.abs(b.centroid[1] - p.z) > 90) continue;
-      if (pointInRing(p.x, p.z, ring)) { best = b; bestD = -1; break; }
+      if (Math.abs(b.centroid[0] - p.x) > 90 || Math.abs(b.centroid[1] - p.z) > 90) return false;
+      if (pointInRing(p.x, p.z, ring)) { best = b; bestD = -1; return true; }
       for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
         const d = segDist(p.x, p.z, ring[j][0], ring[j][1], ring[i][0], ring[i][1]);
         if (d < bestD) { bestD = d; best = b; }
       }
-    }
+      return false;
+    });
     if (best) poiOwner.set(p, best.id);
   }
-  const street3d = { storefrontRuns: 0, mansards: 0, bays: 0, fireEscapes: 0, brackets: 0, rowDoors: 0, pavilions: 0, sample: {} };
-  const streetChunks = new Map(); // chunk key → { far: [fn(buf, signage)], near: [...] } (run once the atlas is packed)
-  function defer(kind, fn) {
-    let c = streetChunks.get(curChunk);
-    if (!c) { c = { key: curChunk, far: [], near: [] }; streetChunks.set(curChunk, c); }
-    c[kind].push(fn);
-  }
+  const street3d = { storefrontRuns: 0, mansards: 0, bays: 0, fireEscapes: 0, brackets: 0, rowDoors: 0, pavilions: 0, gutters: 0, chimneys: 0, sample: {} };
 
-  // ---- chunked buffers: one buffer per (chunk, texture array)
-  const chunks = new Map(); // chunkKey -> { facade: GeoBuffer, surface: GeoBuffer }
-  let curChunk = null, curBid = 0;
+  // ---- chunked buffers. pass 'base' writes into the 500 m base chunk of the building, pass 'detail' into its 250 m
+  // detail chunk (see the LOD note at the top). Detail work is captured per building as a closure (fn) and run later.
+  const baseChunks = new Map();   // key -> { key, x0, z0, bufs:{facade, surface}, meshes:[] }
+  const detailChunks = new Map(); // key -> { key, x0, z0, items:[{bid, fn}], cursor, done, bufs, far:[], near:[], meshes:[], signFar, signNear }
+  let pass = 'base', curBase = null, curDetail = null, curBid = 0, curGround = null;
+  // one buffer per chunk for both texture arrays (the building material samples either, see facades.js)
+  const bufsOf = (c) => { if (!c.bufs) { const g = new GeoBuffer(4096); c.bufs = { all: g, facade: g, surface: g }; } return c.bufs; };
   function E(slot, tint) {
-    let m = chunks.get(curChunk);
-    if (!m) { m = { facade: new GeoBuffer(), surface: new GeoBuffer() }; chunks.set(curChunk, m); }
-    return new Emitter(m[slot.array], tint || NO_TINT, curBid, slot.layer, 1 / slot.tileW, 1 / slot.tileH);
+    const m = bufsOf(pass === 'base' ? curBase : curDetail);
+    return new Emitter(m.all, tint || NO_TINT, curBid, slot.code ?? slot.layer, 1 / slot.tileW, 1 / slot.tileH, curGround);
   }
+  // street atlas work (signs, blade signs, café furniture, brackets, fire escapes): run once the atlas is packed
+  function defer(kind, fn) { curDetail[kind].push(fn); }
 
   // ---- slots used across styles
   const S = {
@@ -305,8 +345,13 @@ export async function createBuildings(ctx) {
     concretePlain: () => mats.surface('concrete', 6),
     plasterPlain: () => mats.surface('plain', 4),
     tileRoof: () => mats.surface('tile', 2, { roughness: 0.92 }),
+    shingleRoof: () => mats.surface('shingle', 2, { roughness: 0.95 }),
+    slateRoof: () => mats.surface('slate', 2, { roughness: 0.78 }),
     seamRoof: () => mats.surface('seam', 4, { roughness: 0.45, metal: 0.5 }),
   };
+  // roofing by colour family: slate greys → natural slate, clay reds → tiles, everything else asphalt shingles
+  const SLATE = new Set([...PAL.slate, '#474b52', '#3e4249', '#51565c']), CLAY = new Set(PAL.clay);
+  const roofFor = (color) => (SLATE.has(color) ? S.slateRoof() : CLAY.has(color) ? S.tileRoof() : S.shingleRoof());
   const plainFor = (kind) => (kind === 'stone' ? S.stonePlain() : kind === 'concrete' || kind === 'panel' ? S.concretePlain() : kind === 'plain' || kind === 'siding' || kind === 'stucco' || kind === 'shingle' ? S.plasterPlain() : S.brickPlain());
 
   // Build the style spec for one building.
@@ -365,7 +410,7 @@ export async function createBuildings(ctx) {
         sp.wallSlot = mats.facade(FACADES.gothic); sp.wallKind = 'stone'; sp.wallColor = pick(r, PAL.gothic);
         sp.plinth = { slot: S.stonePlain(), color: '#7f786d', h: 1.0 };
         sp.parapetH = 1.1; sp.coping = { slot: S.stonePlain(), color: '#b2a892' };
-        if (rect > 0.68 && frame.width < 40 && !(b.holes && b.holes.length)) sp.roof = { shape: 'gabled', slot: S.tileRoof(), color: pick(r, PAL.slate), pitch: 46, overhang: 0.35, maxRise: 13, soffit: '#6b6358' };
+        if (rect > 0.68 && frame.width < 40 && !(b.holes && b.holes.length)) sp.roof = { shape: 'gabled', slot: S.slateRoof(), color: pick(r, PAL.slate), pitch: 46, overhang: 0.35, maxRise: 13, soffit: '#6b6358' };
         sp.units = 0;
         break;
       case 'tower':
@@ -384,7 +429,7 @@ export async function createBuildings(ctx) {
         if (r() < 0.6) sp.plinth = { slot: S.stonePlain(), color: '#8e877c', h: 0.7 };
         if (r() < 0.65) sp.cornice = r() < 0.5 ? { slot: mats.trim(), color: '#3d3a36', out: 0.45, h: 0.6 } : { slot: S.stonePlain(), color: '#d8d0c0', out: 0.4, h: 0.5 };
         sp.parapetH = 0.7;
-        sp.units = 0.6;
+        sp.units = 0.9;
         break;
       }
       case 'industrial':
@@ -412,7 +457,7 @@ export async function createBuildings(ctx) {
         sp.wallSlot = mats.house(kind, 0, false); sp.wallKind = kind; sp.uniformFloors = false;
         sp.wallColor = kind === 'brick' ? pick(r, PAL.red) : pick(r, PAL.siding);
         sp.parapetH = 0.25; sp.coping = { slot: mats.trim(), color: '#6f6d68' }; sp.units = 0;
-        if (rect > 0.75 && r() < 0.45) sp.roof = { shape: r() < 0.6 ? 'gabled' : 'skillion', slot: S.tileRoof(), color: pick(r, PAL.shingle), pitch: 18, overhang: 0.25, maxRise: 2.2, soffit: '#dcd8cf' };
+        if (rect > 0.75 && r() < 0.45) sp.roof = { shape: r() < 0.6 ? 'gabled' : 'skillion', slot: S.shingleRoof(), color: pick(r, PAL.shingle), pitch: 18, overhang: 0.25, maxRise: 2.2, soffit: '#dcd8cf' };
         break;
       }
       case 'house':
@@ -430,7 +475,7 @@ export async function createBuildings(ctx) {
           const shape = squarish && rr < 0.25 ? 'pyramidal' : rr < 0.62 ? 'gabled' : 'hipped';
           const pr = r();
           const color = pr < 0.35 ? pick(r, PAL.slate) : pr < 0.95 ? pick(r, PAL.shingle) : pick(r, PAL.clay);
-          sp.roof = { shape, slot: S.tileRoof(), color, pitch: shape === 'gabled' ? 36 + r() * 10 : 28 + r() * 8, overhang: 0.45, maxRise: 6.5, soffit: '#e6e2d8' };
+          sp.roof = { shape, slot: roofFor(color), color, pitch: shape === 'gabled' ? 36 + r() * 10 : 28 + r() * 8, overhang: 0.45, maxRise: 6.5, soffit: '#e6e2d8' };
           sp.chimney = r() < 0.6;
         }
         break;
@@ -469,7 +514,7 @@ export async function createBuildings(ctx) {
         const classical = ['beaux-arts', 'limestone-classical'].includes(sp.style);
         const color = sp.roof.color || (classical ? pick(r, PAL.clay) : sp.style === 'gothic-stone' ? pick(r, PAL.slate) : pick(r, r() < 0.5 ? PAL.slate : PAL.shingle));
         sp.roof = {
-          shape: s, slot: s === 'dome' ? mats.copper() : S.tileRoof(), color: s === 'dome' ? null : color,
+          shape: s, slot: s === 'dome' ? mats.copper() : roofFor(color), color: s === 'dome' ? null : color,
           pitch: s === 'skillion' ? 12 : s === 'gabled' ? 38 : s === 'pyramidal' ? 35 : 26,
           overhang: geo.area > 600 ? 0.6 : 0.4, maxRise: clamp(Math.sqrt(geo.area) * 0.3, 2.5, 9), soffit: '#d9d3c6',
         };
@@ -480,11 +525,11 @@ export async function createBuildings(ctx) {
       if (m === 'copperRoof') { sp.roof.slot = mats.copper(); sp.roof.color = null; }
       else if (m === 'metalRoof' || m === 'zinc') { sp.roof.slot = S.seamRoof(); sp.roof.color = sp.roof.color || pick(r, PAL.metal); }
       else if (m === 'tileRoof') { sp.roof.slot = S.tileRoof(); sp.roof.color = pick(r, PAL.clay); }
-      else if (m === 'slateRoof') { sp.roof.slot = S.tileRoof(); sp.roof.color = pick(r, PAL.slate); }
+      else if (m === 'slateRoof') { sp.roof.slot = S.slateRoof(); sp.roof.color = pick(r, PAL.slate); }
     }
     if (b.roof?.height > 0 && sp.roof.shape !== 'flat') sp.roof.rise = +b.roof.height;
     const rc = parseColor(b.roof?.color) || parseColor(b.roofColor);
-    if (rc) { if (sp.roof.shape === 'flat') sp.flatColor = rc; else if (sp.roof.slot?.key !== 'roof:copper') sp.roof.color = rc; }
+    if (rc) { if (sp.roof.shape === 'flat') sp.flatColor = rc; else if (sp.roof.slot?.key !== 'roof:copper') { sp.roof.color = rc; if (!b.roof?.material && sp.roof.slot?.key?.startsWith('surf:')) sp.roof.slot = roofFor(rc); } }
     return sp;
   }
 
@@ -511,6 +556,10 @@ export async function createBuildings(ctx) {
     const small = area < 320 && h <= 13.5;
     let typo = ov?.typo;
     if (ov && !ov.typo) ov = null;
+    // East Liberty's big blocks are the 2000s–2010s redevelopment (Eastside, the Penn / Centre Avenue mixed-use
+    // apartments, big-box retail): modern panel / stucco infill rather than Victorian commercial blocks
+    const eastLiberty = b.centroid[0] > 1250 && b.centroid[0] < 2150 && b.centroid[1] > -2250 && b.centroid[1] < -1550;
+    if (!typo && eastLiberty && area > 1800 && !b.style) typo = 'infill';
     if (!typo) {
       if (sp.style === 'commercial' || ci.shop) typo = small && r3() < 0.3 ? 'row' : 'mixed';
       else if (small) typo = r3() < 0.82 ? 'row' : 'infill';
@@ -526,7 +575,7 @@ export async function createBuildings(ctx) {
       if (r3() < 0.1) sp.wallColor = pick(r3, PAINTED_BRICK);
     } else if (typo === 'mixed') {
       sp.wallSlot = mats.facade(FACADES.mixedUse);
-      sp.cornice = null; sp.bracket = { color: paint, dentil: r3() < 0.4 }; sp.parapetH = 0.75; sp.units = 0.5;
+      sp.cornice = null; sp.bracket = { color: paint, dentil: r3() < 0.4 }; sp.parapetH = 0.75; sp.units = 0.9;
       sp.fireEscape = r3() < 0.3; sp.chimneys = true;
       if (r3() < 0.22) sp.wallColor = pick(r3, PAINTED_BRICK);
     } else if (typo === 'apt') {
@@ -535,7 +584,7 @@ export async function createBuildings(ctx) {
       sp.wallColor = pick(r3, pr < 0.4 ? PAL.buff : pr < 0.8 ? PAL.red : PAL.brown);
       sp.plinth = { slot: S.stonePlain(), color: '#b3ab9b', h: 1.0 };
       sp.cornice = { slot: S.stonePlain(), color: '#d8d0bf', out: 0.4, h: 0.6 };
-      sp.parapetH = 1.0; sp.coping = { slot: S.stonePlain(), color: '#d6cebd' }; sp.units = 0.4;
+      sp.parapetH = 1.0; sp.coping = { slot: S.stonePlain(), color: '#d6cebd' }; sp.units = 0.7;
       sp.fireEscape = r3() < 0.45;
     } else if (typo === 'infill') {
       const panel = r3() < 0.6;
@@ -622,15 +671,21 @@ export async function createBuildings(ctx) {
   }
 
   // House front porch facing the street: deck, posts, rails, shed roof, steps and a panelled front door.
-  function addPorch(ring, groundY, roofY, r, roofSlot, roofTint) {
+  function addPorch(ring, groundY, roofY, r, roofSlot, roofTint, centre) {
     const edges = ringEdges(ring).filter((e) => e.len >= 4);
     if (!edges.length) return;
-    let best = null, bestD = Infinity;
-    for (const e of edges) {
-      const d = roadDistance(e.mx + e.nx * 4, e.mz + e.nz * 4, 45) - roadDistance(e.mx - e.nx * 4, e.mz - e.nz * 4, 45) * 0.25;
-      if (d < bestD) { bestD = d; best = e; }
+    // the street side: the wall whose outward normal points most directly at the nearest street (one lookup per house)
+    const ns = street.nearestStreet(centre[0], centre[1], 55);
+    let best = null;
+    if (ns) {
+      const vx = ns.px - centre[0], vz = ns.pz - centre[1], vl = Math.hypot(vx, vz) || 1;
+      let bestS = -Infinity;
+      for (const e of edges) {
+        const s = (e.nx * vx + e.nz * vz) / vl + Math.min(e.len, 12) * 0.015;
+        if (s > bestS) { bestS = s; best = e; }
+      }
     }
-    if (bestD >= 44) best = edges.reduce((p, q) => (q.len > p.len ? q : p));
+    if (!best) best = edges.reduce((p, q) => (q.len > p.len ? q : p));
     const e = best;
     const W = clamp(e.len * (0.45 + r() * 0.4), 2.4, Math.min(e.len - 0.6, 8));
     const D = 1.8 + r() * 0.7;
@@ -722,6 +777,7 @@ export async function createBuildings(ctx) {
       const craig = /Craig/.test(fr.name || '');
       if (!best || (craig && !best.craig) || (craig === best.craig && run.len > best.run.len)) best = { run, craig };
     }
+    let detail = null;
     if (best) {
       const p = runPoint(best.run, best.run.len * 0.9);
       const px = p.x + p.nx * (over + 1.4), pz = p.z + p.nz * (over + 1.4);
@@ -729,7 +785,7 @@ export async function createBuildings(ctx) {
       const st = businessStyle({ name: 'PNC Bank', type: 'bank' });
       const bw = 2.7, bh = 0.8;
       const cell = signage.board(st.text, st, bw / bh);
-      defer('far', (buf, sg) => {
+      detail = () => defer('far', (buf, sg) => {
         buf.box({ ox: px, oz: pz, tx: p.tx, tz: p.tz, nx: p.nx, nz: p.nz }, -0.1, 0.1, -0.1, 0.1, gy - 0.3, gy + 4.3, sg.swatch('chrome'));
         emitBoard(buf, sg, { ox: px - p.nx * 0.08, oz: pz - p.nz * 0.08, tx: p.tx, tz: p.tz, nx: p.nx, nz: p.nz }, 0, bw, bh, gy + 4.3, cell);
         emitBoard(buf, sg, { ox: px + p.nx * 0.08, oz: pz + p.nz * 0.08, tx: -p.tx, tz: -p.tz, nx: -p.nx, nz: -p.nz }, 0, bw, bh, gy + 4.3, cell);
@@ -737,7 +793,7 @@ export async function createBuildings(ctx) {
     }
     ctx.colliders?.addPolygon(ring, baseY, roofY, b.id);
     street3d.pavilions++;
-    return { topY: roofY, groundY: lv.groundY, style: 'pavilion', shop: true, ring };
+    return { topY: roofY, groundY: lv.groundY, style: 'pavilion', shop: true, ring, detail };
   }
 
   // ---- per-building build
@@ -792,6 +848,7 @@ export async function createBuildings(ctx) {
     if (b.type === 'bridge') { baseY = roofY - Math.min(4.5, roofY - groundY - 1); groundY = baseY; elevated = true; sp.shop = false; }
     if (b.type === 'roof') { baseY = roofY - 0.9; elevated = true; sp.shop = false; sp.roof = { shape: 'flat' }; sp.parapetH = 0.2; sp.units = 0; }
     if (elevated) { sp.plinth = null; if (groundY < baseY) groundY = baseY; sp.shop = false; }
+    const ground = curGround = { y0: elevated ? -GROUND_BIAS : lv.groundY, hf: elevated ? null : ctx.heightAt };
     if (ov?.typo === 'pavilion') return buildPavilion(b, ring, frame, baseY, groundY, roofY, lv);
 
     // ---- street frontage: which walls face a street (storefronts, street-front cornices, bays, mansards, fire escapes)
@@ -826,7 +883,7 @@ export async function createBuildings(ctx) {
           planes = mp; rise = H; roofY -= H;
           mansard = { runs: fr, H, t: Math.tan((pitch * Math.PI) / 180) };
           street3d.mansards++;
-          sp.roof = { shape: 'mansard-front', slot: S.tileRoof(), color: pick(r4, ['#474b52', '#3e4249', '#5a4d47', '#6b4f42', '#51565c']), overhang: 0.05, soffit: sp.bracket?.color || '#3a3533' };
+          sp.roof = { shape: 'mansard-front', slot: S.slateRoof(), color: pick(r4, ['#474b52', '#3e4249', '#5a4d47', '#6b4f42', '#51565c']), overhang: 0.05, soffit: sp.bracket?.color || '#3a3533' };
         }
       }
     }
@@ -906,80 +963,41 @@ export async function createBuildings(ctx) {
     }
     if (elevated) emitCap(E(plainFor(sp.wallKind), plainWallTint), ring, holes, baseY, -1);
 
-    // ---- roof
+    // ---- roof massing (base pass). Everything small is emitted by the detail closure further down.
     let topY = roofY;
     const detail = !lowQ;
     let roofTint = NO_TINT;
+    const deckY = roofY - parapetH;
+    let roofSlot = null, soffitTint = null, deckF = 1, deckTint = null, deckSlot = null;
+    const glassDeck = sp.style === 'glasshouse';
+    const overhang = sp.roof.overhang ?? 0.4, roofThick = sp.roof.glass ? 0.08 : 0.2;
     if (isPitched) {
-      const roofSlot = sp.roof.slot || S.tileRoof();
+      roofSlot = sp.roof.slot || S.tileRoof();
       roofTint = sp.roof.color ? tintFor(sp.roof.color, 0.92 + r() * 0.16) : NO_TINT;
-      const soffitTint = tintFor(sp.roof.soffit || '#d9d3c6');
+      soffitTint = tintFor(sp.roof.soffit || '#d9d3c6');
       // mansard front: the last plane is the flat deck behind the slope → membrane / gravel instead of slate
       const deckEm = mansard ? E(sp.gravel ? mats.gravelRoof() : mats.flatRoof(), tintFor(sp.flatColor)) : null;
-      emitPitchedRoof(E(roofSlot, roofTint), E(sp.roof.glass ? roofSlot : mats.trim(), sp.roof.glass ? NO_TINT : soffitTint), ring, planes, roofY, sp.roof.overhang ?? 0.4, sp.roof.glass ? 0.08 : 0.2,
+      emitPitchedRoof(E(roofSlot, roofTint), null, ring, planes, roofY, overhang, roofThick,
         mansard ? { planeEm: (i) => (i === planes.length - 1 ? deckEm : null) } : {});
       topY = roofY + rise;
-      if (sp.chimney && detail) {
-        const u = (r() < 0.5 ? -1 : 1) * frame.length * (0.22 + r() * 0.12);
-        const v = (r() - 0.5) * frame.width * 0.3;
-        const cs = Math.cos(frame.angle), sn = Math.sin(frame.angle);
-        const cx = frame.center[0] + u * cs - v * sn, cz = frame.center[1] + u * sn + v * cs;
-        if (pointInRing(cx, cz, ring)) {
-          const hb = roofY + envelope(planes, cx, cz) - 0.3;
-          emitBox(E(S.brickPlain(), tintFor(pick(r, PAL.red), 0.9)), E(S.concretePlain(), tintFor('#6e6a64')), cx, cz, 0.35 + r() * 0.15, 0.45 + r() * 0.2, frame.angle, hb, Math.max(hb + 1.2, topY + 0.7));
-        }
-      }
     } else {
-      const deckF = 0.93 + r() * 0.14;
-      const deckTint = tintFor(sp.flatColor, deckF);
-      const deckSlot = sp.gravel ? mats.gravelRoof() : mats.flatRoof();
-      const glassDeck = sp.style === 'glasshouse';
-      const corn = detail && sp.cornice && parapetH > 0.3 && wallH > 6 ? sp.cornice : null;
-      emitFlatRoof({
-        deck: glassDeck ? E(sp.wallSlot, NO_TINT) : E(deckSlot, deckTint),
-        parapetIn: E(plainFor(sp.wallKind), plainWallTint),
-        coping: E(sp.coping.slot, tintFor(sp.coping.color)),
-        cornice: corn ? E(corn.slot, tintFor(corn.color)) : null,
-      }, ring, holes, roofY, parapetH, { cornice: corn ? { out: corn.out, h: corn.h, y1: roofY - parapetH + 0.12 } : null, parapetT: parapetH < 0.4 ? 0.2 : 0.3 });
-      const deckY = roofY - parapetH;
+      deckF = 0.93 + r() * 0.14;
+      deckTint = tintFor(sp.flatColor, deckF);
+      deckSlot = sp.gravel ? mats.gravelRoof() : mats.flatRoof();
+      emitCap(glassDeck ? E(sp.wallSlot, NO_TINT) : E(deckSlot, deckTint), ring, holes, deckY + 0.02, 1);
       if (sp.roof.shape === 'dome') {
         const R = Math.min(frame.width, frame.length) * 0.42;
         const domeH = R * 0.75;
         emitDome(E(sp.roof.slot || mats.copper(), NO_TINT), frame.center[0], frame.center[1], R, domeH, roofY, 8, 28);
         topY = roofY + domeH;
       }
-      if (detail && !glassDeck && b.type !== 'roof' && parapetH > 0.05 && area > 60) {
-        // dirt / water marks collecting along the parapet: dark at the parapet, fading into the deck
-        emitDeckBand(E(deckSlot, tintFor(sp.flatColor, deckF * 0.35)), E(deckSlot, tintFor(sp.flatColor, deckF * 0.64)), E(deckSlot, deckTint),
-          ring, holes, deckY + 0.07, parapetH < 0.4 ? 0.2 : 0.3, clamp(Math.sqrt(area) * 0.06, 0.8, 2.0));
-      }
-      if (detail && !glassDeck && area > 350 && b.type !== 'roof') {
-        // re-roofed patches: a few rectangles of a clearly different shade
-        const cs = Math.cos(frame.angle), sn = Math.sin(frame.angle);
-        const np = (area > 1500 ? 2 : 1) + Math.floor(r2() * 3);
-        for (let k = 0, tries = 0; k < np && tries < 14; tries++) {
-          const u = (r2() - 0.5) * frame.length * 0.7, v = (r2() - 0.5) * frame.width * 0.7;
-          const hu = frame.length * (0.08 + r2() * 0.16), hv = frame.width * (0.1 + r2() * 0.2);
-          const P = (du, dv) => [frame.center[0] + (u + du) * cs - (v + dv) * sn, frame.center[1] + (u + du) * sn + (v + dv) * cs];
-          const rect = [P(-hu, -hv), P(hu, -hv), P(hu, hv), P(-hu, hv)];
-          if (!rect.every(([x, z]) => pointInRing(x, z, ring) && !holes.some((h) => pointInRing(x, z, h)))) continue;
-          const pf = r2() < 0.5 ? 0.7 + r2() * 0.18 : 1.1 + r2() * 0.2;
-          // (each patch at its own height: overlapping coplanar patches would z-fight)
-          emitCap(E(deckSlot, tintFor(sp.flatColor, deckF * pf)), signedArea(rect) < 0 ? rect.reverse() : rect, [], deckY + 0.12 + k * 0.03, 1);
-          k++;
-        }
-      }
-      if (detail && sp.units > 0 && area > 220 && b.type !== 'roof') {
-        const count = clamp(Math.round((area / 500) * sp.units * (0.6 + r() * 0.8)), 1, 14);
-        const unitEm = E(mats.unit(), tintFor(pick(r, ['#c9cbcc', '#b6b9bb', '#d6d4cf', '#a8acae'])));
-        emitRooftopUnits(unitEm, unitEm, ring, holes, deckY, frame, r, count, area > 2000 ? 6 : 4);
-      }
       if (detail && sp.penthouse && wallH > 16 && area > 700) {
         // stair / elevator penthouse near the middle of the roof
         const hx = clamp(frame.length * 0.1, 2.5, 6), hz = clamp(frame.width * 0.12, 2, 4.5);
         const [cx, cz] = frame.center;
         if (pointInRing(cx, cz, ring) && !holes.some((h) => pointInRing(cx, cz, h))) {
-          emitBox(E(plainFor(sp.wallKind), plainWallTint), E(mats.flatRoof(), tintFor(sp.flatColor, deckF * 0.9)), cx + (r() - 0.5) * hx, cz + (r() - 0.5) * hz, hx, hz, frame.angle, deckY, deckY + 3.4);
+          const px = cx + (r() - 0.5) * hx, pz = cz + (r() - 0.5) * hz;
+          emitBox(E(plainFor(sp.wallKind), plainWallTint), E(mats.flatRoof(), tintFor(sp.flatColor, deckF * 0.9)), px, pz, hx, hz, frame.angle, deckY, deckY + 3.4);
           topY = Math.max(topY, deckY + 3.4);
         }
       }
@@ -994,109 +1012,22 @@ export async function createBuildings(ctx) {
       }
     }
 
-    // ---- ground-level details (entrances, porches)
-    if (detail && !elevated && b.type !== 'roof') {
-      if (sp.style === 'house' && area >= 45 && area < 600 && wallH > 4.5) {
-        const pr = isPitched && sp.roof.slot ? sp.roof : { slot: S.tileRoof(), color: pick(r, PAL.shingle) };
-        addPorch(ring, groundY, roofY, r, pr.slot || S.tileRoof(), pr.color ? tintFor(pr.color) : NO_TINT);
-      } else if (!['house', 'shed', 'parking', 'glasshouse'].includes(sp.style) && !sp.shop && sp.typo !== 'row' && area >= 150 && wallH > 5) {
-        addEntrances(ring, sp, groundY, roofY, baseY, r);
-      }
-    }
-
-    // ---- storefronts: ledges, storefront cornices, awnings / canopies (building buffer); sign boards, blade signs,
-    // café furniture (signage atlas meshes, deferred until the atlas is packed)
-    if (plan) {
-      const slots = { trim: mats.trim(), stone: S.stonePlain(), awningSolid: mats.awning(false), awningStriped: mats.awning(true) };
-      street3d.storefrontRuns += plan.runs.length;
-      for (const pr of plan.runs) {
-        emitStorefrontRun({
-          plan: pr, shopH, E, slots, tintFor, signage, defer, near: !lowQ, street, fp: fpIndex, selfId: b.id, heightAt,
-          groundOf: (u) => { const a = runPoint(pr.run, u.s0 + 0.01), c = runPoint(pr.run, u.s1 - 0.01); return groundFn(a.x, a.z, c.x, c.z); },
-          ledgeColor: '#cfc8b8', corniceColor: sp.bracket?.color || pick(r4, ['#3a3835', '#2b2e31', '#5b2b22', '#1f3a2c', '#d8d0bf']),
-        });
-      }
-    }
-
-    // ---- street typology details: bracketed cornices, dormers, bays, rowhouse doors, fire escapes, chimneys
-    if (sp.typo && runs && !elevated) {
-      const frontRuns = runs.filter((run, i) => fronts[i] && !run.blocked && run.len >= 2);
-      const shopRun = (run) => !!plan && plan.runs.some((q) => q.run === run);
-      const paint = E(mats.trim(), tintFor(sp.bracket?.color || '#3a3533'));
-      if (detail && sp.bracket && (mansard || (!isPitched && parapetH > 0.2))) {
-        const list = mansard ? mansard.runs : frontRuns;
-        const key = signage.color(sp.bracket.color || '#3a3533');
-        street3d.brackets++;
-        for (const run of list) {
-          const segs = runSegs(run, 0, run.len), yTop = mansard ? roofY + 0.05 : roofY + 0.06;
-          const co = { out: mansard ? 0.42 : 0.55, frieze: mansard ? 0.42 : 0.62, corona: mansard ? 0.24 : 0.3, dentil: !!sp.bracket.dentil };
-          emitBracketCornice(paint, segs, yTop, co);
-          defer('near', (buf, sg) => emitCorniceDetail(buf, sg.swatch(key), segs, yTop, co));
-        }
-      }
-      if (mansard && detail) {
-        const roofEm = E(S.tileRoof(), roofTint), trimEm = E(mats.trim(), tintFor('#ebe7dd')), winEm = E(mats.dormer(), NO_TINT);
-        for (const run of mansard.runs) {
-          const n = clamp(Math.floor(run.len / 3.8), 1, 5);
-          for (let k = 0; k < n; k++) emitDormer({ p: runPoint(run, (run.len * (k + 0.5)) / n), y0: roofY + 0.04, t: mansard.t, roofEm, trimEm, winEm });
-        }
-      }
+    // ---- bay windows on rowhouse street fronts: part of the wall massing, so base pass (the facade texture array)
+    let bayRun = null;
+    if (detail && sp.typo && runs && !elevated && sp.bays && !(isPitched && !mansard)) {
       const eaveTop = (mansard ? roofY : roofY - parapetH) - (sp.bracket ? (mansard ? 0.75 : 0.98) : 0.3);
-      let bayRun = null;
-      if (detail && sp.bays && !(isPitched && !mansard)) {
-        const cand = frontRuns.filter((run) => run.len >= 5.5 && !shopRun(run));
-        if (cand.length) {
-          bayRun = cand.reduce((p, q) => (q.len > p.len ? q : p));
-          const n = Math.min(sp.bays, Math.max(1, Math.floor(bayRun.len / 5.4)));
-          const capEm = E(mats.trim(), tintFor(sp.bracket?.color || '#3a3533'));
-          for (let k = 0; k < n; k++) {
-            const sC = n === 1 ? bayRun.len * 0.32 : (bayRun.len * (k + 0.5)) / n;
-            const p = runPoint(bayRun, sC);
-            const y0 = clamp(heightAt(p.x + p.nx * 0.6, p.z + p.nz * 0.6), groundY, groundY + liftMax) - 0.3;
-            if (eaveTop - y0 < 4.5) continue;
-            street3d.bays++;
-            emitBay({ run: bayRun, sC, width: 2.9, depth: 0.7, y0, y1: eaveTop, bands: [{ em: mainEm, bay: slot.bay, winW: 0.45, uOffset: 0, vFn: mainVFn }], capEm, bottomEm: null, colliders: ctx.colliders, id: b.id });
-          }
-        }
-      }
-      if (detail && sp.typo === 'row' && !plan && frontRuns.length) {
-        // rowhouse front door with stone jambs + hood and a stoop, over the last window bay of the street front
-        const run = bayRun || frontRuns.reduce((p, q) => (q.len > p.len ? q : p));
-        const nb = Math.max(1, Math.round(run.len / slot.bay)), uw = run.len / nb;
-        const sD = bayRun && nb > 1 ? (nb - 0.5) * uw : (Math.max(0, nb - 1) + 0.5) * uw;
-        addRowDoor(runPoint(run, sD), groundY, liftMax, r4);
-        street3d.rowDoors++;
-      }
-      const totalFloors = nFloors + (shopH > 0 ? 1 : 0);
-      if (detail && sp.fireEscape && totalFloors >= 3) {
-        let list = runs.filter((run, i) => !run.blocked && !fronts[i] && run.len >= 6);
-        if (!list.length && sp.typo === 'apt') list = frontRuns.filter((run) => run.len >= 9 && !shopRun(run));
-        if (list.length) {
-          const run = list.reduce((p, q) => (q.len > p.len ? q : p));
-          const nb = Math.max(1, Math.round(run.len / slot.bay)), uw = run.len / nb;
-          const p = runPoint(run, (Math.floor(nb / 2) + 0.5) * uw);
-          const fh = floorsH / nFloors, ys = [];
-          for (let j = shopH > 0 ? 0 : 1; j < nFloors; j++) ys.push(start + j * fh);
-          if (ys.length >= 2 && !fpIndex.inside(p.x + p.nx * 1.4, p.z + p.nz * 1.4, b.id) && street.clearance(p.x + p.nx * 1.2, p.z + p.nz * 1.2) > 0.3) {
-            const width = clamp(uw * 1.15, 2.6, 3.6);
-            defer('near', (buf, sg) => emitFireEscape({ p, floors: ys, buf, uv: sg.swatch('black'), width }));
-            street3d.fireEscapes++; street3d.sample.fireEscape = street3d.sample.fireEscape || [+p.x.toFixed(1), +p.z.toFixed(1), b.id];
-          }
-        }
-      }
-      if (detail && sp.chimneys && (mansard || !isPitched)) {
-        const deck = mansard ? roofY + mansard.H : roofY - parapetH;
-        const party = runs.filter((run) => run.blocked && run.len > 4);
-        const pool = party.length ? party : runs.filter((run, i) => !fronts[i] && run.len > 4);
-        const nC = pool.length ? 1 + (r4() < 0.4 ? 1 : 0) : 0;
-        for (let k = 0; k < nC; k++) {
-          const run = pool[Math.floor(r4() * pool.length)];
-          const p = runPoint(run, run.len * (0.25 + r4() * 0.5));
-          const cx = p.x - p.nx * 0.55, cz = p.z - p.nz * 0.55;
-          if (!pointInRing(cx, cz, ring)) continue;
-          const ang = Math.atan2(p.tz, p.tx), hC = 1.0 + r4() * 0.8;
-          emitBox(E(S.brickPlain(), tintFor(pick(r4, PAL.red), 0.85)), E(S.concretePlain(), tintFor('#5e5a55')), cx, cz, 0.5 + r4() * 0.3, 0.3, ang, deck - 0.3, deck + hC);
-          topY = Math.max(topY, deck + hC);
+      const cand = runs.filter((run, i) => fronts[i] && !run.blocked && run.len >= 5.5 && !(plan && plan.runs.some((q) => q.run === run)));
+      if (cand.length) {
+        bayRun = cand.reduce((p, q) => (q.len > p.len ? q : p));
+        const n = Math.min(sp.bays, Math.max(1, Math.floor(bayRun.len / 5.4)));
+        const capEm = E(mats.trim(), tintFor(sp.bracket?.color || '#3a3533'));
+        for (let k = 0; k < n; k++) {
+          const sC = n === 1 ? bayRun.len * 0.32 : (bayRun.len * (k + 0.5)) / n;
+          const p = runPoint(bayRun, sC);
+          const y0 = clamp(heightAt(p.x + p.nx * 0.6, p.z + p.nz * 0.6), groundY, groundY + liftMax) - 0.3;
+          if (eaveTop - y0 < 4.5) continue;
+          street3d.bays++;
+          emitBay({ run: bayRun, sC, width: 2.9, depth: 0.7, y0, y1: eaveTop, bands: [{ em: mainEm, bay: slot.bay, winW: 0.45, uOffset: 0, vFn: mainVFn }], capEm, bottomEm: null, colliders: ctx.colliders, id: b.id });
         }
       }
     }
@@ -1113,23 +1044,199 @@ export async function createBuildings(ctx) {
         }
       }
     }
-    return { topY, groundY: lv.groundY, style: sp.style, shop: !!sp.shop && shopH > 0, ring };
+
+    // ---- everything the detail pass will draw from the shop-sign atlas has to be requested now (the atlas is
+    // packed once, after the base pass)
+    if (plan) for (const pr of plan.runs) requestStorefrontSigns({ plan: pr, shopH, signage, near: !lowQ });
+    const bracketKey = sp.typo && sp.bracket ? signage.color(sp.bracket.color || '#3a3533') : null;
+
+    // ================================================================ detail pass (run later, per 250 m chunk)
+    const rd = rng(hashStr(b.id) ^ 0x68e31da4); // detail-only random stream
+    const centre = b.centroid;
+    const detailFn = () => {
+      curGround = ground;
+      // ---- roof edges and roof-top clutter
+      if (isPitched) {
+        const house = sp.style === 'house' || sp.style === 'shed';
+        // soffits + fascia boards; ridge / hip caps; gutters with downspouts on houses
+        emitPitchedRoof(null, E(sp.roof.glass ? roofSlot : mats.trim(), sp.roof.glass ? NO_TINT : soffitTint), ring, planes, roofY, overhang, roofThick, {
+          ridgeEm: detail && !sp.roof.glass && !mansard && roofSlot.key !== 'roof:copper' ? E(roofSlot, tintFor(sp.roof.color || '#555555', 0.78)) : null,
+          gutter: detail && house && !mansard ? { em: E(mats.trim(), tintFor(pick(rd, ['#ece9e2', '#e4dfd4', '#5a4a3c', '#3b3c3e', '#d9d4c8']))), heightAt, groundY } : null,
+        });
+        if (detail && house && !mansard) street3d.gutters++;
+        if (sp.chimney && detail) {
+          const u = (rd() < 0.5 ? -1 : 1) * frame.length * (0.22 + rd() * 0.12);
+          const v = (rd() - 0.5) * frame.width * 0.3;
+          const cs = Math.cos(frame.angle), sn = Math.sin(frame.angle);
+          const cx = frame.center[0] + u * cs - v * sn, cz = frame.center[1] + u * sn + v * cs;
+          if (pointInRing(cx, cz, ring)) {
+            const hb = roofY + envelope(planes, cx, cz) - 0.3;
+            emitChimney(E(S.brickPlain(), tintFor(pick(rd, PAL.red), 0.9)), E(S.concretePlain(), tintFor('#8a857c')), E(S.tileRoof(), tintFor('#9b5a3f')),
+              cx, cz, 0.35 + rd() * 0.15, 0.45 + rd() * 0.2, frame.angle, hb, Math.max(hb + 1.2, topY + 0.7), rd);
+            street3d.chimneys++;
+          }
+        }
+      } else {
+        const corn = detail && sp.cornice && parapetH > 0.3 && wallH > 6 ? sp.cornice : null;
+        emitFlatRoof({
+          deck: null,
+          parapetIn: E(plainFor(sp.wallKind), plainWallTint),
+          coping: E(sp.coping.slot, tintFor(sp.coping.color)),
+          cornice: corn ? E(corn.slot, tintFor(corn.color)) : null,
+        }, ring, holes, roofY, parapetH, { cornice: corn ? { out: corn.out, h: corn.h, y1: roofY - parapetH + 0.12 } : null, parapetT: parapetH < 0.4 ? 0.2 : 0.3 });
+        if (detail && !glassDeck && b.type !== 'roof' && parapetH > 0.05 && area > 60) {
+          // dirt / water marks collecting along the parapet: dark at the parapet, fading into the deck
+          emitDeckBand(E(deckSlot, tintFor(sp.flatColor, deckF * 0.35)), E(deckSlot, tintFor(sp.flatColor, deckF * 0.64)), E(deckSlot, deckTint),
+            ring, holes, deckY + 0.07, parapetH < 0.4 ? 0.2 : 0.3, clamp(Math.sqrt(area) * 0.06, 0.8, 2.0));
+        }
+        if (detail && !glassDeck && area > 350 && b.type !== 'roof') {
+          // re-roofed patches: a few rectangles of a clearly different shade
+          const cs = Math.cos(frame.angle), sn = Math.sin(frame.angle);
+          const np = (area > 1500 ? 2 : 1) + Math.floor(r2() * 3);
+          for (let k = 0, tries = 0; k < np && tries < 14; tries++) {
+            const u = (r2() - 0.5) * frame.length * 0.7, v = (r2() - 0.5) * frame.width * 0.7;
+            const hu = frame.length * (0.08 + r2() * 0.16), hv = frame.width * (0.1 + r2() * 0.2);
+            const P = (du, dv) => [frame.center[0] + (u + du) * cs - (v + dv) * sn, frame.center[1] + (u + du) * sn + (v + dv) * cs];
+            const rect = [P(-hu, -hv), P(hu, -hv), P(hu, hv), P(-hu, hv)];
+            if (!rect.every(([x, z]) => pointInRing(x, z, ring) && !holes.some((h) => pointInRing(x, z, h)))) continue;
+            const pf = r2() < 0.5 ? 0.7 + r2() * 0.18 : 1.1 + r2() * 0.2;
+            // (each patch at its own height: overlapping coplanar patches would z-fight)
+            emitCap(E(deckSlot, tintFor(sp.flatColor, deckF * pf)), signedArea(rect) < 0 ? rect.reverse() : rect, [], deckY + 0.12 + k * 0.03, 1);
+            k++;
+          }
+        }
+        if (detail && area > 60 && b.type !== 'roof' && !glassDeck && sp.style !== 'parking') {
+          const em = {
+            unit: E(mats.unit(), tintFor(pick(rd, ['#c9cbcc', '#b6b9bb', '#d6d4cf', '#a8acae']))), top: E(mats.unitTop(), NO_TINT),
+            dark: E(mats.trim(), tintFor(pick(rd, ['#3c3f42', '#4a4c4e', '#5b5a57']))), glass: E(mats.skylight(), NO_TINT), curb: E(mats.trim(), tintFor('#8d8f8e')),
+          };
+          // packaged HVAC units, fans and skylights on the bigger decks …
+          if (sp.units > 0 && area > 140) {
+            const count = clamp(Math.round((area / 500) * sp.units * (0.6 + rd() * 0.8)), 1, 16);
+            emitRooftopUnits(em, ring, holes, deckY, frame, rd, count, area > 2000 ? 6 : 4, { skylights: area > 400 });
+          }
+          // … and the small stuff on every deck: condensers, plumbing vents, roof hatches
+          const small = clamp(Math.round((area / 170) * (0.5 + rd() * 0.8)), 1, 10);
+          emitRooftopUnits(em, ring, holes, deckY, frame, rd, small, 2, { small: true });
+        }
+      }
+
+      // ---- ground-level details (entrances, porches)
+      if (detail && !elevated && b.type !== 'roof') {
+        if (sp.style === 'house' && area >= 45 && area < 600 && wallH > 4.5) {
+          const pr = isPitched && sp.roof.slot ? sp.roof : { slot: S.shingleRoof(), color: pick(rd, PAL.shingle) };
+          addPorch(ring, groundY, roofY, rd, pr.slot || S.tileRoof(), pr.color ? tintFor(pr.color) : NO_TINT, centre);
+        } else if (!['house', 'shed', 'parking', 'glasshouse'].includes(sp.style) && !sp.shop && sp.typo !== 'row' && area >= 150 && wallH > 5) {
+          addEntrances(ring, sp, groundY, roofY, baseY, rd);
+        }
+      }
+
+      // ---- storefronts: ledges, storefront cornices, awnings / canopies (building buffer); sign boards, blade signs,
+      // café furniture (signage atlas meshes, run once the atlas is packed)
+      if (plan) {
+        const slots = { trim: mats.trim(), stone: S.stonePlain(), awningSolid: mats.awning(false), awningStriped: mats.awning(true) };
+        street3d.storefrontRuns += plan.runs.length;
+        for (const pr of plan.runs) {
+          emitStorefrontRun({
+            plan: pr, shopH, E, slots, tintFor, signage, defer, near: !lowQ, street, fp: fpIndex, selfId: b.id, heightAt,
+            groundOf: (u) => { const a = runPoint(pr.run, u.s0 + 0.01), c = runPoint(pr.run, u.s1 - 0.01); return groundFn(a.x, a.z, c.x, c.z); },
+            ledgeColor: '#cfc8b8', corniceColor: sp.bracket?.color || pick(r4, ['#3a3835', '#2b2e31', '#5b2b22', '#1f3a2c', '#d8d0bf']),
+          });
+        }
+      }
+
+      // ---- street typology details: bracketed cornices, dormers, bays, rowhouse doors, fire escapes, chimneys
+      if (sp.typo && runs && !elevated) {
+        const frontRuns = runs.filter((run, i) => fronts[i] && !run.blocked && run.len >= 2);
+        const shopRun = (run) => !!plan && plan.runs.some((q) => q.run === run);
+        const paint = E(mats.trim(), tintFor(sp.bracket?.color || '#3a3533'));
+        if (detail && sp.bracket && (mansard || (!isPitched && parapetH > 0.2))) {
+          const list = mansard ? mansard.runs : frontRuns;
+          street3d.brackets++;
+          for (const run of list) {
+            const segs = runSegs(run, 0, run.len), yTop = mansard ? roofY + 0.05 : roofY + 0.06;
+            const co = { out: mansard ? 0.42 : 0.55, frieze: mansard ? 0.42 : 0.62, corona: mansard ? 0.24 : 0.3, dentil: !!sp.bracket.dentil };
+            emitBracketCornice(paint, segs, yTop, co);
+            defer('near', (buf, sg) => emitCorniceDetail(buf, sg.swatch(bracketKey), segs, yTop, co));
+          }
+        }
+        if (mansard && detail) {
+          const roofEm = E(S.slateRoof(), roofTint), trimEm = E(mats.trim(), tintFor('#ebe7dd')), winEm = E(mats.dormer(), NO_TINT);
+          for (const run of mansard.runs) {
+            const n = clamp(Math.floor(run.len / 3.8), 1, 5);
+            for (let k = 0; k < n; k++) emitDormer({ p: runPoint(run, (run.len * (k + 0.5)) / n), y0: roofY + 0.04, t: mansard.t, roofEm, trimEm, winEm });
+          }
+        }
+        if (detail && sp.typo === 'row' && !plan && frontRuns.length) {
+          // rowhouse front door with stone jambs + hood and a stoop, over the last window bay of the street front
+          const run = bayRun || frontRuns.reduce((p, q) => (q.len > p.len ? q : p));
+          const nb = Math.max(1, Math.round(run.len / slot.bay)), uw = run.len / nb;
+          const sD = bayRun && nb > 1 ? (nb - 0.5) * uw : (Math.max(0, nb - 1) + 0.5) * uw;
+          addRowDoor(runPoint(run, sD), groundY, liftMax, r4);
+          street3d.rowDoors++;
+        }
+        const totalFloors = nFloors + (shopH > 0 ? 1 : 0);
+        if (detail && sp.fireEscape && totalFloors >= 3) {
+          let list = runs.filter((run, i) => !run.blocked && !fronts[i] && run.len >= 6);
+          if (!list.length && sp.typo === 'apt') list = frontRuns.filter((run) => run.len >= 9 && !shopRun(run));
+          if (list.length) {
+            const run = list.reduce((p, q) => (q.len > p.len ? q : p));
+            const nb = Math.max(1, Math.round(run.len / slot.bay)), uw = run.len / nb;
+            const p = runPoint(run, (Math.floor(nb / 2) + 0.5) * uw);
+            const fh = floorsH / nFloors, ys = [];
+            for (let j = shopH > 0 ? 0 : 1; j < nFloors; j++) ys.push(start + j * fh);
+            if (ys.length >= 2 && !fpIndex.inside(p.x + p.nx * 1.4, p.z + p.nz * 1.4, b.id) && street.clearance(p.x + p.nx * 1.2, p.z + p.nz * 1.2) > 0.3) {
+              const width = clamp(uw * 1.15, 2.6, 3.6);
+              defer('near', (buf, sg) => emitFireEscape({ p, floors: ys, buf, uv: sg.swatch('black'), width }));
+              street3d.fireEscapes++; street3d.sample.fireEscape = street3d.sample.fireEscape || [+p.x.toFixed(1), +p.z.toFixed(1), b.id];
+            }
+          }
+        }
+        if (detail && sp.chimneys && (mansard || !isPitched)) {
+          const deck = mansard ? roofY + mansard.H : roofY - parapetH;
+          const party = runs.filter((run) => run.blocked && run.len > 4);
+          const pool = party.length ? party : runs.filter((run, i) => !fronts[i] && run.len > 4);
+          const nC = pool.length ? 1 + (r4() < 0.4 ? 1 : 0) : 0;
+          for (let k = 0; k < nC; k++) {
+            const run = pool[Math.floor(r4() * pool.length)];
+            const p = runPoint(run, run.len * (0.25 + r4() * 0.5));
+            const cx = p.x - p.nx * 0.55, cz = p.z - p.nz * 0.55;
+            if (!pointInRing(cx, cz, ring)) continue;
+            const ang = Math.atan2(p.tz, p.tx), hC = 1.0 + r4() * 0.8;
+            emitChimney(E(S.brickPlain(), tintFor(pick(r4, PAL.red), 0.85)), E(S.concretePlain(), tintFor('#6e6a64')), E(S.tileRoof(), tintFor('#9b5a3f')),
+              cx, cz, 0.5 + r4() * 0.3, 0.3, ang, deck - 0.3, deck + hC, r4);
+            street3d.chimneys++;
+          }
+        }
+      }
+    };
+    return { topY, groundY: lv.groundY, style: sp.style, shop: !!sp.shop && shopH > 0, ring, detail: detailFn };
   }
 
-  // ---- main loop
+  // ---- main loop (base pass for every building; detail closures are collected per 250 m chunk)
   const total = src.length;
   ctx.loading?.detail?.(`建筑 0 / ${total}`);
   for (let i = 0; i < total; i++) {
     const b = src[i];
     const cx = b.centroid[0], cz = b.centroid[1];
-    curChunk = `${Math.floor(cx / CHUNK)},${Math.floor(cz / CHUNK)}`;
+    const bgx = Math.floor(cx / BASE_CHUNK), bgz = Math.floor(cz / BASE_CHUNK), bk = bgx + ',' + bgz;
+    curBase = baseChunks.get(bk);
+    if (!curBase) { curBase = { key: bk, x0: bgx * BASE_CHUNK, z0: bgz * BASE_CHUNK, size: BASE_CHUNK, bufs: null, meshes: [] }; baseChunks.set(bk, curBase); }
+    const dgx = Math.floor(cx / CHUNK), dgz = Math.floor(cz / CHUNK), dk = dgx + ',' + dgz;
+    curDetail = detailChunks.get(dk);
+    if (!curDetail) {
+      curDetail = { key: dk, x0: dgx * CHUNK, z0: dgz * CHUNK, size: CHUNK, items: [], cursor: 0, done: false, bufs: null, far: [], near: [], meshes: [], signFar: null, signNear: null, d: 0 };
+      detailChunks.set(dk, curDetail);
+    }
     // parts of one multi-ring relation share a highlight / pick index
     let gid = groupOf.get(b.osmId);
     if (gid === undefined) { gid = groups.length; groupOf.set(b.osmId, gid); groups.push(null); }
     curBid = gid;
+    pass = 'base';
     let res = null;
     try { res = buildOne(b); } catch (e) { console.warn('[buildings] failed', b.id, e); }
     if (!res) continue;
+    if (res.detail) curDetail.items.push({ bid: gid, fn: res.detail });
     const nameSrc = b.name ? b : b._nameFrom || null;
     const name = nameSrc?.name || null;
     const infoEntry = ctx.info?.buildings?.[b.osmId] || (nameSrc ? ctx.info?.buildings?.[nameSrc.osmId] : null);
@@ -1158,13 +1265,17 @@ export async function createBuildings(ctx) {
       else if (list[near].data.area < b.area) list[near] = rec;
       nameSeen.set(labelName, list);
     }
-    if (i % 150 === 149) { ctx.loading?.detail?.(`建筑 ${i + 1} / ${total}`); await ctx.yield?.(); }
+    if ((i & 31) === 31) {
+      if ((i & 1023) === 1023) ctx.loading?.detail?.(`建筑 ${i + 1} / ${total}`);
+      await ctx.yield?.();
+    }
   }
 
   const T1 = performance.now();
   // ---- meshes
   const group = new THREE.Group();
   group.name = 'buildings';
+  group.matrixAutoUpdate = false;
   const meshes = [];
   const resolver = (hit) => {
     const attr = hit.object.geometry.attributes.bidLayer;
@@ -1172,71 +1283,147 @@ export async function createBuildings(ctx) {
     const rec = groups[Math.round(attr.getX(hit.face.a))];
     return rec ? rec.entry : null;
   };
+  // every texture layer the (lazy) detail pass can use must exist before the arrays are built
+  for (const f of [mats.trim, mats.door, mats.woodDoor, mats.dormer, mats.unit, mats.unitTop, mats.skylight, mats.flatRoof, mats.gravelRoof, mats.copper]) f();
+  mats.awning(true); mats.awning(false);
+  for (const f of Object.values(S)) f();
   const arrayMats = mats.build();
   const T2 = performance.now();
-  for (const [ck, m] of chunks) {
-    for (const kind of ['facade', 'surface']) {
-      const buf = m[kind];
-      if (buf.empty) continue;
+  let detailTris = 0;
+  function makeMeshes(c, tag, shadow = true) {
+    if (!c.bufs) return;
+    {
+      const buf = c.bufs.all;
+      if (buf.empty) { c.bufs = null; return; }
       const geom = buf.toGeometry(); // (frees the buffer's growable arrays)
-      const mesh = new THREE.Mesh(geom, arrayMats[kind]);
-      mesh.name = `bld:${ck}:${kind}`;
-      mesh.castShadow = true;
+      const mesh = new THREE.Mesh(geom, arrayMats.all);
+      mesh.name = `bld:${tag}:${c.key}`;
+      mesh.castShadow = shadow;
       mesh.receiveShadow = true;
       mesh.matrixAutoUpdate = false;
       mesh.updateMatrix();
       group.add(mesh);
       meshes.push(mesh);
-      triCount += buf.triangles;
+      c.meshes.push(mesh);
+      if (tag === 'base') triCount += buf.triangles; else detailTris += buf.triangles;
       ctx.pick?.add(mesh, resolver);
     }
+    c.bufs = null;
   }
-  group.matrixAutoUpdate = false;
+  for (const c of baseChunks.values()) makeMeshes(c, 'base');
   const T3 = performance.now();
-  const nChunks = chunks.size;
-  chunks.clear(); // the geometry lives in the meshes now; don't keep the build buffers reachable from closures
   ctx.scene.add(group);
 
-  // ---- shop signage + small street furniture: one atlas material, per chunk a 'far' mesh (fascia / pole signs) and a
-  // 'near' mesh (blade signs, café tables, sandwich boards), each hidden beyond its distance from the chunk.
+  // ---- shop signage + small street furniture: one atlas material, per detail chunk a 'far' mesh (fascia / pole
+  // signs) and a 'near' mesh (blade signs, café tables, sandwich boards, cornice brackets, fire escapes)
   const streetGroup = new THREE.Group();
   streetGroup.name = 'street-signage';
-  const lodSets = [];
-  let signTris = 0, signCount = 0, atlasSize = null;
-  if (streetChunks.size) {
-    const sg = signage.build();
-    signCount = sg.count;
-    atlasSize = [sg.width, sg.height];
-    for (const c of streetChunks.values()) {
-      const [gx, gz] = c.key.split(',').map(Number);
-      const entry = { x0: gx * CHUNK, z0: gz * CHUNK, far: null, near: null };
-      for (const kind of ['far', 'near']) {
-        if (!c[kind].length) continue;
-        const buf = new AtlasBuffer();
-        for (const fn of c[kind]) { try { fn(buf, signage); } catch (e) { console.warn('[buildings] street detail failed', e); } }
-        const mesh = buf.toMesh(sg.material, `street:${c.key}:${kind}`);
-        if (!mesh) continue;
-        signTris += buf.tris;
-        streetGroup.add(mesh);
-        entry[kind] = mesh;
-      }
-      if (entry.far || entry.near) lodSets.push(entry);
+  streetGroup.matrixAutoUpdate = false;
+  ctx.scene.add(streetGroup);
+  const sg = signage.build();
+  let signTris = 0;
+
+  // ---- detail chunks: run the collected closures (optionally time-sliced), then build the chunk's meshes
+  const detailList = [...detailChunks.values()].filter((c) => c.items.length);
+  let detailBuilt = 0, detailMs = 0, shadowDirty = false;
+  function stepDetail(dc, deadline) {
+    const t0 = performance.now();
+    pass = 'detail'; curDetail = dc;
+    const items = dc.items;
+    while (dc.cursor < items.length) {
+      const it = items[dc.cursor++];
+      curBid = it.bid;
+      try { it.fn(); } catch (e) { console.warn('[buildings] detail failed', e); }
+      items[dc.cursor - 1] = null;
+      if (performance.now() > deadline && dc.cursor < items.length) { pass = 'base'; detailMs += performance.now() - t0; return false; }
     }
-    streetChunks.clear();
-    streetGroup.matrixAutoUpdate = false;
-    ctx.scene.add(streetGroup);
-    ctx.onUpdate?.(() => {
-      const cam = ctx.camera;
-      if (!cam) return;
-      const p = cam.position;
-      for (const e of lodSets) {
-        const dx = Math.max(e.x0 - p.x, 0, p.x - e.x0 - CHUNK), dz = Math.max(e.z0 - p.z, 0, p.z - e.z0 - CHUNK);
-        const d = Math.hypot(dx, dz, Math.max(0, p.y - 60));
-        if (e.far) e.far.visible = d < SIGN_FAR;
-        if (e.near) e.near.visible = d < DETAIL_NEAR;
-      }
-    }, 11);
+    pass = 'base';
+    makeMeshes(dc, 'detail');
+    for (const kind of ['far', 'near']) {
+      if (!dc[kind].length) continue;
+      const buf = new AtlasBuffer();
+      for (const fn of dc[kind]) { try { fn(buf, signage); } catch (e) { console.warn('[buildings] street detail failed', e); } }
+      const mesh = buf.toMesh(sg.material, `street:${dc.key}:${kind}`);
+      dc[kind] = null;
+      if (!mesh) continue;
+      signTris += buf.tris;
+      streetGroup.add(mesh);
+      dc[kind === 'far' ? 'signFar' : 'signNear'] = mesh;
+    }
+    dc.far = dc.near = null;
+    dc.items = null;
+    dc.done = true;
+    detailBuilt++;
+    shadowDirty = true;
+    detailMs += performance.now() - t0;
+    return true;
   }
+
+  // distance from the camera to a chunk's square (the height above ~60 m counts too: detail is sub-pixel from high up)
+  const chunkDist = (c, p) => {
+    const dx = Math.max(c.x0 - p.x, 0, p.x - c.x0 - c.size), dz = Math.max(c.z0 - p.z, 0, p.z - c.z0 - c.size);
+    return Math.hypot(dx, dz, Math.max(0, p.y - 60));
+  };
+  const LOD = lowQ ? { show: 480, build: 520, urgent: 260, init: 300 } : { show: 720, build: 780, urgent: 380, init: 420 };
+  // start view: a ?cam= link, else the home view over the campus
+  const start = (() => {
+    try {
+      const v = (new URLSearchParams(location.search).get('cam') || '').split(',').map(Number);
+      if (v.length === 3 && v.every(Number.isFinite)) return { x: v[0], y: v[1], z: v[2] };
+    } catch { /* no location */ }
+    return { x: -120, y: 60, z: 70 };
+  })();
+  const T4 = performance.now();
+  for (const dc of detailList.map((c) => [chunkDist(c, start), c]).sort((a, b) => a[0] - b[0])) {
+    if (dc[0] > LOD.init) break; // (the rest follows lazily during the first frames)
+    stepDetail(dc[1], Infinity);
+    if (performance.now() - T4 > 150) { await ctx.yield?.(); }
+  }
+  const T5 = performance.now();
+  const initChunks = detailBuilt, initDetailMs = Math.round(detailMs);
+
+  // ---- per-frame LOD: base chunks within drawDistance; detail + signs by distance (the detail's small shadows
+  // only near the camera); lazy detail builds, nearest first, within a per-frame time budget — a bigger one for
+  // chunks already close to the camera (after a teleport / fast flight), so they catch up within a few frames
+  // instead of one long stall. In ?shot mode the close ones are built at once.
+  const baseList = [...baseChunks.values()].filter((c) => c.meshes.length);
+  const budgetMs = ctx.shotMode ? 40 : 4, urgentMs = ctx.shotMode ? Infinity : 12;
+  const pending = [];
+  ctx.onUpdate?.(() => {
+    const cam = ctx.camera;
+    if (!cam) return;
+    const p = cam.position;
+    const far = ctx.quality?.drawDistance || 3200;
+    for (const c of baseList) {
+      const vis = chunkDist(c, p) < far;
+      for (const m of c.meshes) m.visible = vis;
+    }
+    pending.length = 0;
+    for (const c of detailList) {
+      const d = chunkDist(c, p);
+      c.d = d;
+      if (!c.done) { if (d < LOD.build) pending.push(c); continue; }
+      const vis = d < LOD.show, cast = d < 420;
+      for (const m of c.meshes) { m.visible = vis; m.castShadow = cast; } // (picked up by the next periodic shadow update)
+      if (c.signFar) c.signFar.visible = d < SIGN_FAR;
+      if (c.signNear) c.signNear.visible = d < DETAIL_NEAR;
+    }
+    if (pending.length) {
+      pending.sort((a, b) => a.d - b.d);
+      const t0 = performance.now(), deadline = t0 + budgetMs, urgentDeadline = t0 + urgentMs;
+      for (const c of pending) {
+        if (c.d < LOD.urgent && performance.now() < urgentDeadline) stepDetail(c, urgentDeadline);
+        else if (performance.now() < deadline) stepDetail(c, deadline);
+        else break;
+        const vis = c.done && c.d < LOD.show;
+        for (const m of c.meshes) m.visible = vis;
+        if (c.signFar) c.signFar.visible = c.d < SIGN_FAR;
+        if (c.signNear) c.signNear.visible = c.d < DETAIL_NEAR;
+      }
+    }
+    if (shadowDirty) { shadowDirty = false; ctx.env?.refreshShadows?.(); }
+    if (!sg.done) sg.step(ctx.shotMode ? 60 : 6); // shop-sign lettering, painted after start-up
+  }, 11);
 
   // ---- labels (one per distinct name)
   for (const rec of [...nameSeen.values()].flat()) {
@@ -1261,9 +1448,16 @@ export async function createBuildings(ctx) {
     highlight(id) { U.uSelect.value = indexOf(id); },
     hover(id) { U.uHover.value = indexOf(id); },
     streetGroup,
-    stats: { buildings: records.length, meshes: meshes.length, triangles: triCount, chunks: nChunks, signs: signCount, signAtlas: atlasSize, street: street3d, streetMeshes: streetGroup.children.length, streetTriangles: signTris, materials: 2, layers: mats.slots.size, ms: { geometry: Math.round(T1 - T0), paint: Math.round(mats.paintMs), textures: Math.round(T2 - T1), meshes: Math.round(T3 - T2) } },
+    get stats() {
+      return {
+        buildings: records.length, meshes: meshes.length, triangles: triCount, detailTriangles: detailTris, baseChunks: baseList.length,
+        detailChunks: detailList.length, detailBuilt, detailMs: Math.round(detailMs), signs: sg.count, signAtlas: [sg.width, sg.height], street: street3d,
+        streetMeshes: streetGroup.children.length, streetTriangles: signTris, materials: 1, layers: mats.slots.size,
+        ms: { base: Math.round(T1 - T0), paint: Math.round(mats.paintMs), textures: Math.round(T2 - T1), meshes: Math.round(T3 - T2), atlas: Math.round(T4 - T3), initDetail: Math.round(T5 - T4), initDetailWork: initDetailMs, initChunks, total: Math.round(T5 - T0) },
+      };
+    },
   };
-  console.info(`[buildings] ${records.length} buildings, ${meshes.length} meshes, ${(triCount / 1000).toFixed(0)}k triangles, ${nChunks} chunks, ${mats.slots.size} texture layers, ${signCount} signs (${streetGroup.children.length} street meshes, ${(signTris / 1000).toFixed(0)}k tris)`);
+  console.info(`[buildings] ${records.length} buildings, ${baseList.length} base chunks (${(triCount / 1000).toFixed(0)}k tris), detail ${detailBuilt}/${detailList.length} chunks at start, ${mats.slots.size} texture layers, ${sg.count} signs, ${Math.round(T5 - T0)} ms`);
   return ctx.buildings;
 }
 

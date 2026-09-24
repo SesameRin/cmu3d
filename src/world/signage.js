@@ -49,6 +49,38 @@ const BRANDS = [
   [/noodles & company/i, { text: 'noodles & company', font: F.rounded, weight: 700, board: '#b4202a', color: '#ffffff' }],
   [/einstein/i, { text: 'EINSTEIN BROS. BAGELS', font: F.sansBold, weight: 900, board: '#2a3b6b', color: '#f5c342' }],
   [/crazy mocha/i, { text: 'Crazy Mocha', font: F.script, weight: 400, board: '#3b2417', color: '#f0dcb4', awning: { color: '#3b2417' }, tables: 2 }],
+  // Shadyside (Walnut Street) and East Liberty (Penn / Highland Avenue, Centre Avenue)
+  [/^target$/i, { text: 'TARGET', font: F.sansBold, weight: 900, board: '#f4f1ea', color: '#cc0000', light: true, canopy: true }],
+  [/trader joe/i, { text: "TRADER JOE'S", font: F.classic, weight: 700, board: '#6b1f1f', color: '#f3ead2', border: '#d8c9a3' }],
+  [/whole foods/i, { text: 'WHOLE FOODS MARKET', font: F.serif, weight: 700, board: '#1e4d2b', color: '#f4efe0' }],
+  [/shake shack/i, { text: 'SHAKE SHACK', font: F.sans, weight: 700, board: '#1a1a1a', color: '#ffffff', tables: 2 }],
+  [/^cava$/i, { text: 'CAVA', font: F.sansBold, weight: 900, board: '#f2ede2', color: '#b5471f', light: true }],
+  [/honeygrow/i, { text: 'honeygrow', font: F.rounded, weight: 700, board: '#1a1a1a', color: '#f7b500' }],
+  [/wingstop/i, { text: 'WINGSTOP', font: F.sansBold, weight: 900, board: '#0f4d2e', color: '#ffffff' }],
+  [/wendy/i, { text: "Wendy's", font: F.script, weight: 700, board: '#ffffff', color: '#d6252f', light: true }],
+  [/little caesars/i, { text: 'LITTLE CAESARS', font: F.sansBold, weight: 900, board: '#f07b1a', color: '#ffffff' }],
+  [/^sephora$/i, { text: 'SEPHORA', font: F.sans, weight: 400, board: '#0d0d0d', color: '#ffffff' }],
+  [/^j\.? ?crew$/i, { text: 'J.CREW', font: F.serif, weight: 400, board: '#141414', color: '#f2f0ea' }],
+  [/lululemon/i, { text: 'lululemon', font: F.sans, weight: 600, board: '#f5f3ef', color: '#c8102e', light: true }],
+  [/patagonia/i, { text: 'patagonia', font: F.serif, weight: 700, board: '#141414', color: '#f2f0ea' }],
+  [/^pandora$/i, { text: 'PANDORA', font: F.sans, weight: 400, board: '#f6f2ee', color: '#1b1b1b', light: true }],
+  [/occitane/i, { text: "L'OCCITANE", font: F.classic, weight: 400, board: '#f3c300', color: '#1b1b1b', light: true }],
+  [/paris baguette/i, { text: 'PARIS BAGUETTE', font: F.sans, weight: 700, board: '#11275a', color: '#ffffff', tables: 2 }],
+  [/paris 66/i, { text: 'Paris 66', sub: 'BISTRO', font: F.classic, weight: 700, italic: true, board: '#1c2f5a', color: '#f4efe0', border: '#b8994a', awning: { color: '#8e1f28', striped: true }, tables: 3 }],
+  [/kelly'?s bar/i, { text: "KELLY'S", sub: 'BAR & LOUNGE', font: F.impact, weight: 400, board: '#161616', color: '#e8474c', blade: true }],
+  [/mad mex/i, { text: 'MAD MEX', font: F.impact, weight: 400, board: '#d8342a', color: '#ffe066', tables: 3 }],
+  [/hotel indigo/i, { text: 'HOTEL INDIGO', font: F.sans, weight: 700, board: '#2a2a2a', color: '#6fb7e6' }],
+  [/ace hotel/i, { text: 'ACE HOTEL', font: F.sans, weight: 700, board: '#141414', color: '#ffffff' }],
+  [/condado/i, { text: 'CONDADO', sub: 'TACOS', font: F.impact, weight: 400, board: '#1a1a1a', color: '#ff4f7b', tables: 2 }],
+  [/huntington/i, { text: 'Huntington', font: F.sans, weight: 700, board: '#ffffff', color: '#2f7d32', light: true, canopy: true }],
+  [/first national bank/i, { text: 'FNB', font: F.sansBold, weight: 900, board: '#0f2d5c', color: '#ffffff', canopy: true }],
+  [/fifth third/i, { text: 'Fifth Third Bank', font: F.sans, weight: 700, board: '#0b4d2c', color: '#ffffff', canopy: true }],
+  [/^citizens$/i, { text: 'Citizens', font: F.sans, weight: 600, board: '#ffffff', color: '#138a64', light: true }],
+  [/bruegger/i, { text: "BRUEGGER'S BAGELS", font: F.sansBold, weight: 900, board: '#4a2616', color: '#f6c33d' }],
+  [/coffee tree/i, { text: 'The Coffee Tree Roasters', font: F.serif, weight: 700, board: '#2b3a1f', color: '#efe6c9', tables: 3, blade: true }],
+  [/prantl/i, { text: "Prantl's Bakery", font: F.script, weight: 700, board: '#f4eee0', color: '#7a1f2b', light: true }],
+  [/^shell$/i, { text: 'SHELL', font: F.sansBold, weight: 900, board: '#f6c800', color: '#d21f1f', light: true, canopy: true }],
+  [/sherwin/i, { text: 'SHERWIN-WILLIAMS', font: F.sans, weight: 700, board: '#1a3a7a', color: '#ffffff' }],
 ];
 
 const HOUSE_BOARDS = ['#1d3a2b', '#5b1d22', '#1c2a44', '#161616', '#3a2a1c', '#2c4a4a', '#4a2a4a', '#6a2a1a', '#223344', '#2e2e2e'];
@@ -114,6 +146,22 @@ function defaults(biz, name) {
 // Generic category words for unnamed shop units (no invented business names).
 export const GENERIC_SIGNS = ['PIZZA', 'DELI', 'CLEANERS', 'BARBER', 'NAILS', 'PHONE REPAIR', 'BOOKS', 'FLOWERS', 'OPTICAL', 'LAUNDROMAT', 'TAILOR', 'GIFTS', 'CONVENIENCE', 'SALON', 'COPY & PRINT', 'COFFEE'];
 
+// Approximate advance width of a string in em (slightly generous, so estimated text never overflows its board).
+const NARROW = new Set([...'iljtfrI.,:;\'!|’ ']), WIDE = new Set([...'mwMW@%&']), CAPS_WIDE = new Set([...'ABCDGHKNOQRUVXYZ']);
+const FONT_K = new Map([[F.sansBold, 1.2], [F.impact, 0.8], [F.condensed, 0.84], [F.serif, 0.96], [F.classic, 0.95], [F.script, 0.9], [F.rounded, 1.02], [F.mono, 1.12], [F.sans, 1]]);
+function textWidthEm(text, style, weight) {
+  let w = 0;
+  for (const ch of text) {
+    if (ch === ' ') w += 0.28;
+    else if (NARROW.has(ch)) w += 0.3;
+    else if (WIDE.has(ch)) w += 0.86;
+    else if (ch >= 'A' && ch <= 'Z') w += CAPS_WIDE.has(ch) ? 0.72 : 0.64;
+    else if (ch >= '0' && ch <= '9') w += 0.56;
+    else w += 0.54;
+  }
+  return w * (FONT_K.get(style.font) ?? 1) * (weight >= 700 ? 1.06 : 1) * 1.05;
+}
+
 // ---------------------------------------------------------------- atlas
 const SWATCHES = {
   black: '#1b1c1d', metal: '#2e3033', grey: '#6b6e70', white: '#efede6', chrome: '#b9bdc0', wood: '#7a5537', teak: '#9a6e45',
@@ -124,8 +172,8 @@ const SWATCHES = {
 export function createSignage(ctx) {
   const low = ctx.quality?.level === 'low';
   const S = low ? 0.5 : 1;
-  const RH = Math.round(76 * S);   // row height (px) of a fascia sign cell
-  const AW = Math.round(2048 * S); // atlas width
+  const RH = Math.round(64 * S);   // row height (px) of a fascia sign cell
+  const AW = Math.round(4096 * S); // atlas width
   const GUT = 3;                   // gutter (px) around every cell, filled with the cell's background
   const items = [];
   const byKey = new Map();
@@ -133,9 +181,17 @@ export function createSignage(ctx) {
 
   // Fascia sign cell for a text + style (shared by every board showing it). The cell's aspect follows the text
   // length (2.5:1 … 7:1); a wider board shows the cell in its middle and repeats the plain board colour at the ends.
+  // After build() the atlas is fixed: a cell nobody requested before gets a plain board (see requestStorefrontSigns).
+  let fallback = null;
+  function late(kind, text) {
+    console.warn(`[signage] ${kind} "${text}" requested after the atlas was packed`);
+    const uv = swatch('black');
+    return fallback || (fallback = { kind, text, aspect: 3, rect: [uv[0], uv[1], uv[0], uv[1]], edgeU: uv[0] });
+  }
   function board(text, style) {
     const k = 'b|' + text + '|' + styleKey(style);
     if (byKey.has(k)) return byKey.get(k);
+    if (built) return late('board', text);
     const aspect = Math.min(7, Math.max(2.5, text.length * 0.5 + 1.6 + (style.sub ? 0.5 : 0)));
     const it = { kind: 'board', text, style, aspect, rect: null };
     items.push(it); byKey.set(k, it);
@@ -145,6 +201,7 @@ export function createSignage(ctx) {
   function blade(text, style) {
     const k = 'p|' + text + '|' + styleKey(style);
     if (byKey.has(k)) return byKey.get(k);
+    if (built) return late('blade', text);
     const it = { kind: 'blade', text, style, aspect: 1.5, rect: null };
     items.push(it); byKey.set(k, it);
     return it;
@@ -161,14 +218,21 @@ export function createSignage(ctx) {
   const swatchUV = new Map();
   function swatch(name) { return swatchUV.get(name) || swatchUV.get('metal'); }
 
+  // Text is always set in one reference size (REF px) and scaled into its box with the canvas transform: a new
+  // font size per sign made the browser build a new font instance for almost every sign (≈ 1 ms each).
+  const REF = 48;
+  const fontStr = (style, weightOverride) => `${style.italic ? 'italic ' : ''}${weightOverride ?? style.weight ?? 700} ${REF}px ${style.font}`;
+  function setFont(g, f) { if (g.__font !== f) { g.font = f; g.__font = f; } }
+  // → scale k so that the text fits maxW x maxH (px = REF * k). The width is estimated from per-character advances
+  // (measureText cost ≈ 0.25 ms per new string — a few hundred signs added up to over 100 ms of start-up).
   function fitFont(g, style, text, maxW, maxH, weightOverride) {
-    const it = style.italic ? 'italic ' : '';
-    let px = maxH;
-    const font = (p) => `${it}${weightOverride ?? style.weight ?? 700} ${Math.max(6, Math.floor(p))}px ${style.font}`;
-    g.font = font(px);
-    let w = g.measureText(text).width;
-    if (w > maxW) { px *= maxW / w; g.font = font(px); w = g.measureText(text).width; }
-    return { px, w };
+    setFont(g, fontStr(style, weightOverride));
+    const w = textWidthEm(text, style, weightOverride ?? style.weight ?? 700) * REF;
+    const k = Math.min(maxH / REF, maxW / w);
+    return { k, px: REF * k, w: w * k };
+  }
+  function drawText(g, text, x, y, k) {
+    g.save(); g.translate(x, y); g.scale(k, k); g.fillText(text, 0, 0); g.restore();
   }
 
   function paintCell(g, ge, it, x, y, w, h) {
@@ -199,18 +263,18 @@ export function createSignage(ctx) {
     const cx = x + w / 2;
     let cy = y + h * (sub ? 0.4 : lines.length > 1 ? 0.3 : 0.52);
     for (const line of lines) {
-      const { px } = fitFont(g, st, line, w * 0.86, mainH);
-      ge.font = g.font;
+      const { k, px } = fitFont(g, st, line, w * 0.86, mainH);
       // soft drop shadow for legibility, then the letters
-      g.fillStyle = 'rgba(0,0,0,0.35)'; g.fillText(line, cx + px * 0.03, cy + px * 0.04);
-      g.fillStyle = st.color; g.fillText(line, cx, cy);
-      ge.fillStyle = st.light ? 'rgba(0,0,0,0)' : st.color; if (!st.light) ge.fillText(line, cx, cy);
+      g.fillStyle = 'rgba(0,0,0,0.35)'; drawText(g, line, cx + px * 0.03, cy + px * 0.04, k);
+      g.fillStyle = st.color; drawText(g, line, cx, cy, k);
+      // back-lit box: the letters stay dark against the glowing panel; otherwise the letters glow
+      setFont(ge, g.__font); ge.fillStyle = st.light ? '#000' : st.color; drawText(ge, line, cx, cy, k);
       cy += h * 0.4;
     }
     if (sub) {
-      fitFont(g, { ...st, italic: false, font: F.sans }, sub, w * 0.6, h * 0.2, 600);
-      g.fillStyle = st.color; g.fillText(sub, cx, y + h * 0.8);
-      if (!st.light) { ge.font = g.font; ge.fillStyle = st.color; ge.fillText(sub, cx, y + h * 0.8); }
+      const { k } = fitFont(g, { ...st, italic: false, font: F.sans }, sub, w * 0.6, h * 0.2, 600);
+      g.fillStyle = st.color; drawText(g, sub, cx, y + h * 0.8, k);
+      setFont(ge, g.__font); ge.fillStyle = st.light ? '#000' : st.color; drawText(ge, sub, cx, y + h * 0.8, k);
     }
   }
 
@@ -245,19 +309,40 @@ export function createSignage(ctx) {
       sx += sw;
     }
     for (const c of cells) {
-      paintCell(g, ge, c.it, c.x, c.y, c.w, c.h);
       // canvas y is down; texture v is up (flipY)
       c.it.rect = [c.x / AW, 1 - (c.y + c.h) / AH, (c.x + c.w) / AW, 1 - c.y / AH];
       c.it.edgeU = (c.x + Math.max(3, c.h * 0.08)) / AW; // a plain column inside the frame (for board extensions)
     }
-    const map = M.canvasTexture(cMap, { release: true });
-    const emissiveMap = M.canvasTexture(cEm, { release: true });
-    for (const t of [map, emissiveMap]) { t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping; t.repeat.set(1, 1); }
+    // The lettering is painted AFTER start-up, a few ms per frame (step()), and the atlas uploaded once when it is
+    // complete (text rasterisation for ~450 signs took ~150 ms of loading time). Until then the atlas samples black.
+    const tex = (canvas) => {
+      const t = new THREE.Texture(canvas); // (not CanvasTexture: that one would upload the blank canvas right away)
+      t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
+      t.colorSpace = THREE.SRGBColorSpace;
+      t.anisotropy = 4;
+      t.onUpdate = () => { t.onUpdate = null; canvas.width = canvas.height = 1; }; // release the backing store
+      return t;
+    };
+    const map = tex(cMap), emissiveMap = tex(cEm);
     const material = new THREE.MeshStandardMaterial({ map, emissiveMap, emissive: new THREE.Color('#ffffff'), emissiveIntensity: 0, roughness: 0.55, metalness: 0.1 });
     material.name = 'street-signage';
     M.registerNightMaterial(material, 1.15);
-    built = { material, width: AW, height: AH, count: items.length };
-    items.length = 0; byKey.clear();
+    let next = 0;
+    built = {
+      material, width: AW, height: AH, count: items.length, done: false,
+      step(budgetMs = 6) {
+        if (built.done) return true;
+        const t0 = performance.now();
+        while (next < cells.length) {
+          const c = cells[next++];
+          paintCell(g, ge, c.it, c.x, c.y, c.w, c.h);
+          if (performance.now() - t0 > budgetMs) break;
+        }
+        if (next >= cells.length) { built.done = true; map.needsUpdate = true; emissiveMap.needsUpdate = true; }
+        return built.done;
+      },
+    };
+    items.length = 0; // (byKey stays: the lazy detail pass looks its cells up again)
     return built;
   }
 

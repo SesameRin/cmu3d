@@ -355,13 +355,25 @@ export function createMaterials(ctx) {
   // (materials built by other modules from these maps included). Skipped: materials that already have a normal /
   // bump map or patch their shader, meshes without UVs / normals. Idempotent; call before compiling (engine.warm /
   // precompile do). Returns the number of materials upgraded.
+  // Also, where the frame is multisampled: alpha-tested cut-outs (chain-link and picket fences, lattices, signs) use
+  // alpha-to-coverage — their edges get the MSAA samples instead of a hard, shimmering 1-bit cut.
+  const msaa = !!ctx.quality?.antialias;
   function enhance(root) {
-    if (!reliefOn || !root) return 0;
+    if (!root) return 0;
     let n = 0;
     const seen = new Set();
     root.traverse((o) => {
-      if (!o.isMesh || !o.geometry?.attributes?.uv || !o.geometry.attributes.normal) return;
-      for (const m of Array.isArray(o.material) ? o.material : [o.material]) {
+      if (!o.isMesh) return;
+      const mats = Array.isArray(o.material) ? o.material : [o.material];
+      if (msaa) {
+        for (const m of mats) {
+          if (m && m.alphaTest > 0 && !m.transparent && !m.alphaToCoverage && m.userData.cmuA2C === undefined) {
+            m.userData.cmuA2C = true; m.alphaToCoverage = true; m.needsUpdate = true;
+          }
+        }
+      }
+      if (!reliefOn || !o.geometry?.attributes?.uv || !o.geometry.attributes.normal) return;
+      for (const m of mats) {
         if (!m || seen.has(m)) continue;
         seen.add(m);
         if (!m.isMeshStandardMaterial || m.normalMap || m.bumpMap || m.userData.cmuRelief !== undefined) continue;

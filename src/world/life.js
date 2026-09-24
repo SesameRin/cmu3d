@@ -407,6 +407,26 @@ export async function createLife(ctx) {
   }
   const pedEdges = pedNet.edges;
   mark('pedDecks');
+  // busy sidewalks: shops, cafés and restaurants nearby (Walnut St, Penn Ave, Craig St, Forbes…) draw more walkers
+  const BUSY = new Set(['restaurant', 'cafe', 'fast_food', 'bar', 'bank', 'library', 'hotel', 'atm', 'museum', 'school']);
+  const busyGrid = new Map();
+  const TK = 64, tk = (x, z) => Math.floor(x / TK) * 100003 + Math.floor(z / TK);
+  for (const p of data.pois) if (BUSY.has(p.type)) { const k = tk(p.x, p.z); busyGrid.set(k, (busyGrid.get(k) || 0) + 1); }
+  const busyAt = (x, z) => {
+    let n = 0;
+    for (let di = -1; di <= 1; di++) for (let dj = -1; dj <= 1; dj++) n += busyGrid.get(tk(x + di * TK, z + dj * TK)) || 0;
+    return n;
+  };
+  const pedW = new Float32Array(pedEdges.length);
+  const pedTiles = new Map();          // 64 m tile → edge indices (spawning near the camera)
+  let pedWMax = 0;
+  pedEdges.forEach((e, i) => {
+    if (e.dead) return;
+    const mid = Math.floor(e.cum.length / 2), mx = e.pts[mid * 2], mz = e.pts[mid * 2 + 1];
+    const w = (e.campus ? 3 : 1) * (1 + Math.min(3, busyAt(mx, mz) * 0.35)) * (e.line.type === 'steps' ? 0.5 : 1);
+    pedW[i] = w; if (w > pedWMax) pedWMax = w;
+    const k = tk(mx, mz); let a = pedTiles.get(k); if (!a) pedTiles.set(k, a = []); a.push(i);
+  });
   const spawnable = pedEdges.map((e) => (e.dead ? 0 : e.len * (e.campus ? 7 : 1)));
   const spawnCum = new Float64Array(spawnable.length);
   spawnable.reduce((s, w, i) => (spawnCum[i] = s + w), 0);
@@ -471,6 +491,7 @@ export async function createLife(ctx) {
   const pYaw = new Float32Array(nPeople), pScale = new Float32Array(nPeople);
   const pX = new Float32Array(nWalk), pZ = new Float32Array(nWalk);   // current positions (debug / probes)
   const standMat = new Float32Array(Math.max(1, standers.length) * 16);
+  const tmpP0 = { x: 0, z: 0, dx: 0, dz: 0, t: 0 };
   for (let i = 0; i < nWalk; i++) {
     const e = pickSpawnEdge();
     pEdge[i] = e; pDir[i] = rng() < 0.5 ? 1 : -1;
@@ -481,6 +502,7 @@ export async function createLife(ctx) {
     const stride = 0.72 * pScale[i];                       // metres per step
     mAnim[i * 3] = rng() * 6.28; mAnim[i * 3 + 1] = loopHz(pSpeed[i] / (2 * stride)); mAnim[i * 3 + 2] = 1;
     pYaw[i] = NaN;
+    edgePoint(pedEdges[e], pS[i], tmpP0, 1); pX[i] = tmpP0.x; pZ[i] = tmpP0.z;
   }
   const standPos = new Float32Array(Math.max(1, standers.length) * 3);
   standers.forEach((s, k) => {
@@ -527,6 +549,7 @@ export async function createLife(ctx) {
   // ------------------------------------------------------------------ per-frame culling
   const cull = createCuller();
   const cam = { x: 0, y: 0, z: 0 };
+  const focus = { x: 0, z: 0 };        // what the camera looks at (orbit target / a point ahead): NPCs gather here
   const PEOPLE_R2 = (q.level === 'low' ? 220 : 350) ** 2, PEOPLE_SHADOW_R2 = 120 ** 2;
   const CAR_NEAR2 = 120 ** 2, CAR_FAR2 = (q.level === 'low' ? 420 : 600) ** 2;
 
@@ -546,10 +569,37 @@ export async function createLife(ctx) {
     return cull.inView(x, y + 0.9, z, 1.5) || (shadows && d2 < PEOPLE_SHADOW_R2 && cull.inShadow(x, y, z, 3));
   };
 
+  // Walkers far from what the camera looks at are moved to a sidewalk / path near it (rate-limited, never popping
+  // into view close by), so the crowd follows the viewer around the 4 km map instead of thinning out over it.
+  const PED_KEEP = q.level === 'low' ? 260 : 380, PED_SPAWN = [45, q.level === 'low' ? 230 : 330];
+  const recycle = [];
+  function respawnPed(i) {
+    for (let tries = 0; tries < 14; tries++) {
+      const a = rng() * Math.PI * 2, r = PED_SPAWN[0] + Math.sqrt(rng()) * (PED_SPAWN[1] - PED_SPAWN[0]);
+      const list = pedTiles.get(tk(focus.x + Math.cos(a) * r, focus.z + Math.sin(a) * r));
+      if (!list) continue;
+      const ei = list[Math.floor(rng() * list.length)];
+      if (rng() * pedWMax > pedW[ei]) continue;
+      const e = pedEdges[ei];
+      const s0 = rng() * e.len;
+      edgePoint(e, s0, tmpP, 1);
+      const dx = tmpP.x - cam.x, dz = tmpP.z - cam.z;
+      if (dx * dx + dz * dz < 90 * 90 && cull.inView(tmpP.x, groundAt(ctx, tmpP.x, tmpP.z) + 0.9, tmpP.z, 1.5)) continue;
+      pEdge[i] = ei; pDir[i] = rng() < 0.5 ? 1 : -1; pS[i] = pDir[i] > 0 ? s0 : e.len - s0; pHint[i] = 1; pYaw[i] = NaN;
+      pX[i] = tmpP.x; pZ[i] = tmpP.z;
+      return true;
+    }
+    return false;
+  }
   function updatePeople(dt) {
     const arr = pMesh.instanceMatrix.array;
     let c = 0;
+    recycle.length = 0;
     for (let i = 0; i < nWalk; i++) {
+      {
+        const fx = pX[i] - focus.x, fz = pZ[i] - focus.z;
+        if (fx * fx + fz * fz > PED_KEEP * PED_KEEP && recycle.length < 12) { recycle.push(i); continue; }
+      }
       let e = pedEdges[pEdge[i]];
       pS[i] += pSpeed[i] * dt;
       let guard = 0;
@@ -585,6 +635,7 @@ export async function createLife(ctx) {
       composeMatrix(arr, c * 16, x, y, z, pYaw[i], s, s, s);
       putPerson(c++, i);
     }
+    for (const i of recycle) respawnPed(i);
     for (let k = 0; k < standers.length; k++) {
       if (!personShown(standPos[k * 3], standPos[k * 3 + 1], standPos[k * 3 + 2])) continue;
       for (let j = 0; j < 16; j++) arr[c * 16 + j] = standMat[k * 16 + j];
@@ -636,6 +687,12 @@ export async function createLife(ctx) {
   const nearEdge = (n) => { const nd = rNodes[n]; return nd.x < b.minX + EDGE_M || nd.x > b.maxX - EDGE_M || nd.z < b.minZ + EDGE_M || nd.z > b.maxZ - EDGE_M; };
   const canEnter = (ei, node) => { const e = rEdges[ei]; return !e.dead && (!e.line.oneway || e.a === node); };
   const carSpawnEdges = rEdges.map((e, i) => i).filter((i) => !rEdges[i].dead);
+  const roadTiles = new Map();         // 64 m tile → drivable edges (respawning traffic near the camera)
+  for (const i of carSpawnEdges) {
+    const e = rEdges[i], mid = Math.floor(e.cum.length / 2);
+    const k = tk(e.pts[mid * 2], e.pts[mid * 2 + 1]);
+    let a = roadTiles.get(k); if (!a) roadTiles.set(k, a = []); a.push(i);
+  }
   const busNames = ['Forbes Avenue', 'Fifth Avenue'];
 
   const nCars = rEdges.length ? Math.round(npc * 0.6) : 0;
@@ -718,9 +775,36 @@ export async function createLife(ctx) {
         if (Math.hypot(tmpP.x - c.x, tmpP.z - c.z) < 180 && tries < 25) continue;
       }
       cE[i] = ei; cD[i] = dir; cS[i] = s; cPE[i] = -1; cPD[i] = dir; // no previous edge yet
+      cX[i] = tmpP.x; cZ[i] = tmpP.z;
       cLane[i] = rng() < 0.7 ? 0 : 1;
       cLat[i] = laneOffset(e, cLane[i]);
       cV[i] = e.vmax * 0.8; cWait[i] = 0;
+      planNext(i);
+      return true;
+    }
+    return false;
+  }
+
+  // Traffic far from what the camera looks at re-enters on a road near it (not in plain view close by).
+  const CAR_KEEP = q.level === 'low' ? 450 : 650, CAR_SPAWN = [130, q.level === 'low' ? 380 : 520];
+  function spawnCarNear(i) {
+    for (let tries = 0; tries < 16; tries++) {
+      const a = rng() * Math.PI * 2, r = CAR_SPAWN[0] + Math.sqrt(rng()) * (CAR_SPAWN[1] - CAR_SPAWN[0]);
+      const list = roadTiles.get(tk(focus.x + Math.cos(a) * r, focus.z + Math.sin(a) * r));
+      if (!list) continue;
+      const ei = list[Math.floor(rng() * list.length)];
+      const e = rEdges[ei];
+      if (rng() * 6.6 > e.cls) continue;
+      const dir = e.line.oneway ? 1 : rng() < 0.5 ? 1 : -1;
+      const s0 = rng() * e.len;
+      edgePoint(e, dir > 0 ? s0 : e.len - s0, tmpP, 1);
+      const dx = tmpP.x - cam.x, dz = tmpP.z - cam.z;
+      if (dx * dx + dz * dz < 150 * 150 && cull.inView(tmpP.x, groundAt(ctx, tmpP.x, tmpP.z) + 1, tmpP.z, 3)) continue;
+      cE[i] = ei; cD[i] = dir; cS[i] = s0; cPE[i] = -1; cPD[i] = dir;
+      cLane[i] = rng() < 0.7 ? 0 : 1;
+      cLat[i] = laneOffset(e, cLane[i]);
+      cV[i] = e.vmax * 0.8; cWait[i] = 0;
+      cX[i] = tmpP.x; cZ[i] = tmpP.z;
       planNext(i);
       return true;
     }
@@ -814,8 +898,12 @@ export async function createLife(ctx) {
   function updateCars(dt) {
     const night = ctx.env?.state?.nightFactor ?? 0;
     for (let t = 0; t < 4; t++) { fillN[t] = 0; fillF[t] = 0; }
-    let nPool = 0;
+    let nPool = 0, moved = 0;
     for (let i = 0; i < N; i++) {
+      if (cType[i] !== 3 && moved < 6) {
+        const fx = cX[i] - focus.x, fz = cZ[i] - focus.z;
+        if (fx * fx + fz * fz > CAR_KEEP * CAR_KEEP && spawnCarNear(i)) moved++;
+      }
       const e = rEdges[cE[i]];
       // ---- target speed: road class, curvature ahead, car ahead, bus stops
       let vt = cType[i] === 3 ? Math.min(e.vmax, 10.5) : e.vmax;
@@ -1033,6 +1121,14 @@ export async function createLife(ctx) {
       const sun = ctx.env?.sun;
       cull.update(c, 3, shadows && sun?.castShadow ? sun.shadow.camera : null);
       cam.x = cull.st.cx; cam.y = cull.st.cy; cam.z = cull.st.cz;
+      const f = ctx.nav?.focus;
+      if (f && Number.isFinite(f.x) && Number.isFinite(f.z) && (f.x !== 0 || f.z !== 0)) { focus.x = f.x; focus.z = f.z; }
+      else {
+        // a point ahead of the camera, further when it is high above the ground
+        const h = Math.max(0, cam.y - groundAt(ctx, cam.x, cam.z));
+        const fl = Math.hypot(cull.st.fx, cull.st.fz) || 1, ahead = Math.min(450, h * 1.1);
+        focus.x = cam.x + (cull.st.fx / fl) * ahead; focus.z = cam.z + (cull.st.fz / fl) * ahead;
+      }
     }
     updatePeople(dt);
     if (N) updateCars(dt);

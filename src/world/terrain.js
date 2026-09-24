@@ -1,36 +1,46 @@
-// Terrain: heightfield mesh (64×64-cell chunks for frustum culling) + a low-detail skirt of concentric rings that
+// Terrain: heightfield mesh in 64×64-cell chunks with four levels of detail (vertex stride 1–8 cells by distance,
+// built on demand; curtains hide the cracks between levels) + a low-detail skirt of concentric rings that
 // continues the terrain 3.2 km beyond the data bounds (edge heights blending into synthetic hills) and fades into
 // the fog. One MeshStandardMaterial shades it all (onBeforeCompile):
-//   · painted ground texture in two levels (ground-painter.js): 'far' covers the data bounds and carries the road /
-//     field markings; 'core' (campus + Junction Hollow, ~2× sharper) has NO markings — within CORE_FADE of the camera
-//     those are crisp decal geometry (roads.js), beyond it the far level takes over;
+//   · painted ground texture in two levels (ground-painter.js): 'far' covers the whole data (painted once at
+//     start-up, in far mode) and carries the road / field markings; 'near' is a ~450 m window around the camera
+//     at ~0.22 m per pixel in a wrap-around canvas, repainted strip by strip as the camera moves (createNearLevel)
+//     — sharp ground wherever one walks. It has NO markings: within CORE_FADE of the camera those are crisp decal
+//     geometry (roads.js), beyond it the far level takes over;
 //   · a detail-type mask (vegetation / asphalt / hard / soil) selecting world-space close-up detail;
 //   · outside the data: a procedural, band-limited "Pittsburgh" (wooded slopes, street-grid neighbourhoods);
 //   · seasons ('env:season'): grass tint, fallen leaves, bare winter canopy, snow with cleared walks; ground snow
 //     also builds up while the weather is 'snow' (env state), whatever the season;
-//   · crisp lawn / path borders near the camera (edge field from the core mask), night street lights outside;
+//   · crisp lawn / path borders near the camera (edge field from the near mask), night street lights outside;
+//   · 3D grass blades on the lawns around the camera (high / medium, createGrass);
 //   · 3D surroundings on the first ~400 m of the skirt (buildSkirtContent): trees, houses on the painted lots and
 //     the mapped roads that leave the data, with land use continuing the data along each stretch of its edge.
 // Contract: ARCHITECTURE.md §terrain. ctx.terrain = { mesh (Group), material, heightAt, normalAt, extHeightAt
-//   (continues beyond the grid), meshHeightAt (exact rendered triangle surface), raycast(origin, dir), bounds,
-//   coreRect, groundTexture (far level), groundTextures, minimapCanvas (1024 px top-down ground), uniforms,
-//   setSeason(s), stats, groundData (classified roads/paths/areas shared with roads.js), surroundings (Group) }.
-//   After a WebGL context loss the released ground canvases are repainted when the context is restored.
+//   (continues beyond the grid), meshHeightAt (exact LOD-0 triangle surface), raycast(origin, dir), bounds,
+//   coreRect (the near level's current window, null before its first paint), groundTexture (far level),
+//   groundTextures, minimapCanvas (1024 px top-down ground), uniforms, setSeason(s), stats, groundData (classified
+//   roads/paths/areas shared with roads.js), surroundings (Group), near ({ rect(), update(force), stats }) }.
+//   After a WebGL context loss the released far canvases are repainted when the context is restored.
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { pointInRing } from '../core/heightfield.js';
-import { paintGround, tileNoise, mulberry, resamplePolyline, RAIL_GONE } from './ground-painter.js';
+import { paintGround, paintRegion, tileNoise, mulberry, resamplePolyline, RAIL_GONE } from './ground-painter.js';
 import { waterBodies } from './water.js';
 import { extendedBridgeRoads } from './bridges.js';
 
 const SKIRT_OFFSETS = [0, 6, 14, 26, 42, 64, 94, 134, 186, 254, 340, 450, 590, 770, 1000, 1290, 1650, 2100, 2600, 3200];
-const CORE_RECT = { minX: -480, maxX: 360, minZ: -400, maxZ: 400 }; // campus core + Junction Hollow (high-res level)
-// Pitt's upper campus / Schenley Plaza / the Carnegie museums / Soldiers & Sailors (high-res level on high and
-// medium; overlaps the core by 40 m so the two ramps never leave a gap)
-const OAK_RECT = { minX: -1229.47, maxX: -440, minZ: -600, maxZ: 260 };
-const OAK_SIZE = { high: 3584, medium: 2560 }; // canvas px along the rectangle's long side (0.24 / 0.34 m per px)
+// The sharp 'near' ground level: a square window of `m` metres painted at `px` pixels, following the camera
+// (moved in steps of m / 8; only the newly exposed strips are painted, into a wrap-around canvas). It replaces
+// the fixed campus / Oakland levels of earlier versions: sharp ground wherever one goes on the (now 3.3 × 3.1 km)
+// map, and nothing of it to paint at start-up.
+const NEAR = { high: { px: 2048, m: 448 }, medium: { px: 2048, m: 512 }, low: { px: 1024, m: 384 } };
+const NEAR_MAX_H = 420; // camera height above the ground up to which the near level is kept up to date (m)
 const CHUNK = { low: 128 }; // cells per terrain chunk side (64 by default; bigger chunks = fewer draw calls at low)
-export const CORE_FADE = [300, 400]; // sharp levels → far ground texture cross-fade distance (m)
+// Terrain chunk levels of detail: vertex stride 1 / 2 / 4 / 8 cells, switched by the distance from the camera to
+// the chunk (LOD 0 — the exact surface meshHeightAt describes, which the road decals are draped on — reaches
+// beyond the marking range). Chunks hang a short curtain from their edges that hides the cracks between levels.
+const LOD_DIST = { high: [520, 1000, 1800], medium: [480, 900, 1600], low: [340, 700, 1300] };
+export const CORE_FADE = [300, 400]; // sharp level → far ground texture cross-fade distance (m)
 // Road / field markings: crisp decals (roads.js) within MARK_RANGE of the camera, the far level's painted
 // markings fading in over its last 100 m. The decal tiles and the shader take their range from here.
 export const MARK_RANGE = { low: 250, medium: 400, high: 400 };
@@ -106,14 +116,8 @@ function makeDetail2Texture() {
   };
   const wrapDraw = (g, x, y, fn) => { for (const ox of [-S, 0, S]) for (const oy of [-S, 0, S]) fn(x + ox, y + oy); };
   const r = mulberry(4242);
-  const leaves = chan((g) => {
-    g.fillStyle = '#000'; g.fillRect(0, 0, S, S);
-    for (let i = 0; i < 520; i++) {
-      const x = r() * S, y = r() * S, rad = 2.2 + r() * 2.6, rot = r() * Math.PI, v = 110 + ((r() * 145) | 0);
-      g.fillStyle = `rgb(${v},${v},${v})`;
-      wrapDraw(g, x, y, (px, py) => { g.beginPath(); g.ellipse(px, py, rad * 1.6, rad, rot, 0, Math.PI * 2); g.fill(); });
-    }
-  });
+  // (the speckle channels are rasterised on the CPU: thousands of tiny canvas ellipses cost ~30 ms of calls)
+  const leaves = stampEllipses(S, 0, 520, () => { const x = r() * S, y = r() * S, rad = 2.2 + r() * 2.6, rot = r() * Math.PI; return [x, y, rad * 1.6, rad, rot, 110 + ((r() * 145) | 0)]; });
   const pavers = chan((g) => {
     g.fillStyle = '#000'; g.fillRect(0, 0, S, S);
     const pw = S / 4, ph = S / 8; // 0.3 × 0.15 m at a 1.2 m tile
@@ -138,17 +142,10 @@ function makeDetail2Texture() {
     }
     g.globalAlpha = 1;
   });
-  const litter = chan((g) => {
-    g.fillStyle = 'rgb(128,128,128)'; g.fillRect(0, 0, S, S);
-    for (let i = 0; i < 900; i++) {
-      const x = r() * S, y = r() * S, rad = 1 + r() * 3, v = (r() * 255) | 0;
-      g.fillStyle = `rgb(${v},${v},${v})`;
-      wrapDraw(g, x, y, (px, py) => { g.beginPath(); g.ellipse(px, py, rad * 2, rad, r() * 3, 0, Math.PI * 2); g.fill(); });
-    }
-  });
+  const litter = stampEllipses(S, 128, 900, () => { const x = r() * S, y = r() * S, rad = 1 + r() * 3, v = (r() * 255) | 0; return [x, y, rad * 2, rad, r() * 3, v]; });
   const d = new Uint8Array(S * S * 4);
   for (let i = 0; i < S * S; i++) {
-    d[i * 4] = leaves[i * 4]; d[i * 4 + 1] = pavers[i * 4]; d[i * 4 + 2] = cracks[i * 4]; d[i * 4 + 3] = litter[i * 4];
+    d[i * 4] = leaves[i]; d[i * 4 + 1] = pavers[i * 4]; d[i * 4 + 2] = cracks[i * 4]; d[i * 4 + 3] = litter[i];
   }
   const t = new THREE.DataTexture(d, S, S, THREE.RGBAFormat);
   t.wrapS = t.wrapT = THREE.RepeatWrapping;
@@ -158,6 +155,28 @@ function makeDetail2Texture() {
   t.anisotropy = 4;
   t.needsUpdate = true;
   return t;
+}
+
+// Tileable single-channel field of anti-aliased filled ellipses over a background value (drawn in order, each
+// covering what is below). next() → [x, y, radiusX, radiusY, rotation, value 0..255].
+function stampEllipses(S, bg, n, next) {
+  const buf = new Float32Array(S * S).fill(bg);
+  for (let i = 0; i < n; i++) {
+    const [x, y, ra, rb, rot, v] = next();
+    const ca = Math.cos(rot), sa = Math.sin(rot), ext = Math.ceil(Math.max(ra, rb)) + 1;
+    for (let py = Math.floor(y - ext); py <= Math.ceil(y + ext); py++) {
+      const row = (((py % S) + S) % S) * S;
+      for (let px = Math.floor(x - ext); px <= Math.ceil(x + ext); px++) {
+        const dx = px + 0.5 - x, dy = py + 0.5 - y;
+        const u = (dx * ca + dy * sa) / ra, w = (-dx * sa + dy * ca) / rb;
+        const cov = Math.min(1, (1 - Math.sqrt(u * u + w * w)) * Math.min(ra, rb) + 0.5);
+        if (cov <= 0) continue;
+        const k = row + (((px % S) + S) % S);
+        buf[k] += (v - buf[k]) * cov;
+      }
+    }
+  }
+  return buf;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -297,7 +316,7 @@ const OUTER_GLSL = /* glsl */`
   }
 `;
 
-// Crisp grass ↔ path / plaza / sidewalk borders near the camera, against one painted level (core or Oakland).
+// Crisp grass ↔ path / plaza / sidewalk borders near the camera, against the sharp painted level.
 // Their textures have 0.2–0.25 m texels, so up close every border is a soft ramp. The level mask's vegetation
 // channel is used as an edge field: its 0.5 iso-line is the border, (r - 0.5) / |∇r| the signed distance to it.
 // On each side the colour / mask are re-sampled 0.55 m away from the border and chosen with a pixel-wide step
@@ -333,7 +352,7 @@ const EDGE_GLSL = /* glsl */`
   float gRectW(vec2 wp, vec4 r) { vec2 e = min(wp - r.xy, r.xy + r.zw - wp); return clamp(min(e.x, e.y) / 30.0, 0.0, 1.0); }
 `;
 
-function makeGroundMaterial(uniforms, { oak = false } = {}) {
+function makeGroundMaterial(uniforms) {
   const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.96, metalness: 0 });
   mat.name = 'ground';
   mat.onBeforeCompile = (sh) => {
@@ -347,13 +366,9 @@ function makeGroundMaterial(uniforms, { oak = false } = {}) {
       .replace('#include <common>', `#include <common>
         varying vec3 vGPos;
         varying vec3 vGNrm;
-        ${oak ? '#define GROUND_OAK' : ''}
-        uniform sampler2D uFarMap, uFarMask, uFarMarks, uCoreMap, uCoreMask, uDetail, uDetail2;
-        uniform vec4 uFarRect, uCoreRect, uDataRect;
-        #ifdef GROUND_OAK
-        uniform sampler2D uOakMap, uOakMask;
-        uniform vec4 uOakRect;
-        #endif
+        uniform sampler2D uFarMap, uFarMask, uFarMarks, uNearMap, uNearMask, uDetail, uDetail2;
+        uniform vec4 uFarRect, uNearRect, uDataRect;
+        uniform float uNearPeriod;
         uniform vec2 uMarkFade;
         uniform vec3 uMarkWhite, uMarkYellow;
         uniform vec3 uGrassTint;
@@ -369,44 +384,30 @@ function makeGroundMaterial(uniforms, { oak = false } = {}) {
         float vd = length(vGPos - cameraPosition);
         float fp = max(length(fwidth(wp)), 1e-3);   // metres per pixel
         vec2 uvF = (wp - uFarRect.xy) / uFarRect.zw;
-        vec2 uvC = (wp - uCoreRect.xy) / uCoreRect.zw;
-        // Sharper levels near the camera: 'core' (campus + Junction Hollow) and, on high / medium, 'oak' (Pitt's
-        // upper campus, Schenley Plaza, the museums). Neither carries road / field markings: within uMarkFade.x of
-        // the camera those are crisp decal geometry (roads.js); further out they come from the far level's own
-        // markings texture (uFarMarks), faded in over uMarkFade. Beyond uCoreFade the far level alone is used.
-        float nearW = 1.0 - smoothstep(uCoreFade.x, uCoreFade.y, vd);
-        float wC = gRectW(wp, uCoreRect) * nearW;
+        // The sharp 'near' level: a window (uNearRect) around the camera in a wrap-around texture that repeats every
+        // uNearPeriod metres. It carries no road / field markings: within uMarkFade.x of the camera those are crisp
+        // decal geometry (roads.js); further out they come from the far level's own markings texture (uFarMarks),
+        // faded in over uMarkFade. Beyond uCoreFade (or outside the window) the far level alone is used.
+        vec2 uvN = wp / uNearPeriod;
+        float wN = gRectW(wp, uNearRect) * (1.0 - smoothstep(uCoreFade.x, uCoreFade.y, vd));
         vec3 gcol = texture2D(uFarMap, uvF).rgb;
         vec3 gm = texture2D(uFarMask, uvF).rgb;
-        #ifdef GROUND_OAK
-        vec2 uvO = (wp - uOakRect.xy) / uOakRect.zw;
-        float wO = gRectW(wp, uOakRect) * nearW;
-        gcol = mix(gcol, texture2D(uOakMap, uvO).rgb, wO);
-        gm = mix(gm, texture2D(uOakMask, uvO).rgb, wO);
-        #endif
-        gcol = mix(gcol, texture2D(uCoreMap, uvC).rgb, wC);
-        gm = mix(gm, texture2D(uCoreMask, uvC).rgb, wC);
+        if (wN > 0.0) {
+          gcol = mix(gcol, texture2D(uNearMap, uvN).rgb, wN);
+          gm = mix(gm, texture2D(uNearMask, uvN).rgb, wN);
+        }
         // unsharp mask while the painted texture is magnified (close to the camera) — on luminance only: per
         // channel it overshoots differently in R, G and B and fringes saturated edges (red / white field paint)
         float shp = uSharpen * (1.0 - smoothstep(6.0, 35.0, vd));
         if (shp > 0.001) {
-          vec3 blur = texture2D(uFarMap, uvF, 1.3).rgb;
-          #ifdef GROUND_OAK
-          blur = mix(blur, texture2D(uOakMap, uvO, 1.3).rgb, wO);
-          #endif
-          blur = mix(blur, texture2D(uCoreMap, uvC, 1.3).rgb, wC);
+          vec3 blur = mix(texture2D(uFarMap, uvF, 1.3).rgb, texture2D(uNearMap, uvN, 1.3).rgb, wN);
           const vec3 LUM = vec3(0.2126, 0.7152, 0.0722);
           float l = dot(gcol, LUM), lb = dot(blur, LUM);
           gcol *= max(l + (l - lb) * shp, 0.0) / max(l, 1e-3);
         }
 
         float edgeLine = 0.0;
-        if (uSharpen > 0.0 && vd < 45.0) {
-          if (wC > 0.5) gCrispEdge(uCoreMap, uCoreMask, uCoreRect, wC, wp, vd, fp, gcol, gm, edgeLine);
-          #ifdef GROUND_OAK
-          else if (wO > 0.5) gCrispEdge(uOakMap, uOakMask, uOakRect, wO, wp, vd, fp, gcol, gm, edgeLine);
-          #endif
-        }
+        if (uSharpen > 0.0 && vd < 45.0 && wN > 0.5) gCrispEdge(uNearMap, uNearMask, vec4(0.0, 0.0, uNearPeriod, uNearPeriod), wN, wp, vd, fp, gcol, gm, edgeLine);
 
         // painted road / field markings of the far level, where the decals no longer reach
         vec2 mk = texture2D(uFarMarks, uvF).rg * smoothstep(uMarkFade.x, uMarkFade.y, vd);
@@ -490,13 +491,16 @@ function makeGroundMaterial(uniforms, { oak = false } = {}) {
       .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
         totalEmissiveRadiance += gEmit;`);
   };
-  mat.customProgramCacheKey = () => (oak ? 'cmu-ground-v6-oak' : 'cmu-ground-v6');
+  mat.customProgramCacheKey = () => 'cmu-ground-v7';
   return mat;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
 export async function createTerrain(ctx) {
   const T0 = performance.now();
+  const steps = {}; // per-step ms (stats.steps)
+  let tLast = T0;
+  const mark = (k) => { const t = performance.now(); steps[k] = Math.round(t - tLast); tLast = t; performance.mark?.('terrain:' + k); };
   let skirtContent = null; // 3D trees / houses / roads on the surroundings (built after the skirt mesh)
   const hf = ctx.heightfield;
   const { width: GW, height: GH, cellSize: CS } = hf;
@@ -569,6 +573,7 @@ export async function createTerrain(ctx) {
   }
 
   // ---------------------------------------------------------------- grid heights (+ carved pond beds)
+  mark("anchors");
   const H = new Float32Array(hf.heights);
   for (const w of waterBodies(ctx)) {
     if (w.kind !== 'pond') continue;
@@ -628,27 +633,27 @@ export async function createTerrain(ctx) {
   const low = qLevel === 'low';
   const size = ctx.quality?.groundTextureSize || 4096;
   const farW = B.maxX - B.minX, farH = B.maxZ - B.minZ;
-  const coreW = CORE_RECT.maxX - CORE_RECT.minX, coreH = CORE_RECT.maxZ - CORE_RECT.minZ;
+  // (asked before painting: a WebGL parameter query waits for the GPU process, busy rasterising the canvases after)
+  const maxAniso = ctx.renderer?.capabilities?.getMaxAnisotropy?.() ?? 8;
   const tPaint0 = performance.now();
-  // far: the whole data (its fine detail passes skipped at low, where it is ~1 m/px — the core covers the
-  // campus at eye level); markings go to their own texture so the shader can hide them where decals draw them
+  // far: the whole data, painted once in far mode (lite at low, where it is ~1.6 m/px); markings go to their own
+  // texture so the shader can hide them where decals draw them. The sharp near level is painted later, around
+  // the camera, while exploring (nearLevel below).
   const levelDefs = [
-    { name: 'far', minX: B.minX, minZ: B.minZ, w: farW, h: farH, ppm: size / Math.max(farW, farH), maskScale: 0.35, markings: 'separate', marksScale: qLevel === 'medium' ? 0.5 : 1, lite: low },
-    { name: 'core', minX: CORE_RECT.minX, minZ: CORE_RECT.minZ, w: coreW, h: coreH, ppm: size / Math.max(coreW, coreH), maskScale: 0.5, markings: false },
+    { name: 'far', minX: B.minX, minZ: B.minZ, w: farW, h: farH, ppm: size / Math.max(farW, farH), maskScale: 0.35, markings: 'separate', marksScale: 0.5, far: true, lite: low },
   ];
-  const oakSize = OAK_SIZE[qLevel] || 0;
-  const oakX0 = Math.max(B.minX, OAK_RECT.minX), oakW = OAK_RECT.maxX - oakX0, oakH = OAK_RECT.maxZ - OAK_RECT.minZ;
-  if (oakSize) levelDefs.push({ name: 'oak', minX: oakX0, minZ: OAK_RECT.minZ, w: oakW, h: oakH, ppm: oakSize / Math.max(oakW, oakH), maskScale: 0.5, markings: false });
   // (the canvas drawing itself is executed later, asynchronously, by the GPU process — nothing below reads the
   // canvases back, so it overlaps with the rest of the loading)
+  mark("ponds");
   const painted = paintGround(ctx, levelDefs);
+  mark("paint");
+  steps.prepare = painted.prepMs; steps.sources = painted.sourcesMs;
   const paintMs = performance.now() - tPaint0;
-  const [farL, coreL, oakL = null] = painted.levels;
-  const maxAniso = ctx.renderer?.capabilities?.getMaxAnisotropy?.() ?? 8;
-  const mkTex = (canvas, color, rg = false) => {
+  const [farL] = painted.levels;
+  const mkTex = (canvas, color, rg = false, repeat = false) => {
     const t = new THREE.CanvasTexture(canvas);
     t.flipY = false;
-    t.wrapS = t.wrapT = THREE.ClampToEdgeWrapping;
+    t.wrapS = t.wrapT = repeat ? THREE.RepeatWrapping : THREE.ClampToEdgeWrapping;
     t.minFilter = THREE.LinearMipmapLinearFilter;
     t.magFilter = THREE.LinearFilter;
     t.generateMipmaps = true;
@@ -658,19 +663,15 @@ export async function createTerrain(ctx) {
     t.needsUpdate = true;
     return t;
   };
-  const tex = {
-    far: mkTex(farL.color, true), farMask: mkTex(farL.mask, false), farMarks: mkTex(farL.marks, false, true),
-    core: mkTex(coreL.color, true), coreMask: mkTex(coreL.mask, false),
-  };
-  if (oakL) { tex.oak = mkTex(oakL.color, true); tex.oakMask = mkTex(oakL.mask, false); }
+  const tex = { far: mkTex(farL.color, true), farMask: mkTex(farL.mask, false), farMarks: mkTex(farL.marks, false, true) };
 
   // Minimap-friendly copy of the whole ground (1024 px wide) before the big canvases are released.
   const mm = document.createElement('canvas');
   mm.width = 1024; mm.height = Math.round((1024 * farH) / farW);
   mm.getContext('2d').drawImage(farL.color, 0, 0, mm.width, mm.height);
 
-  // Upload now and release the big canvases (saves ~100+ MB of canvas backing store).
-  const GROUND_KEYS = ['far', 'farMask', 'farMarks', 'core', 'coreMask', ...(oakL ? ['oak', 'oakMask'] : [])];
+  // Upload now and release the big canvases (saves ~100 MB of canvas backing store).
+  const GROUND_KEYS = ['far', 'farMask', 'farMarks'];
   const uploadAndRelease = () => {
     if (!ctx.renderer?.initTexture) return;
     for (const k of GROUND_KEYS) {
@@ -682,19 +683,27 @@ export async function createTerrain(ctx) {
       } catch (e) { console.warn('[terrain] texture pre-upload failed', e); }
     }
   };
+  mark("minimap");
   uploadAndRelease();
+  mark("upload");
   tex.detail = makeDetailTexture();
   tex.detail2 = makeDetail2Texture();
+  mark("detailTex");
 
-  // After a WebGL context loss three.js re-uploads every texture from its image — the released ground canvases
-  // have none, so repaint them (1–2 s, once) when the context comes back. This listener runs after three's own.
+  // ---- the near level: wrap-around canvases (colour + half-resolution mask), kept (they are repainted)
+  const nearCfg = NEAR[qLevel] || NEAR.high;
+  const nearLevel = createNearLevel(ctx, painted.prepared, nearCfg, mkTex);
+  tex.near = nearLevel.tex.color; tex.nearMask = nearLevel.tex.mask;
+
+  // After a WebGL context loss three.js re-uploads every texture from its image — the released far canvases
+  // have none, so repaint them (~1 s, once) when the context comes back (the near canvases are kept anyway).
+  // This listener runs after three's own.
   const glCanvas = ctx.renderer?.domElement || ctx.canvas;
   glCanvas?.addEventListener?.('webglcontextrestored', () => {
     try {
       const again = paintGround(ctx, levelDefs, painted.prepared);
-      const [f, c, o] = again.levels;
-      tex.far.image = f.color; tex.farMask.image = f.mask; tex.farMarks.image = f.marks; tex.core.image = c.color; tex.coreMask.image = c.mask;
-      if (o) { tex.oak.image = o.color; tex.oakMask.image = o.mask; }
+      const [f] = again.levels;
+      tex.far.image = f.color; tex.farMask.image = f.mask; tex.farMarks.image = f.marks;
       for (const k of GROUND_KEYS) tex[k].needsUpdate = true;
       uploadAndRelease();
       console.info('[terrain] ground textures repainted after WebGL context restore');
@@ -704,26 +713,27 @@ export async function createTerrain(ctx) {
     }
   });
   const season0 = SEASONS[ctx.env?.state?.season] || SEASONS.autumn;
+  mark("near");
   const edgeLU = edgeLandUse(ctx.data, B);
+  mark("edgeLU");
   const uniforms = {
     uEdgeLU: { value: edgeLU.tex },
     uFarMap: { value: tex.far }, uFarMask: { value: tex.farMask },
-    uCoreMap: { value: tex.core }, uCoreMask: { value: tex.coreMask },
     uFarMarks: { value: tex.farMarks },
+    uNearMap: { value: tex.near }, uNearMask: { value: tex.nearMask },
+    uNearRect: nearLevel.rectUniform, uNearPeriod: { value: nearCfg.m },
     uMarkFade: { value: new THREE.Vector2(markRange(ctx) - 100, markRange(ctx)) },
     uMarkWhite: { value: new THREE.Color('#ebe9e1') }, uMarkYellow: { value: new THREE.Color('#d8a526') },
-    ...(oakL ? { uOakMap: { value: tex.oak }, uOakMask: { value: tex.oakMask }, uOakRect: { value: new THREE.Vector4(oakX0, OAK_RECT.minZ, oakW, oakH) } } : {}),
     uDetail: { value: tex.detail },
     uDetail2: { value: tex.detail2 },
     uSharpen: { value: ctx.quality?.level === 'low' ? 0 : 0.6 },
     uFarRect: { value: new THREE.Vector4(B.minX, B.minZ, farW, farH) },
-    uCoreRect: { value: new THREE.Vector4(CORE_RECT.minX, CORE_RECT.minZ, coreW, coreH) },
     uDataRect: { value: new THREE.Vector4(B.minX, B.minZ, farW, farH) },
     uGrassTint: { value: new THREE.Vector3(...season0.tint) },
     uSnow: { value: season0.snow },
     uLeaves: { value: season0.leaves },
     uBare: { value: season0.bare },
-    // the sharp levels are used up to x m from the camera, the far texture beyond y m
+    // the sharp level is used up to x m from the camera, the far texture beyond y m
     uCoreFade: { value: new THREE.Vector2(CORE_FADE[0], CORE_FADE[1]) },
     uDetailAmt: { value: 1 },
     uSunDir: { value: new THREE.Vector3(0.4, 0.8, 0.4) },
@@ -731,58 +741,85 @@ export async function createTerrain(ctx) {
     // painted house roofs of the procedural surroundings give way to 3D houses up to this far out (m)
     uHouse3D: { value: new THREE.Vector2(SKIRT_3D.houses - 20, SKIRT_3D.houses + 20) },
   };
-  const material = makeGroundMaterial(uniforms, { oak: !!oakL });
-  await ctx.yield?.();
+  const material = makeGroundMaterial(uniforms);
+  let grass = null;
+  try { grass = createGrass(ctx, { H, GW, GH, CS, B, uniforms, nearCfg }); } catch (e) { console.warn('[terrain] grass failed', e); }
 
-  // ---------------------------------------------------------------- chunked grid mesh
+  // ---------------------------------------------------------------- chunked grid mesh (levels of detail)
   ctx.loading?.detail?.('生成地形网格 building terrain mesh…');
+  mark("yield");
   const tMesh0 = performance.now();
   const group = new THREE.Group();
   group.name = 'terrain';
-  let triCount = 0;
-  const normalAtGrid = (i, j, out, o) => {
-    const hx = gridH(i + 1, j) - gridH(i - 1, j);
-    const hz = gridH(i, j + 1) - gridH(i, j - 1);
-    let nx = -hx, ny = 2 * CS, nz = -hz;
-    const l = Math.hypot(nx, ny, nz);
-    out[o] = nx / l; out[o + 1] = ny / l; out[o + 2] = nz / l;
-  };
   const CH = CHUNK[qLevel] || 64;
+  const lodDist = LOD_DIST[qLevel] || LOD_DIST.high;
+  const chunks = [];
   for (let cj = 0; cj < GH - 1; cj += CH) {
     for (let ci = 0; ci < GW - 1; ci += CH) {
       const ni = Math.min(CH, GW - 1 - ci), nj = Math.min(CH, GH - 1 - cj);
-      const vw = ni + 1, vh = nj + 1;
-      const pos = new Float32Array(vw * vh * 3), nor = new Float32Array(vw * vh * 3);
-      for (let j = 0; j < vh; j++) for (let i = 0; i < vw; i++) {
-        const gi = ci + i, gj = cj + j, o = (j * vw + i) * 3;
-        pos[o] = B.minX + gi * CS; pos[o + 1] = H[gj * GW + gi]; pos[o + 2] = B.minZ + gj * CS;
-        normalAtGrid(gi, gj, nor, o);
-      }
-      const idx = new (vw * vh > 65535 ? Uint32Array : Uint16Array)(ni * nj * 6);
-      let k = 0;
-      for (let j = 0; j < nj; j++) for (let i = 0; i < ni; i++) {
-        const a = j * vw + i, b = a + 1, c = a + vw, d = c + 1;
-        const ha = pos[a * 3 + 1], hb = pos[b * 3 + 1], hc = pos[c * 3 + 1], hd = pos[d * 3 + 1];
-        if (Math.abs(ha - hd) < Math.abs(hb - hc)) { idx[k++] = a; idx[k++] = c; idx[k++] = d; idx[k++] = a; idx[k++] = d; idx[k++] = b; }
-        else { idx[k++] = a; idx[k++] = c; idx[k++] = b; idx[k++] = b; idx[k++] = c; idx[k++] = d; }
-      }
-      const geo = new THREE.BufferGeometry();
-      geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-      geo.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
-      geo.setIndex(new THREE.BufferAttribute(idx, 1));
-      geo.computeBoundingSphere();
-      geo.computeBoundingBox();
-      const mesh = new THREE.Mesh(geo, material);
+      let y0 = Infinity, y1 = -Infinity;
+      for (let j = 0; j <= nj; j++) for (let i = 0; i <= ni; i++) { const h = H[(cj + j) * GW + ci + i]; if (h < y0) y0 = h; if (h > y1) y1 = h; }
+      const box = new THREE.Box3(new THREE.Vector3(B.minX + ci * CS, y0, B.minZ + cj * CS), new THREE.Vector3(B.minX + (ci + ni) * CS, y1, B.minZ + (cj + nj) * CS));
+      const c = { ci, cj, ni, nj, box, sphere: box.getBoundingSphere(new THREE.Sphere()), geos: [], lod: -1, mesh: null, drop: 0 };
+      c.drop = chunkCurtainDrop(c, H, GW);
+      const mesh = new THREE.Mesh(chunkGeometry(c, 3, H, GW, CS, B, gridH), material);
+      c.geos[3] = mesh.geometry;
+      c.lod = 3;
       mesh.name = `terrain-chunk-${ci / CH}-${cj / CH}`;
       mesh.receiveShadow = true;
       mesh.castShadow = false;
       mesh.matrixAutoUpdate = false;
+      c.mesh = mesh;
       group.add(mesh);
-      triCount += ni * nj * 2;
+      chunks.push(c);
     }
   }
+  // LOD selection (when the camera has moved a few metres): the right level for every chunk, missing geometry
+  // built nearest first within a small per-frame budget (more right after a jump); LOD 0 geometry of chunks far
+  // behind is dropped again.
+  const lodStats = { built: 0, buildMs: 0, counts: [0, 0, 0, 0] };
+  const _cp = new THREE.Vector3();
+  let lodLast = null, lodPending = true;
+  const updateLods = (force = false) => {
+    const cam = ctx.camera;
+    if (!cam) return;
+    const p = cam.position;
+    const moved = !lodLast || Math.abs(p.x - lodLast.x) + Math.abs(p.y - lodLast.y) + Math.abs(p.z - lodLast.z) > 6;
+    if (!moved && !lodPending && !force) return;
+    const jump = !lodLast || Math.abs(p.x - lodLast.x) + Math.abs(p.z - lodLast.z) > 150;
+    lodLast = p.clone();
+    const want = [];
+    for (const c of chunks) {
+      const d = c.box.distanceToPoint(p);
+      const lod = d < lodDist[0] ? 0 : d < lodDist[1] ? 1 : d < lodDist[2] ? 2 : 3;
+      if (c.geos[lod]) setLod(c, lod);
+      else want.push([d, c, lod]);
+      if (c.geos[0] && lod > 0 && d > lodDist[1] * 1.6) { c.geos[0].dispose(); c.geos[0] = null; }
+    }
+    want.sort((a, b) => a[0] - b[0]);
+    const t0 = performance.now(), budget = force ? 1e9 : jump ? 14 : 4;
+    let k = 0;
+    for (; k < want.length && (k === 0 || performance.now() - t0 < budget); k++) {
+      const [, c, lod] = want[k];
+      c.geos[lod] = chunkGeometry(c, lod, H, GW, CS, B, gridH);
+      lodStats.built++;
+      setLod(c, lod);
+    }
+    lodStats.buildMs += performance.now() - t0;
+    lodPending = k < want.length;
+  };
+  const setLod = (c, lod) => { if (c.lod !== lod) { c.mesh.geometry = c.geos[lod]; c.lod = lod; } };
+  ctx.onUpdate?.(() => updateLods(), 22);
+  const triStats = () => {
+    const counts = [0, 0, 0, 0];
+    let tris = 0;
+    for (const c of chunks) { counts[c.lod]++; tris += c.mesh.geometry.index.count / 3; }
+    return { counts, tris };
+  };
+  let triCount = chunks.reduce((n, c) => n + c.ni * c.nj * 2, 0); // (full resolution; see stats.lod for the drawn)
 
   // ---------------------------------------------------------------- skirt: concentric rectangular rings, zipped
+  mark("chunks");
   const skirt = buildSkirt(B, GW, GH, CS, H, extHeightAt);
   skirtGeo = skirt;
   const skirtMesh = new THREE.Mesh(skirt, material);
@@ -795,6 +832,7 @@ export async function createTerrain(ctx) {
   group.updateMatrixWorld(true);
   ctx.scene.add(group);
   const meshMs = performance.now() - tMesh0;
+  mark("skirt");
 
   // ---------------------------------------------------------------- 3D surroundings on the skirt
   // Built after the first frame, a few milliseconds per frame (they are only ever seen out at the data edge,
@@ -897,7 +935,15 @@ export async function createTerrain(ctx) {
 
   // GPU memory of the ground textures (RGBA8 + full mip chain ≈ 4/3)
   const texMB = Object.values(tex).reduce((m, t) => m + ((t.image?.width || 0) * (t.image?.height || 0) * (t.format === THREE.RGFormat ? 2 : 4) * 4) / 3, 0) / 1048576;
-  const stats = { paintMs: Math.round(paintMs), meshMs: Math.round(meshMs), surroundings: skirtStats, totalMs: Math.round(performance.now() - T0), triangles: triCount, chunks: group.children.length, textureMB: Math.round(texMB), texSizes: Object.fromEntries(Object.entries(tex).map(([k, t]) => [k, `${t.image?.width}x${t.image?.height}`])) };
+  mark("rest");
+  const stats = {
+    steps, paintMs: Math.round(paintMs), meshMs: Math.round(meshMs), surroundings: skirtStats, totalMs: Math.round(performance.now() - T0),
+    triangles: triCount, chunks: chunks.length, textureMB: Math.round(texMB),
+    texSizes: Object.fromEntries(Object.entries(tex).map(([k, t]) => [k, `${t.image?.width}x${t.image?.height}`])),
+    near: nearLevel.stats,
+    grass: grass ? { tufts: grass.tufts, triangles: grass.triangles } : null,
+    get lod() { return { ...triStats(), built: lodStats.built, buildMs: Math.round(lodStats.buildMs) }; },
+  };
   ctx.terrain = {
     mesh: group,
     material,
@@ -907,8 +953,9 @@ export async function createTerrain(ctx) {
     meshHeightAt,
     raycast,
     bounds: { ...B },
-    coreRect: { ...CORE_RECT },
-    oakRect: oakL ? { minX: oakX0, maxX: OAK_RECT.maxX, minZ: OAK_RECT.minZ, maxZ: OAK_RECT.maxZ } : null,
+    // the sharp level's current window (it follows the camera; null until first painted)
+    get coreRect() { return nearLevel.rect(); },
+    oakRect: null,
     markRange: markRange(ctx),
     groundTexture: tex.far,
     groundTextures: tex,
@@ -918,9 +965,292 @@ export async function createTerrain(ctx) {
     stats,
     groundData: painted.prepared, // classified roads/paths (used by roads.js for the marking decals)
     surroundings: null, // 3D trees / houses / road continuations beyond the data (set once built, after the first frame)
+    near: nearLevel, // the sharp level: { rect(), update(force), stats }
   };
   console.info('[terrain]', JSON.stringify(stats));
   return ctx.terrain;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// The sharp near level. A PX² canvas (+ a half-resolution mask) holds an M-metre window of the ground around the
+// camera, wrapped: world (x, z) lives at canvas pixel (x·ppm mod PX, z·ppm mod PX), so the shader samples it with
+// uv = world / M on a repeating texture and the window can move in steps of M / 8 by painting only the strips it
+// newly covers (paintRegion; typically an 8th of the window: ~2–4 ms of drawing calls). The window sits a
+// little ahead of the camera, in the direction it looks; above NEAR_MAX_H the far level alone is visible and
+// the window stays where it is.
+function createNearLevel(ctx, P, cfg, mkTex) {
+  const PX = cfg.px, M = cfg.m, ppm = PX / M, STEP = M / 8;
+  const MPX = PX / 2, mppm = ppm / 2;
+  const mk = (n) => { const c = document.createElement('canvas'); c.width = c.height = n; return c; };
+  const color = mk(PX), mask = mk(MPX);
+  const gc = color.getContext('2d', { alpha: false }), gmk = mask.getContext('2d', { alpha: false });
+  gc.fillStyle = '#59733a'; gc.fillRect(0, 0, PX, PX);   // (never shown: the window starts out of the way)
+  gmk.fillStyle = '#ff0000'; gmk.fillRect(0, 0, MPX, MPX);
+  const tex = { color: mkTex(color, true, false, true), mask: mkTex(mask, false, false, true) };
+  const rectUniform = { value: new THREE.Vector4(-1e7, -1e7, 1, 1) };
+  const stats = { px: PX, m: M, paints: 0, fullPaints: 0, ms: 0, lastMs: 0, maxMs: 0 };
+  let win = null;
+  const mod = (a, n) => ((a % n) + n) % n;
+  // world rectangle (on the STEP grid) → its one to four pieces on the wrap-around canvas
+  const paintRect = (x, z, w, h) => {
+    if (w <= 0 || h <= 0) return;
+    const px0 = Math.round(x * ppm), pz0 = Math.round(z * ppm), pw = Math.round(w * ppm), ph = Math.round(h * ppm);
+    const split = (p0, pl) => { const c0 = mod(p0, PX); return c0 + pl <= PX ? [[c0, pl, 0]] : [[c0, PX - c0, 0], [0, c0 + pl - PX, PX - c0]]; };
+    for (const [cx, cw, ox] of split(px0, pw)) {
+      for (const [cz, ch, oz] of split(pz0, ph)) {
+        const rect = { minX: (px0 + ox) / ppm, minZ: (pz0 + oz) / ppm, w: cw / ppm, h: ch / ppm };
+        paintRegion(gc, 'color', P, rect, cx, cz, ppm, { name: 'near' });
+        paintRegion(gmk, 'mask', P, rect, cx / 2, cz / 2, mppm, { name: 'near' });
+      }
+    }
+  };
+  const dir = new THREE.Vector3();
+  function update(force = false) {
+    const cam = ctx.camera;
+    if (!cam) return;
+    const p = cam.position;
+    const hAbove = p.y - ctx.heightAt(p.x, p.z);
+    if (hAbove > NEAR_MAX_H && !force) return;
+    cam.getWorldDirection(dir);
+    const fl = Math.hypot(dir.x, dir.z);
+    // focus: ahead of the camera by up to 18 % of the window (less when looking down from above)
+    let off = 0.18 * M;
+    if (dir.y < -0.02) off = Math.min(off, (Math.max(0, hAbove) * fl) / -dir.y);
+    const fx = p.x + (fl > 1e-3 ? (dir.x / fl) * off : 0), fz = p.z + (fl > 1e-3 ? (dir.z / fl) * off : 0);
+    if (win && !force && Math.abs(fx - (win.x + M / 2)) < STEP * 0.75 && Math.abs(fz - (win.z + M / 2)) < STEP * 0.75) return;
+    const nx = Math.round((fx - M / 2) / STEP) * STEP, nz = Math.round((fz - M / 2) / STEP) * STEP;
+    if (win && nx === win.x && nz === win.z) return;
+    const t0 = performance.now();
+    try {
+      if (!win || Math.abs(nx - win.x) >= M || Math.abs(nz - win.z) >= M) { paintRect(nx, nz, M, M); stats.fullPaints++; }
+      else {
+        const dx = nx - win.x, dz = nz - win.z;
+        if (dx > 0) paintRect(win.x + M, nz, dx, M); else if (dx < 0) paintRect(nx, nz, -dx, M);
+        const xr0 = Math.max(nx, win.x), xr1 = Math.min(nx, win.x) + M;
+        if (dz > 0) paintRect(xr0, win.z + M, xr1 - xr0, dz); else if (dz < 0) paintRect(xr0, nz, xr1 - xr0, -dz);
+      }
+    } catch (e) { console.warn('[terrain] near ground painting failed', e); }
+    win = { x: nx, z: nz };
+    tex.color.needsUpdate = true;
+    tex.mask.needsUpdate = true;
+    rectUniform.value.set(nx, nz, M, M);
+    stats.paints++;
+    stats.lastMs = Math.round((performance.now() - t0) * 10) / 10;
+    stats.maxMs = Math.max(stats.maxMs, stats.lastMs);
+    stats.ms = Math.round(stats.ms + stats.lastMs);
+  }
+  ctx.onUpdate?.(() => update(), 21);
+  return {
+    tex, rectUniform, stats, update,
+    rect: () => (win ? { minX: win.x, maxX: win.x + M, minZ: win.z, maxZ: win.z + M } : null),
+  };
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// 3D grass near the camera (high / medium). A fixed grid of tufts (a few blades each) centred on the camera, drawn
+// in one instanced call; the vertex shader places each tuft in the world cell it covers (so the blades stay put
+// as the grid follows the camera), stands it on the exact terrain triangle surface (a height texture with the
+// mesh's own triangulation), takes its colour from the painted near level, and folds it away where that level's
+// mask is not lawn (paths, roads, beds, buildings, woods) and towards the edge of the grid. Mown campus lawns:
+// 6–12 cm blades.
+const GRASS = { high: { radius: 17, spacing: 0.21 }, medium: { radius: 11, spacing: 0.25 } };
+function createGrass(ctx, { H, GW, GH, CS, B, uniforms, nearCfg }) {
+  const cfg = GRASS[ctx.quality?.level];
+  if (!cfg) return null;
+  const N = Math.ceil(cfg.radius / cfg.spacing);
+  // tuft: 5 blades, each a thin triangle leaning out from the tuft centre (unit height; the shader scales it)
+  const pos = [], side = [];
+  const rnd = mulberry(515);
+  for (let k = 0; k < 5; k++) {
+    const a = (k / 5) * Math.PI * 2 + rnd() * 0.8, r0 = 0.02 + rnd() * 0.06, w = 0.012 + rnd() * 0.01;
+    const bx = Math.cos(a) * r0, bz = Math.sin(a) * r0, px = -Math.sin(a), pz = Math.cos(a);
+    const lean = 0.18 + rnd() * 0.25, h = 0.75 + rnd() * 0.25;
+    pos.push(bx - px * w, 0, bz - pz * w, bx + px * w, 0, bz + pz * w, bx + Math.cos(a) * lean * h, h, bz + Math.sin(a) * lean * h);
+    side.push(0, 0, 1);
+  }
+  const geo = new THREE.InstancedBufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  geo.setAttribute('normal', new THREE.Float32BufferAttribute(new Array(pos.length).fill(0).map((_, i) => (i % 3 === 1 ? 1 : 0)), 3));
+  geo.setAttribute('aTip', new THREE.Float32BufferAttribute(side, 1));
+  const cells = [];
+  for (let j = -N; j <= N; j++) for (let i = -N; i <= N; i++) if (i * i + j * j <= N * N) cells.push(i, j);
+  geo.setAttribute('aCell', new THREE.InstancedBufferAttribute(new Float32Array(cells), 2));
+  geo.instanceCount = cells.length / 2;
+  geo.boundingSphere = new THREE.Sphere(new THREE.Vector3(), 1e5);
+  // exact terrain heights (with the carved pond beds) for the vertex shader
+  const hTex = new THREE.DataTexture(H, GW, GH, THREE.RedFormat, THREE.FloatType);
+  hTex.minFilter = hTex.magFilter = THREE.NearestFilter;
+  hTex.needsUpdate = true;
+  const gu = {
+    uGCell: { value: new THREE.Vector2() }, uGSpacing: { value: cfg.spacing }, uGRadius: { value: cfg.radius },
+    uGHeight: { value: hTex }, uGHGrid: { value: new THREE.Vector4(B.minX, B.minZ, CS, 0) }, uGHSize: { value: new THREE.Vector2(GW, GH) },
+    uGTime: { value: 0 },
+  };
+  const mat = new THREE.MeshStandardMaterial({ color: 0xffffff, roughness: 0.92, metalness: 0, side: THREE.DoubleSide });
+  mat.name = 'grass-blades';
+  mat.onBeforeCompile = (sh) => {
+    Object.assign(sh.uniforms, gu, {
+      uNearMap: uniforms.uNearMap, uNearMask: uniforms.uNearMask, uNearRect: uniforms.uNearRect, uNearPeriod: uniforms.uNearPeriod,
+      uGrassTint: uniforms.uGrassTint, uSnow: uniforms.uSnow,
+    });
+    sh.vertexShader = sh.vertexShader
+      .replace('#include <common>', `#include <common>
+        attribute vec2 aCell;
+        attribute float aTip;
+        uniform vec2 uGCell;
+        uniform float uGSpacing, uGRadius, uGTime, uNearPeriod, uSnow;
+        uniform vec4 uGHGrid, uNearRect;
+        uniform vec2 uGHSize;
+        uniform sampler2D uGHeight, uNearMap, uNearMask;
+        uniform vec3 uGrassTint;
+        varying vec3 vGCol;
+        float gH1(vec2 c) { return fract(sin(dot(c, vec2(127.1, 311.7))) * 43758.5453); }
+        // the terrain mesh surface (same triangulation as terrain.js chunkGeometry / meshHeightAt)
+        float gTerrain(vec2 p) {
+          vec2 f = (p - uGHGrid.xy) / uGHGrid.z;
+          ivec2 i = clamp(ivec2(floor(f)), ivec2(0), ivec2(uGHSize) - 2);
+          vec2 u = clamp(f - vec2(i), 0.0, 1.0);
+          float ha = texelFetch(uGHeight, i, 0).r, hb = texelFetch(uGHeight, i + ivec2(1, 0), 0).r;
+          float hc = texelFetch(uGHeight, i + ivec2(0, 1), 0).r, hd = texelFetch(uGHeight, i + ivec2(1, 1), 0).r;
+          if (abs(ha - hd) < abs(hb - hc)) return u.y >= u.x ? ha + (hd - hc) * u.x + (hc - ha) * u.y : ha + (hb - ha) * u.x + (hd - hb) * u.y;
+          return u.x + u.y <= 1.0 ? ha + (hb - ha) * u.x + (hc - ha) * u.y : hd + (hc - hd) * (1.0 - u.x) + (hb - hd) * (1.0 - u.y);
+        }`)
+      .replace('#include <begin_vertex>', `
+        vec2 cell = uGCell + aCell;
+        float r1 = gH1(cell), r2 = gH1(cell + 17.31), r3 = gH1(cell + 41.7);
+        vec2 base = (cell + vec2(r1, r2)) * uGSpacing;
+        float d = length(base - (uGCell + 0.5) * uGSpacing);
+        // lawn? (near level mask: vegetation without asphalt / hard surface, not beds or woods)
+        vec2 e = min(base - uNearRect.xy, uNearRect.xy + uNearRect.zw - base);
+        vec3 m = textureLod(uNearMask, base / uNearPeriod, 0.0).rgb;
+        float lawn = smoothstep(0.86, 0.96, m.r) * (1.0 - smoothstep(0.04, 0.12, m.g + m.b)) * step(4.0, min(e.x, e.y));
+        float hgt = (0.06 + 0.06 * r3) * lawn * (1.0 - smoothstep(uGRadius * 0.55, uGRadius, d)) * (1.0 - smoothstep(0.2, 0.5, uSnow));
+        float ang = r2 * 6.2832, ca = cos(ang), sa = sin(ang);
+        vec3 p = position;
+        p.xz = mat2(ca, sa, -sa, ca) * p.xz * (0.8 + 0.5 * r1);
+        // wind: the tips sway a little
+        float sw = sin(uGTime * 1.7 + base.x * 0.9 + base.y * 0.6) * 0.5 + sin(uGTime * 2.9 + base.x * 2.3) * 0.25;
+        p.xz += vec2(0.7, 0.4) * sw * 0.12 * p.y;
+        vec3 transformed = vec3(base.x + p.x, gTerrain(base) + p.y * hgt - 0.01, base.y + p.z);
+        // no lawn here: fold the tuft into a point under the ground (flat blades would poke out of slopes)
+        if (hgt < 0.004) transformed = vec3(base.x, gTerrain(base) - 1.0, base.y);
+        vec3 gc = textureLod(uNearMap, base / uNearPeriod, 0.0).rgb;
+        gc *= uGrassTint;                                           // (the texture is decoded from sRGB)
+        vGCol = gc * mix(0.62, 1.22 + 0.25 * (r3 - 0.5), aTip) * mix(vec3(1.0), vec3(1.08, 1.05, 0.82), aTip * r1 * 0.6);
+      `)
+      .replace('#include <beginnormal_vertex>', 'vec3 objectNormal = vec3(0.0, 1.0, 0.0);\n#ifdef USE_TANGENT\nvec3 objectTangent = vec3(1.0, 0.0, 0.0);\n#endif');
+    sh.fragmentShader = sh.fragmentShader
+      .replace('#include <common>', '#include <common>\nvarying vec3 vGCol;')
+      .replace('#include <color_fragment>', '#include <color_fragment>\ndiffuseColor.rgb *= vGCol;')
+      // (both faces lit like the ground below them: no flipped normal on the back face)
+      .replace('#include <normal_fragment_begin>', 'float faceDirection = 1.0;\nvec3 normal = normalize(vNormal);\nvec3 nonPerturbedNormal = normal;');
+  };
+  mat.customProgramCacheKey = () => 'cmu-grass-v1';
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.name = 'terrain-grass';
+  mesh.frustumCulled = false;
+  mesh.receiveShadow = true;
+  mesh.castShadow = false;
+  mesh.matrixAutoUpdate = false;
+  ctx.scene.add(mesh);
+  ctx.onUpdate?.((dt, el) => {
+    const cam = ctx.camera;
+    if (!cam) return;
+    const p = cam.position;
+    const above = p.y - ctx.heightAt(p.x, p.z);
+    mesh.visible = above < 45 && uniforms.uNearRect.value.x > -1e6;
+    if (!mesh.visible) return;
+    gu.uGCell.value.set(Math.floor(p.x / cfg.spacing), Math.floor(p.z / cfg.spacing));
+    gu.uGTime.value = el;
+  }, 23);
+  return { mesh, tufts: geo.instanceCount, triangles: geo.instanceCount * 5 };
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Terrain chunk geometry at level of detail `lod` (vertex stride 2^lod cells; the chunk's last row / column is
+// always included), with a curtain hanging `c.drop` metres from its four edges (faces outwards) that hides the
+// cracks against neighbours drawn at another level.
+function chunkGeometry(c, lod, H, GW, CS, B, gridH) {
+  const s = 1 << lod;
+  const is = [], js = [];
+  for (let i = 0; i < c.ni; i += s) is.push(i);
+  is.push(c.ni);
+  for (let j = 0; j < c.nj; j += s) js.push(j);
+  js.push(c.nj);
+  const vw = is.length, vh = js.length, nGrid = vw * vh;
+  const nV = nGrid + 2 * (vw + vh);
+  const pos = new Float32Array(nV * 3), nor = new Float32Array(nV * 3);
+  for (let j = 0; j < vh; j++) for (let i = 0; i < vw; i++) {
+    const gi = c.ci + is[i], gj = c.cj + js[j], o = (j * vw + i) * 3;
+    pos[o] = B.minX + gi * CS; pos[o + 1] = H[gj * GW + gi]; pos[o + 2] = B.minZ + gj * CS;
+    const hx = gridH(gi + 1, gj) - gridH(gi - 1, gj), hz = gridH(gi, gj + 1) - gridH(gi, gj - 1);
+    const l = Math.hypot(hx, 2 * CS, hz);
+    nor[o] = -hx / l; nor[o + 1] = (2 * CS) / l; nor[o + 2] = -hz / l;
+  }
+  const nIdx = (vw - 1) * (vh - 1) * 6 + 2 * ((vw - 1) + (vh - 1)) * 6;
+  const idx = new (nV > 65535 ? Uint32Array : Uint16Array)(nIdx);
+  let k = 0;
+  for (let j = 0; j < vh - 1; j++) for (let i = 0; i < vw - 1; i++) {
+    const a = j * vw + i, b = a + 1, cc = a + vw, d = cc + 1;
+    const ha = pos[a * 3 + 1], hb = pos[b * 3 + 1], hc = pos[cc * 3 + 1], hd = pos[d * 3 + 1];
+    if (Math.abs(ha - hd) < Math.abs(hb - hc)) { idx[k++] = a; idx[k++] = cc; idx[k++] = d; idx[k++] = a; idx[k++] = d; idx[k++] = b; }
+    else { idx[k++] = a; idx[k++] = cc; idx[k++] = b; idx[k++] = b; idx[k++] = cc; idx[k++] = d; }
+  }
+  // curtains: edge vertex list, outward direction
+  let nv = nGrid;
+  const cx = B.minX + (c.ci + c.ni / 2) * CS, cz = B.minZ + (c.cj + c.nj / 2) * CS;
+  const edges = [
+    Array.from({ length: vw }, (_, i) => i),                      // north (j = 0)
+    Array.from({ length: vw }, (_, i) => (vh - 1) * vw + i),      // south
+    Array.from({ length: vh }, (_, j) => j * vw),                 // west
+    Array.from({ length: vh }, (_, j) => j * vw + vw - 1),        // east
+  ];
+  for (const e of edges) {
+    const base = nv;
+    for (const v of e) {
+      pos[nv * 3] = pos[v * 3]; pos[nv * 3 + 1] = pos[v * 3 + 1] - c.drop; pos[nv * 3 + 2] = pos[v * 3 + 2];
+      nor[nv * 3] = nor[v * 3]; nor[nv * 3 + 1] = nor[v * 3 + 1]; nor[nv * 3 + 2] = nor[v * 3 + 2];
+      nv++;
+    }
+    for (let t = 0; t < e.length - 1; t++) {
+      const a = e[t], b = e[t + 1], a2 = base + t, b2 = base + t + 1;
+      // outward = away from the chunk centre; (b - a) × (a2 - a) points along ±outward
+      const ex = pos[b * 3] - pos[a * 3], ez = pos[b * 3 + 2] - pos[a * 3 + 2];
+      const mx = (pos[a * 3] + pos[b * 3]) / 2 - cx, mz = (pos[a * 3 + 2] + pos[b * 3 + 2]) / 2 - cz;
+      // cross((ex,0,ez), (0,-1,0)) = (ez, 0, -ex)
+      if (ez * mx - ex * mz > 0) { idx[k++] = a; idx[k++] = b; idx[k++] = a2; idx[k++] = b; idx[k++] = b2; idx[k++] = a2; }
+      else { idx[k++] = a; idx[k++] = a2; idx[k++] = b; idx[k++] = b; idx[k++] = a2; idx[k++] = b2; }
+    }
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  geo.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+  geo.setIndex(new THREE.BufferAttribute(k === nIdx ? idx : idx.subarray(0, k), 1));
+  geo.boundingBox = c.box.clone();
+  geo.boundingBox.min.y -= c.drop;
+  geo.boundingSphere = geo.boundingBox.getBoundingSphere(new THREE.Sphere());
+  return geo;
+}
+
+// How far a chunk's curtain must hang: the largest gap between its edges at full resolution and at any coarser
+// level (the neighbour across an edge may be drawn at any of them), plus a margin.
+function chunkCurtainDrop(c, H, GW) {
+  let e = 0;
+  const edge = (i0, j0, di, dj, n) => {
+    for (const s of [2, 4, 8]) {
+      for (let a = 0; a < n; a += s) {
+        const b = Math.min(n, a + s);
+        const ha = H[(j0 + dj * a) * GW + i0 + di * a], hb = H[(j0 + dj * b) * GW + i0 + di * b];
+        for (let t = a + 1; t < b; t++) {
+          const h = H[(j0 + dj * t) * GW + i0 + di * t];
+          e = Math.max(e, Math.abs(h - (ha + ((hb - ha) * (t - a)) / (b - a))));
+        }
+      }
+    }
+  };
+  edge(c.ci, c.cj, 1, 0, c.ni); edge(c.ci, c.cj + c.nj, 1, 0, c.ni);
+  edge(c.ci, c.cj, 0, 1, c.nj); edge(c.ci + c.ni, c.cj, 0, 1, c.nj);
+  return e + 0.6;
 }
 
 // ---------------------------------------------------------------------------------------------------------------

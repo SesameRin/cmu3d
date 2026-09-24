@@ -1,5 +1,7 @@
-// Water: Westinghouse Pond, fountain basins (Mary Schenley Memorial Fountain, plaza fountains) with a cheap
-// animated reflective surface (MeshStandardMaterial + procedural wave normals → the sky/env map does the reflecting).
+// Water: Westinghouse Pond, Panther Hollow Lake, fountain basins (Mary Schenley Memorial Fountain, the Joy of Life
+// fountain in East Liberty, plaza fountains): MeshStandardMaterial with procedural wave normals; the sky/env map does
+// the reflecting, and on high the nearest water in view also gets a real planar reflection (trees, banks,
+// buildings mirrored in the pond: one extra 512² render of the scene while it is within 320 m).
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { pointInRing } from '../core/heightfield.js';
@@ -72,7 +74,11 @@ function rippleTexture() {
 }
 
 export function createWaterMaterial(ctx, { color = '#1f3b40', strength = 1 } = {}) {
-  const uniforms = { uTime: { value: 0 }, uRipple: { value: rippleTexture() }, uStrength: { value: strength } };
+  const uniforms = {
+    uTime: { value: 0 }, uRipple: { value: rippleTexture() }, uStrength: { value: strength },
+    // planar reflection: texture, world → texture projection, mirrored water level (-1e9: none), its body (xz, r)
+    uRefl: { value: null }, uReflMatrix: { value: new THREE.Matrix4() }, uReflLevel: { value: -1e9 }, uReflBody: { value: new THREE.Vector3() },
+  };
   const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.05, metalness: 0.0, envMapIntensity: 1.25 });
   mat.name = 'water';
   mat.onBeforeCompile = (sh) => {
@@ -81,7 +87,7 @@ export function createWaterMaterial(ctx, { color = '#1f3b40', strength = 1 } = {
       .replace('#include <common>', '#include <common>\nvarying vec3 vWPos;')
       .replace('#include <begin_vertex>', '#include <begin_vertex>\nvWPos = (modelMatrix * vec4(transformed, 1.0)).xyz;');
     sh.fragmentShader = sh.fragmentShader
-      .replace('#include <common>', '#include <common>\nvarying vec3 vWPos;\nuniform float uTime;\nuniform float uStrength;\nuniform sampler2D uRipple;')
+      .replace('#include <common>', '#include <common>\nvarying vec3 vWPos;\nuniform float uTime;\nuniform float uStrength;\nuniform sampler2D uRipple;\nuniform sampler2D uRefl;\nuniform mat4 uReflMatrix;\nuniform float uReflLevel;\nuniform vec3 uReflBody;\nvec2 wGrad;')
       .replace('#include <normal_fragment_maps>', `#include <normal_fragment_maps>
       {
         vec2 p = vWPos.xz;
@@ -97,9 +103,22 @@ export function createWaterMaterial(ctx, { color = '#1f3b40', strength = 1 } = {
         g *= uStrength * (0.35 + 0.65 * fd);
         vec3 wn = normalize(vec3(-g.x, 1.0, -g.y));
         normal = normalize((viewMatrix * vec4(wn, 0.0)).xyz);
-      }`);
+        wGrad = g;
+      }`)
+      .replace('#include <opaque_fragment>', `
+      if (abs(vWPos.y - uReflLevel) < 0.05 && length(vWPos.xz - uReflBody.xy) < uReflBody.z) {
+        // mirrored scene, displaced by the waves; Schlick fresnel for water (F0 0.02)
+        vec4 rp = uReflMatrix * vec4(vWPos, 1.0);
+        rp.xy += wGrad * 0.3 * rp.w;
+        vec3 refl = texture2DProj(uRefl, rp).rgb;
+        vec3 V = normalize(cameraPosition - vWPos);
+        float F = 0.02 + 0.98 * pow(1.0 - clamp(V.y, 0.0, 1.0), 5.0);
+        outgoingLight = mix(outgoingLight, refl, clamp(F * 1.05, 0.0, 0.92));
+      }
+      #include <opaque_fragment>`);
   };
-  mat.customProgramCacheKey = () => 'cmu-water-v1';
+  mat.customProgramCacheKey = () => 'cmu-water-v2';
+  mat.userData.waterUniforms = uniforms;
   ctx.onUpdate((dt, el) => { uniforms.uTime.value = el; }, 10);
   return mat;
 }
@@ -180,7 +199,7 @@ export function createWater(ctx) {
   group.name = 'water';
   const bodies = waterBodies(ctx);
   if (!bodies.length) return group;
-  const mat = createWaterMaterial(ctx);
+  const mat = createWaterMaterial(ctx, { strength: 0.6 }); // (ponds and basins: calm water)
   const stone = ctx.materials.get('granite');
   const surfaces = [], rims = [];
   for (const b of bodies) {
@@ -216,6 +235,7 @@ export function createWater(ctx) {
   water.receiveShadow = true;
   water.name = 'water-surfaces';
   group.add(water);
+  try { createReflection(ctx, bodies, mat, water); } catch (e) { console.warn('[water] reflection failed', e); }
   if (rims.length) {
     const rimMesh = new THREE.Mesh(mergeGeometries(rims.map((g) => (g.index ? g.toNonIndexed() : g)).map(stripToPosNormUv)), stone);
     rimMesh.castShadow = true; rimMesh.receiveShadow = true;
@@ -227,6 +247,97 @@ export function createWater(ctx) {
   if (jets.length) group.add(createJets(ctx, jets));
   ctx.scene.add(group);
   return group;
+}
+
+// Planar reflection (high quality): each frame the nearest water body in view within REFL_RANGE, seen from above
+// its surface, is mirrored — the scene rendered from the camera reflected in its plane (oblique near plane at the
+// water level, so nothing below it shows up) into a small half-float target, which the water shader samples with
+// the matching projection. The render target stays linear (no tone mapping: the main pass does that once).
+const REFL_RANGE = 320, REFL_SIZE = 512;
+function createReflection(ctx, bodies, mat, water) {
+  if (ctx.quality?.level !== 'high' || !ctx.renderer) return;
+  const U = mat.userData.waterUniforms;
+  const rt = new THREE.WebGLRenderTarget(REFL_SIZE, REFL_SIZE, { type: THREE.HalfFloatType, depthBuffer: true });
+  rt.texture.name = 'water-reflection';
+  U.uRefl.value = rt.texture;
+  const list = bodies.map((b) => {
+    let r = 0;
+    for (const [x, z] of b.ring) r = Math.max(r, Math.hypot(x - b.center[0], z - b.center[1]));
+    return { b, r, sphere: new THREE.Sphere(new THREE.Vector3(b.center[0], b.level, b.center[1]), r + 2) };
+  });
+  const cam = new THREE.PerspectiveCamera();
+  cam.matrixAutoUpdate = true;
+  const frustum = new THREE.Frustum(), pm = new THREE.Matrix4();
+  const N = new THREE.Vector3(0, 1, 0), P0 = new THREE.Vector3(), camPos = new THREE.Vector3(), rot = new THREE.Matrix4();
+  const look = new THREE.Vector3(), target = new THREE.Vector3(), view = new THREE.Vector3();
+  const plane = new THREE.Plane(), clip = new THREE.Vector4(), q = new THREE.Vector4();
+  const bias = new THREE.Matrix4().set(0.5, 0, 0, 0.5, 0, 0.5, 0, 0.5, 0, 0, 0.5, 0.5, 0, 0, 0, 1);
+  const stats = { renders: 0, ms: 0, calls: 0, enabled: true };
+  ctx.water = Object.assign(ctx.water || {}, { reflection: stats });
+  ctx.onUpdate(() => {
+    const main = ctx.camera, renderer = ctx.renderer, scene = ctx.scene;
+    if (!main || !scene) return;
+    U.uReflLevel.value = -1e9;
+    main.updateMatrixWorld();
+    camPos.setFromMatrixPosition(main.matrixWorld);
+    pm.multiplyMatrices(main.projectionMatrix, main.matrixWorldInverse);
+    frustum.setFromProjectionMatrix(pm);
+    let best = null, bd = Infinity;
+    for (const e of list) {
+      if (camPos.y < e.b.level + 0.3) continue;
+      const d = e.sphere.distanceToPoint(camPos);
+      if (d > REFL_RANGE || d >= bd || !frustum.intersectsSphere(e.sphere)) continue;
+      best = e; bd = d;
+    }
+    if (!best || !stats.enabled) return;
+    const t0 = performance.now();
+    const c0 = renderer.info.render.calls;
+    // mirror camera (as three's Reflector)
+    P0.set(0, best.b.level, 0);
+    rot.extractRotation(main.matrixWorld);
+    view.y = 2 * best.b.level - camPos.y; view.x = camPos.x; view.z = camPos.z;
+    look.set(0, 0, -1).applyMatrix4(rot).add(camPos);
+    target.set(look.x, 2 * best.b.level - look.y, look.z);
+    cam.position.copy(view);
+    cam.up.set(0, 1, 0).applyMatrix4(rot).reflect(N);
+    cam.lookAt(target);
+    cam.near = main.near; cam.far = Math.min(main.far, 2500);
+    cam.fov = main.fov; cam.aspect = main.aspect; cam.zoom = main.zoom;
+    cam.updateMatrixWorld();
+    cam.updateProjectionMatrix();
+    // oblique near plane = the water plane (Lengyel)
+    plane.setFromNormalAndCoplanarPoint(N, P0).applyMatrix4(cam.matrixWorldInverse);
+    clip.set(plane.normal.x, plane.normal.y, plane.normal.z, plane.constant);
+    const e = cam.projectionMatrix.elements;
+    q.x = (Math.sign(clip.x) + e[8]) / e[0];
+    q.y = (Math.sign(clip.y) + e[9]) / e[5];
+    q.z = -1.0;
+    q.w = (1.0 + e[10]) / e[14];
+    clip.multiplyScalar(2.0 / clip.dot(q));
+    e[2] = clip.x; e[6] = clip.y; e[10] = clip.z + 1.0; e[14] = clip.w;
+    cam.projectionMatrixInverse.copy(cam.projectionMatrix).invert();
+    U.uReflMatrix.value.copy(bias).multiply(cam.projectionMatrix).multiply(cam.matrixWorldInverse);
+    // render (without the water itself)
+    const prevRT = renderer.getRenderTarget(), prevXr = renderer.xr.enabled, prevShadow = renderer.shadowMap.autoUpdate;
+    water.visible = false;
+    renderer.xr.enabled = false;
+    renderer.shadowMap.autoUpdate = false;
+    try {
+      renderer.setRenderTarget(rt);
+      renderer.clear();
+      renderer.render(scene, cam);
+    } finally {
+      renderer.setRenderTarget(prevRT);
+      renderer.xr.enabled = prevXr;
+      renderer.shadowMap.autoUpdate = prevShadow;
+      water.visible = true;
+    }
+    U.uReflLevel.value = best.b.level;
+    U.uReflBody.value.set(best.b.center[0], best.b.center[1], best.r + 1);
+    stats.renders++;
+    stats.calls = renderer.info.render.calls - c0;
+    stats.ms = Math.round((stats.ms * 0.9 + (performance.now() - t0) * 0.1) * 100) / 100;
+  }, 95);
 }
 
 // Ring moved inwards by d metres (mitred vertex offsets, clamped at sharp corners).

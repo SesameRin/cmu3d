@@ -2,21 +2,28 @@
 //
 // Placement sources (in priority order, deduplicated with a spatial hash):
 //   1. OSM individual trees (data.trees) and tree rows (data.treeRows)            — always kept
-//   2. street trees along urban streets (both sides, species runs per street)
+//   2. street trees along urban streets (both sides, species runs per street); where buildings stand at the back
+//      of the sidewalk (Walnut St, Penn Ave, Ellsworth…) young street trees go into sidewalk pits at the kerb
 //   3. area/terrain driven fill on a jittered grid: woods, steep slopes (Junction Hollow, Panther Hollow…),
 //      Schenley Park groves, golf-course roughs, residential back yards, sparse campus planting
 //   4. campus lawn-edge trees (never inside The Cut / The Mall / pitches…)
 //   5. shrubs: forest understory, foundation planting along buildings, gardens & flowerbeds
 // Everything avoids buildings, roads, paths, rails, water, hard surfaces and open lawns via the 1 m land mask.
 //
-// Rendering: one InstancedMesh per species per LOD. A cheap CPU pass (when the camera has moved ≥ 12 m or turned
-// ≥ 12°) packs the instances that are in view — or throw a shadow into it — into the near (full detail, leafy
-// cards, branch skeleton for winter), mid/far (low poly) and very-far (~46 tris) meshes. Seasons recolour the
-// per-instance foliage attribute.
+// Rendering (cost bounded by what is near the camera, not by the size of the map):
+//   near  (≤ ~180 m)  full model: leaf-cluster cards, branch skeleton, leafy shadows within 60 m
+//   mid   (…~420 m)   low-poly lobe crowns (cast shadows up to 380 m)
+//   impostor (beyond) ONE instanced draw of camera-facing quads for every tree on the map, crowns drawn procedurally
+// Neighbouring tiers overlap in a distance band and cross-fade (complementary dither), so nothing pops. Instances
+// are stored sorted by 64 m tiles; when the camera has moved ≥ 12 m or turned ≥ 12° a CPU pass visits only the
+// tiles within the mid range that are in view (or throw a shadow into it) and packs the near/mid instances into
+// the per-species meshes. The impostor mesh is static (the vertex shader hides trees that are still 3D).
+// Seasons recolour the per-instance foliage attributes.
 import * as THREE from 'three';
 import { RoundedBoxGeometry } from 'three/examples/jsm/geometries/RoundedBoxGeometry.js';
+import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { getLandMask, M, AREA, mulberry32, fbm2, samplePolyline, composeMatrix, polylineLength, pointInRing, createCuller, createCameraWatch, animTime } from './graph.js';
-import { SPECIES, EVERGREEN, buildSpeciesGeometry, seasonColor, createTreeShared, createTreeMaterial, createTreeDepthMaterial } from './trees.js';
+import { SPECIES, EVERGREEN, buildSpeciesGeometry, seasonColor, createTreeShared, createTreeMaterial, createTreeDepthMaterial, createImpostorGeometry, createImpostorMaterial } from './trees.js';
 
 const SP = Object.fromEntries(SPECIES.map((k, i) => [k, i]));
 
@@ -24,7 +31,8 @@ const SP = Object.fromEntries(SPECIES.map((k, i) => [k, i]));
 const MIX = {
   campus: [['broadleaf', 0.34], ['oak', 0.3], ['ornamental', 0.14], ['columnar', 0.1], ['pine', 0.06], ['spruce', 0.06]],
   osm: [['broadleaf', 0.42], ['oak', 0.3], ['ornamental', 0.1], ['columnar', 0.06], ['spruce', 0.07], ['pine', 0.05]],
-  street: [['broadleaf', 0.5], ['oak', 0.22], ['columnar', 0.16], ['ornamental', 0.12]],
+  street: [['broadleaf', 0.52], ['oak', 0.26], ['columnar', 0.08], ['ornamental', 0.08], ['street', 0.06]],
+  pit: [['street', 0.84], ['ornamental', 0.16]],
   forest: [['oak', 0.52], ['broadleaf', 0.3], ['pine', 0.08], ['spruce', 0.05], ['columnar', 0.05]],
   park: [['oak', 0.36], ['broadleaf', 0.34], ['spruce', 0.12], ['pine', 0.1], ['ornamental', 0.08]],
   yard: [['broadleaf', 0.4], ['oak', 0.24], ['spruce', 0.12], ['ornamental', 0.16], ['columnar', 0.08]],
@@ -39,12 +47,12 @@ function pick(table, r) {
 // Base scale ranges per species (multiplies the modelled size)
 const SCALE = {
   broadleaf: [0.8, 1.2], oak: [0.8, 1.2], columnar: [0.8, 1.15], spruce: [0.75, 1.15],
-  pine: [0.85, 1.2], ornamental: [0.8, 1.2], shrub: [0.6, 1.25],
+  pine: [0.85, 1.2], ornamental: [0.8, 1.2], street: [0.85, 1.15], shrub: [0.6, 1.25],
 };
 // Trunk radius at breast height (m, before instance scale) — walk-mode colliders
-const TRUNK_R = { broadleaf: 0.3, oak: 0.45, columnar: 0.25, spruce: 0.35, pine: 0.36, ornamental: 0.2, shrub: 0 };
+const TRUNK_R = { broadleaf: 0.3, oak: 0.45, columnar: 0.25, spruce: 0.35, pine: 0.36, ornamental: 0.2, street: 0.14, shrub: 0 };
 // Trunk clearance to buildings for each species (m)
-const CLEAR_B = { broadleaf: 3.2, oak: 4.2, columnar: 2.2, spruce: 3.0, pine: 3.2, ornamental: 2.2, shrub: 0.6 };
+const CLEAR_B = { broadleaf: 3.2, oak: 4.2, columnar: 2.2, spruce: 3.0, pine: 3.2, ornamental: 2.2, street: 1.8, shrub: 0.6 };
 
 // Open lawns inside unmapped park land (OSM maps only the woods around them). Generous outline: only cells whose
 // area is plain "park" inside it are treated as lawn — woods, roads and other areas keep their own rules.
@@ -55,6 +63,16 @@ const OPEN_LAWNS = [
     [-300, 375], [-318, 362], [-380, 305], [-428, 255]],
 ];
 const LAWN_EDGE = 12; // trees still grow in a band this wide along the lawn's edges
+
+// LOD distances per quality level (camera distance, m): near → mid cross-fade ends at `near`, mid → impostor at `imp`.
+const LOD = {
+  low: { near: 80, imp: 260 },
+  medium: { near: 130, imp: 340 },
+  high: { near: 180, imp: 420 },
+};
+const NEAR_BAND = 11, IMP_BAND = 30;
+const SHRUB_LOD = 1.45;                   // shrubs switch at 1 / 1.45 of the tree distances and fade out at the mid end
+const TILE = 64;
 
 export async function createVegetation(ctx) {
   const t0 = performance.now();
@@ -70,7 +88,7 @@ export async function createVegetation(ctx) {
   const hf = ctx.heightfield;
 
   // ---------------------------------------------------------------- instance store
-  const T = { x: [], z: [], sp: [], s: [], sy: [], rot: [], r1: [], r2: [], evg: [] };
+  const T = { x: [], z: [], sp: [], s: [], sy: [], w: [], rot: [], r1: [], r2: [], evg: [] };
   const HASH = 4;
   const hash = new Map();
   const hk = (i, j) => i * 92821 + j;
@@ -84,13 +102,13 @@ export async function createVegetation(ctx) {
     }
     return false;
   }
-  function add(x, z, sp, { minDist = 0, scale = 1, evg = false, osm = false } = {}) {
+  function add(x, z, sp, { minDist = 0, scale = 1, wide = 1, evg = false, osm = false } = {}) {
     if (!osm && excluded(x, z)) return false;
     if (minDist > 0 && nearest(x, z, minDist)) return false;
     const [a, b] = SCALE[sp];
     const s = (a + (b - a) * rng()) * scale;
     const k = T.x.length;
-    T.x.push(x); T.z.push(z); T.sp.push(SP[sp]); T.s.push(s); T.sy.push(s * (0.9 + rng() * 0.22));
+    T.x.push(x); T.z.push(z); T.sp.push(SP[sp]); T.s.push(s); T.sy.push(s * (0.9 + rng() * 0.22)); T.w.push(wide);
     T.rot.push(rng() * Math.PI * 2); T.r1.push(rng()); T.r2.push(rng()); T.evg.push(evg ? 1 : 0);
     if (sp !== 'shrub') {
       const key = hk(Math.floor(x / HASH), Math.floor(z / HASH));
@@ -139,7 +157,34 @@ export async function createVegetation(ctx) {
   await ctx.yield?.();
 
   // ---------------------------------------------------------------- 2. street trees
+  // junctions (road vertices shared by several streets) and pedestrian crossings: no street trees there
+  const JC = 8, jGrid = new Map();
+  const jk = (i, j) => i * 100003 + j;
+  const addPt = (x, z) => { const k = jk(Math.floor(x / JC), Math.floor(z / JC)); let a = jGrid.get(k); if (!a) jGrid.set(k, a = []); a.push(x, z); };
+  const nearPt = (x, z, r) => {
+    const R = Math.ceil(r / JC), ci = Math.floor(x / JC), cj = Math.floor(z / JC);
+    for (let di = -R; di <= R; di++) for (let dj = -R; dj <= R; dj++) {
+      const a = jGrid.get(jk(ci + di, cj + dj)); if (!a) continue;
+      for (let q = 0; q < a.length; q += 2) if ((a[q] - x) ** 2 + (a[q + 1] - z) ** 2 < r * r) return true;
+    }
+    return false;
+  };
+  {
+    const seen = new Map();
+    data.roads.forEach((r, ri) => {
+      if (r.tunnel) return;
+      for (const [x, z] of r.points) {
+        const k = `${Math.round(x)},${Math.round(z)}`;
+        const v = seen.get(k);
+        if (v === undefined) seen.set(k, ri);
+        else if (v !== ri && v >= 0) { addPt(x, z); seen.set(k, -1); }
+      }
+    });
+    for (const p of data.paths) if (p.footway === 'crossing') samplePolyline(p.points, 2, 0, (x, z) => addPt(x, z));
+  }
+  const pits = [];
   const STREET_TYPES = { residential: 0.82, tertiary: 0.68, secondary: 0.6, primary: 0.55, trunk: 0.4, unclassified: 0.45 };
+  const PIT_TYPES = { residential: 0.35, tertiary: 0.85, secondary: 0.8, primary: 0.75, unclassified: 0.3 };
   for (const r of data.roads) {
     const p = STREET_TYPES[r.type];
     if (!p || r.bridge || r.tunnel || r.points.length < 2) continue;
@@ -149,11 +194,13 @@ export async function createVegetation(ctx) {
     const half = (r.width || 7) / 2;
     // candidate offsets from the centreline: kerb strip, strip beyond the sidewalk, front yard
     const offs = [half + 1.0, half + 1.8, half + 3.4, half + 5.2];
+    const pitP = PIT_TYPES[r.type] || 0;
     for (const side of [-1, 1]) {
       samplePolyline(r.points, 9 * (0.9 + streetRnd() * 0.25) / Math.sqrt(Math.max(0.5, density)), 4 + streetRnd() * 5, (x, z, dx, dz) => {
         if (rng() > p) return;
         const j = (rng() - 0.5) * 2.2;
         const sp = rng() < 0.75 ? main : pick(MIX.street, rng());
+        let room = false;       // true when the verge has space for a tree somewhere (then no sidewalk pit)
         for (const off of offs) {
           const tx = x - dz * off * side + dx * j, tz = z + dx * off * side + dz * j;
           if (!mask.inBounds(tx, tz)) return;
@@ -161,9 +208,20 @@ export async function createVegetation(ctx) {
           if (f & (M.LAWN | M.HARD | M.WATER | M.BUILDING)) continue;
           if (blocked(tx, tz, 0.6, M.ROAD | M.RAIL) || blocked(tx, tz, 0.45, M.PATH)) continue;
           if (blocked(tx, tz, CLEAR_B[sp] * 0.6, M.BUILDING)) continue;
+          room = true;
+          if (nearPt(tx, tz, 7)) return;
           if (add(tx, tz, sp, { minDist: 5.5 })) return;
           return;
         }
+        // no verge: buildings at the back of the sidewalk → a young street tree in a pit at the kerb
+        if (room || rng() > pitP) return;
+        const off = half + 0.8;
+        const tx = x - dz * off * side, tz = z + dx * off * side;
+        if (!mask.inBounds(tx, tz) || (mask.at(tx, tz) & (M.BUILDING | M.WATER | M.RAIL))) return;
+        if (blocked(tx, tz, 0.3, M.ROAD) || blocked(tx, tz, 1.5, M.BUILDING) || !blocked(tx, tz, 4.5, M.BUILDING)) return;
+        if (nearPt(tx, tz, 7)) return;
+        const psp = pick(MIX.pit, rng());
+        if (add(tx, tz, psp, { minDist: 8 })) pits.push(tx, tz, Math.atan2(dx, dz));
       });
     }
   }
@@ -189,44 +247,59 @@ export async function createVegetation(ctx) {
     }
     return false;
   };
+  const SKIP = M.BUILDING | M.WATER | M.LAWN | M.HARD;
+  // cheap terrain steepness: squared gradient from 3 height lookups, compared against tan²(angle)
+  const grad2 = (x, z) => { const h0 = hf.heightAt(x, z), gx = (hf.heightAt(x + 2, z) - h0) / 2, gz = (hf.heightAt(x, z + 2) - h0) / 2; return gx * gx + gz * gz; };
+  const T2 = (deg) => Math.tan((deg * Math.PI) / 180) ** 2;
+  const S10 = T2(10), S12 = T2(12), S13 = T2(13), S14 = T2(14), S15 = T2(15), S16 = T2(16);
   for (let gz = b.minZ; gz < b.maxZ; gz += cell) {
     for (let gx = b.minX; gx < b.maxX; gx += cell) {
       const x = gx + rng() * cell, z = gz + rng() * cell;
       const f = mask.at(x, z);
-      if (f & (M.BUILDING | M.WATER | M.LAWN | M.HARD)) continue;
+      if (f & (SKIP | M.ROAD)) continue;
       const code = mask.areaAt(x, z);
       const campus = f & M.CAMPUS;
-      const slope = hf.slopeAt(x, z);
-      const grove = fbm2(x / 70, z / 70);
       let p = 0, table = MIX.forest, clearRoad = 3, clearPath = 1.6, clearB = 1;
       switch (code) {
         case AREA.wood: p = 0.97; break;
         case AREA.scrub: p = 0.45; table = MIX.park; break;
-        case AREA.park:
+        case AREA.park: {
           // steep ravines are wooded; gentle slopes stay open with a few groves; mapped open lawns stay open
-          if (inOpenLawn(x, z)) { p = nearLawnEdge(x, z) ? 0.3 : 0.01; table = MIX.park; }
-          else if (slope > 14) p = 0.95;
-          else if (slope > 10) p = grove > 0.5 ? 0.8 : 0.2;
-          else { p = grove > 0.6 ? 0.8 : grove > 0.5 ? 0.22 : 0.03; table = grove > 0.6 ? MIX.forest : MIX.park; }
+          if (inOpenLawn(x, z)) { p = nearLawnEdge(x, z) ? 0.3 : 0.01; table = MIX.park; break; }
+          const g2 = grad2(x, z);
+          if (g2 > S14) p = 0.95;
+          else {
+            const grove = fbm2(x / 70, z / 70);
+            if (g2 > S10) p = grove > 0.5 ? 0.8 : 0.2;
+            else { p = grove > 0.6 ? 0.8 : grove > 0.5 ? 0.22 : 0.03; table = grove > 0.6 ? MIX.forest : MIX.park; }
+          }
           break;
-        case AREA.golf: p = grove > 0.52 ? 0.6 : 0.12; table = MIX.park; clearPath = 3; break;
+        }
+        case AREA.golf: p = fbm2(x / 70, z / 70) > 0.52 ? 0.6 : 0.12; table = MIX.park; clearPath = 3; break;
         case AREA.garden: p = 0.1; table = MIX.garden; break;
-        case AREA.grass:
-          p = slope > 16 ? 0.8 : campus ? 0.03 : 0.12; table = campus ? MIX.campus : MIX.park; break;
-        case AREA.none:
-          if (slope > 12 && !campus) { p = 0.92; }
-          else if (campus) { p = slope > 12 ? 0.55 : 0.04; table = MIX.campus; }
-          else { p = 0.16 * (0.4 + grove * 1.4); table = MIX.yard; clearRoad = 5; clearB = 1.3; }
+        case AREA.grass: {
+          p = grad2(x, z) > S16 ? 0.8 : campus ? 0.03 : 0.12; table = campus ? MIX.campus : MIX.park; break;
+        }
+        case AREA.none: {
+          const steep = grad2(x, z) > S12;
+          if (steep && !campus) { p = 0.92; }
+          else if (campus) { p = steep ? 0.55 : 0.04; table = MIX.campus; }
+          else { p = 0.16 * (0.4 + fbm2(x / 70, z / 70) * 1.4); table = MIX.yard; clearRoad = 5; clearB = 1.3; }
           break;
+        }
         default: p = 0;
       }
       if (p <= 0 || rng() > p) continue;
       const sp = pick(table, rng());
-      if (blocked(x, z, clearRoad, M.ROAD | M.RAIL)) continue;
+      const minDist = sp === 'ornamental' ? 3 : 4.2;
+      if (nearest(x, z, minDist)) continue;                       // cheap test first
+      if (blocked(x, z, 1.2, M.LAWN | M.HARD)) continue;
       if (blocked(x, z, clearPath, M.PATH)) continue;
       if (blocked(x, z, CLEAR_B[sp] * clearB, M.BUILDING)) continue;
-      if (blocked(x, z, 1.2, M.LAWN | M.HARD)) continue;
-      add(x, z, sp, { minDist: sp === 'ornamental' ? 3 : 4.2, scale: table === MIX.forest ? 1.22 : 1 });
+      if (blocked(x, z, clearRoad, M.ROAD | M.RAIL)) continue;
+      // woodland: taller trees with wider crowns so the canopy closes (seen from above it is one mass, not balls)
+      const forest = table === MIX.forest;
+      add(x, z, sp, { scale: forest ? 1.22 : 1, wide: forest ? 1.14 : 1 });
     }
     if (((gz - b.minZ) / cell | 0) % 40 === 0) await ctx.yield?.();
   }
@@ -274,8 +347,8 @@ export async function createVegetation(ctx) {
       let p = 0;
       if (code === AREA.wood || code === AREA.scrub) p = 0.45;
       else if (code === AREA.garden || code === AREA.flowerbed) p = 0.9;
-      else if (code === AREA.park) p = inOpenLawn(x, z) ? (nearLawnEdge(x, z) ? 0.08 : 0) : hf.slopeAt(x, z) > 13 ? 0.35 : 0.05;
-      else if (code === AREA.none && !(f & M.CAMPUS) && hf.slopeAt(x, z) > 15) p = 0.4;
+      else if (code === AREA.park) p = inOpenLawn(x, z) ? (nearLawnEdge(x, z) ? 0.08 : 0) : grad2(x, z) > S13 ? 0.35 : 0.05;
+      else if (code === AREA.none && !(f & M.CAMPUS) && grad2(x, z) > S15) p = 0.4;
       if (rng() > p) continue;
       if (blocked(x, z, 1.2, M.PATH | M.ROAD | M.BUILDING)) continue;
       add(x, z, 'shrub', { scale: code === AREA.garden || code === AREA.flowerbed ? 0.9 : 1.15, evg: rng() < 0.3 });
@@ -319,25 +392,40 @@ export async function createVegetation(ctx) {
   const shrubCount = total - treeCount;
   mark('lawnEdge+shrubs');
 
+  // ---------------------------------------------------------------- tiles (instances are stored tile by tile)
+  const TX0 = Math.floor((b.minX - 20) / TILE), TZ0 = Math.floor((b.minZ - 20) / TILE);
+  const NTX = Math.floor((b.maxX + 20) / TILE) - TX0 + 1, NTZ = Math.floor((b.maxZ + 20) / TILE) - TZ0 + 1;
+  const NT = NTX * NTZ;
+  const tileOf = (x, z) => {
+    const tx = Math.min(NTX - 1, Math.max(0, Math.floor(x / TILE) - TX0)), tz = Math.min(NTZ - 1, Math.max(0, Math.floor(z / TILE) - TZ0));
+    return tz * NTX + tx;
+  };
+  // per tile bounds of everything in it (for view / shadow culling of whole tiles)
+  const tY0 = new Float32Array(NT).fill(Infinity), tY1 = new Float32Array(NT).fill(-Infinity), tN = new Int32Array(NT);
+
   // ---------------------------------------------------------------- build instance data per species
+  const lvl = LOD[q.level] ? q.level : 'high';
   const shared = createTreeShared();
-  const matNear = createTreeMaterial(shared, { near: true });
-  const matFar = createTreeMaterial(shared, { near: false });
+  const setBands = (level) => {
+    const L = LOD[level] || LOD.high;
+    shared.uLod.value.set(L.near - NEAR_BAND, L.near, L.imp - IMP_BAND, L.imp);
+  };
+  setBands(lvl);
+  // impostors end where the haze has swallowed a tree anyway (FogExp2 ≈ 0.0006/m: ~75 % at 2 km)
+  shared.uFar.value = Math.min(2600, Math.max(1200, q.drawDistance || 2400));
   const depthMat = createTreeDepthMaterial(shared);
+  const matNearTree = createTreeMaterial(shared, { near: true }), matFarTree = createTreeMaterial(shared, { near: false });
+  const matNearShrub = createTreeMaterial(shared, { near: true, lodScale: SHRUB_LOD }), matFarShrub = createTreeMaterial(shared, { near: false, lodScale: SHRUB_LOD });
   const group = new THREE.Group();
   group.name = 'vegetation';
 
-  // LOD rings (3D camera distance): near = full model (0…nearR), mid = low-poly model that still casts shadows
-  // (…MID_R), far = low-poly, no shadow (…VFAR_R), very far = coarse model. Only near trees within SHADOW_NEAR_R cast their full leafy shadow; beyond
-  // that the low-poly model is drawn into the shadow map as a shadow-only instance.
-  const nearRFor = (lvl) => (lvl === 'low' ? 80 : lvl === 'medium' ? 130 : 180);
-  const nearR = nearRFor(q.level);
-  const MID_R2 = 380 * 380;
-  const VFAR_R2 = (q.level === 'low' ? 420 : 520) ** 2;   // beyond: ~46-triangle crowns
-  const SHADOW_NEAR_R2 = 60 * 60;
-  const farR = Math.max(1200, q.drawDistance || 2400);
+  const SHADOW_NEAR_R = 60;
+  const MID_CAST_R = 380;
   const layers = [];
   const counts = {};
+  let nImp = 0;
+  const tileK = new Int32Array(total);
+  for (let k = 0; k < total; k++) tileK[k] = tileOf(T.x[k], T.z[k]);
   for (let s = 0; s < SPECIES.length; s++) {
     const key = SPECIES[s];
     const idx = [];
@@ -345,56 +433,104 @@ export async function createVegetation(ctx) {
     counts[key] = idx.length;
     if (!idx.length) continue;
     const n = idx.length;
+    idx.sort((u, v) => tileK[u] - tileK[v] || u - v);
+    const tg = performance.now();
     const geo = buildSpeciesGeometry(key, 101 + s * 17);
+    phases.geo = (phases.geo || 0) + Math.round(performance.now() - tg);
     const bs = geo.near.boundingSphere;
+    const shrub = key === 'shrub';
     const L = {
-      key, n,
+      key, n, shrub, imp: geo.imp, lodScale: shrub ? SHRUB_LOD : 1,
       xs: new Float32Array(n), ys: new Float32Array(n), zs: new Float32Array(n),
       cy: new Float32Array(n), rad: new Float32Array(n),      // bounding sphere (centre height, radius) for culling
-      mats: new Float32Array(n * 16), leaf: new Float32Array(n * 3), params: new Float32Array(n * 4),
+      sw: new Float32Array(n), sh: new Float32Array(n),       // crown width / height scale (impostor)
+      mats: new Float32Array(n * 16), leaf: new Float32Array(n * 3), leaf2: new Float32Array(n * 4), params: new Float32Array(n * 4),
       r1: new Float32Array(n), r2: new Float32Array(n), evg: new Uint8Array(n),
-      farR2: (key === 'shrub' ? 420 : key === 'ornamental' ? 900 : farR) ** 2,
+      ts: new Int32Array(NT + 1),                             // tile t holds instances ts[t] … ts[t+1]-1
+      impOff: -1,
     };
     for (let i = 0; i < n; i++) {
       const k = idx[i];
       const x = T.x[k], z = T.z[k];
       // sink the trunk on slopes: lowest ground under the trunk
-      const g0 = ctx.heightAt(x, z);
-      const gMin = Math.min(g0, ctx.heightAt(x + 0.6, z), ctx.heightAt(x - 0.6, z), ctx.heightAt(x, z + 0.6), ctx.heightAt(x, z - 0.6));
+      const g0 = hf.heightAt(x, z);
+      const gMin = Math.min(g0, hf.heightAt(x + 0.6, z), hf.heightAt(x - 0.6, z), hf.heightAt(x, z + 0.6), hf.heightAt(x, z - 0.6));
       const y = gMin - 0.05;
-      const s1 = T.s[k], sw = s1 * (0.92 + T.r2[k] * 0.16);
-      composeMatrix(L.mats, i * 16, x, y, z, T.rot[k], sw, T.sy[k], s1 * (0.92 + T.r1[k] * 0.16));
+      const s1 = T.s[k], sw = s1 * (0.92 + T.r2[k] * 0.16) * T.w[k], sd = s1 * (0.92 + T.r1[k] * 0.16) * T.w[k];
+      composeMatrix(L.mats, i * 16, x, y, z, T.rot[k], sw, T.sy[k], sd);
       L.xs[i] = x; L.ys[i] = y; L.zs[i] = z;
       L.cy[i] = y + bs.center.y * T.sy[k];
-      L.rad[i] = bs.radius * Math.max(sw, T.sy[k], s1 * 1.08);
+      L.rad[i] = bs.radius * Math.max(sw, T.sy[k], sd * 1.08);
+      L.sw[i] = (sw + sd) / 2; L.sh[i] = T.sy[k];
       L.r1[i] = T.r1[k]; L.r2[i] = T.r2[k]; L.evg[i] = T.evg[k];
       const decid = EVERGREEN[key] || T.evg[k] ? 0 : 1;
-      const barkTone = key === 'oak' ? 0.15 + T.r1[k] * 0.3 : key === 'pine' || key === 'spruce' ? 0.1 + T.r2[k] * 0.2 : 0.35 + T.r1[k] * 0.5;
-      L.params.set([T.r1[k], decid, barkTone, key === 'shrub' ? 0.5 : 1], i * 4);
-      if (key !== 'shrub') ctx.colliders?.addCircle(x, z, TRUNK_R[key] * s1, y - 1, y + 5, 'tree');
+      const barkTone = key === 'oak' ? 0.15 + T.r1[k] * 0.3 : key === 'pine' || key === 'spruce' ? 0.1 + T.r2[k] * 0.2 : 0.35 + T.r1[k] * 0.52;
+      L.params[i * 4] = T.r1[k]; L.params[i * 4 + 1] = decid; L.params[i * 4 + 2] = barkTone; L.params[i * 4 + 3] = shrub ? 0.5 : 1;
+      if (!shrub) ctx.colliders?.addCircle(x, z, TRUNK_R[key] * s1, y - 1, y + 5, 'tree');
+      const t = tileK[k];
+      L.ts[t + 1]++;
+      tN[t]++;
+      if (y < tY0[t]) tY0[t] = y;
+      if (L.cy[i] + L.rad[i] > tY1[t]) tY1[t] = L.cy[i] + L.rad[i];
     }
-    const mk = (g, mat, cap, shadow) => {
+    for (let t = 0; t < NT; t++) L.ts[t + 1] += L.ts[t];
+    if (!shrub) { L.impOff = nImp; nImp += n; }
+    const mNear = shrub ? matNearShrub : matNearTree, mFar = shrub ? matFarShrub : matFarTree;
+    // tier capacities: only trees within ~210 m (near) / ~450 m (mid) of the camera are ever packed, so the buffers
+    // need not hold the whole map (the densest woods put < 3k / 9k of one species in those rings)
+    const mk = (g, mat, shadow, cap) => {
       const m = new THREE.InstancedMesh(g, mat, cap);
       m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
       g.setAttribute('iLeaf', new THREE.InstancedBufferAttribute(new Float32Array(cap * 3), 3).setUsage(THREE.DynamicDrawUsage));
+      g.setAttribute('iLeaf2', new THREE.InstancedBufferAttribute(new Float32Array(cap * 4), 4).setUsage(THREE.DynamicDrawUsage));
       g.setAttribute('iParams', new THREE.InstancedBufferAttribute(new Float32Array(cap * 4), 4).setUsage(THREE.DynamicDrawUsage));
+      m.userData.cap = cap;
       m.count = 0;
       m.visible = false;
       m.frustumCulled = false;
       m.castShadow = shadow;
       m.receiveShadow = true;
       m.customDepthMaterial = depthMat;
+      m.renderOrder = 3;              // after terrain / buildings: early-z rejects the leaves they hide
       m.name = `trees:${key}`;
       group.add(m);
       return m;
     };
-    L.nearC = mk(geo.near, matNear, n, !!q.shadows);            // near, casting (≤ 60 m)
-    L.nearN = mk(geo.near.clone(), matNear, n, false);          // near, no shadow
-    L.mid = mk(geo.far, matFar, n, !!q.shadows && key !== 'shrub');
-    L.far = mk(geo.far.clone(), matFar, n, false);
-    L.vfar = mk(geo.vfar, matFar, n, false);
-    L.tiers = [L.nearC, L.nearN, L.mid, L.far, L.vfar];
+    const capN = Math.min(n, 3000), capM = Math.min(n, 9000);
+    L.nearC = mk(geo.near, mNear, !!q.shadows, capN);             // near, casting (≤ 60 m)
+    L.nearN = mk(geo.near.clone(), mNear, false, capN);           // near, no shadow
+    L.mid = mk(geo.far, mFar, !!q.shadows && !shrub, capM);       // mid, casting (≤ 380 m)
+    L.far = mk(geo.far.clone(), mFar, false, capM);               // mid, no shadow
+    L.tiers = [L.nearC, L.nearN, L.mid, L.far];
+    L.caps = L.tiers.map((m) => m.userData.cap);
     layers.push(L);
+  }
+
+  mark('layers');
+  // ---------------------------------------------------------------- impostors: every tree, one draw call
+  let imp = null;
+  if (nImp) {
+    const ig = createImpostorGeometry(nImp);
+    const P = ig.attributes.iPos.array, D = ig.attributes.iDim.array;
+    for (const L of layers) {
+      if (L.impOff < 0) continue;
+      const d = L.imp;
+      for (let i = 0; i < L.n; i++) {
+        const o = L.impOff + i;
+        // w: the tree's seed (= iParams.x of the 3D tiers: same per-tree LOD jitter) + 2 if deciduous
+        P[o * 4] = L.xs[i]; P[o * 4 + 1] = L.ys[i]; P[o * 4 + 2] = L.zs[i]; P[o * 4 + 3] = L.r1[i] * 0.999 + (L.params[i * 4 + 1] > 0.5 ? 2 : 0);
+        const rx = d.rx * L.sw[i];
+        D[o * 4] = d.cy * L.sh[i]; D[o * 4 + 1] = rx; D[o * 4 + 2] = d.ry * L.sh[i];
+        D[o * 4 + 3] = d.shape + Math.min(0.45, (d.trunkR * L.sw[i]) / Math.max(0.1, rx));
+      }
+    }
+    imp = new THREE.Mesh(ig, createImpostorMaterial(shared));
+    imp.frustumCulled = false;
+    imp.castShadow = false;
+    imp.receiveShadow = true;
+    imp.renderOrder = 4;              // last opaque draw: crowns hidden behind hills and buildings are rejected early
+    imp.name = 'trees:impostors';
+    group.add(imp);
   }
 
   // ---------------------------------------------------------------- hedges (clipped, boxy, following the polyline)
@@ -428,19 +564,54 @@ export async function createVegetation(ctx) {
     hg.setAttribute('aTree', new THREE.BufferAttribute(at, 3));
     hg.setAttribute('aLeafUv', new THREE.BufferAttribute(new Float32Array(hp.count * 2), 2));
     const n = hedgeSegs.length;
-    hedge = new THREE.InstancedMesh(hg, matNear, n);
-    const leaf = new Float32Array(n * 3), prm = new Float32Array(n * 4);
+    // same program as the near trees; lodScale 0 → never fades out (hedges have no low-poly tier)
+    hedge = new THREE.InstancedMesh(hg, createTreeMaterial(shared, { near: true, lodScale: 0 }), n);
+    const leaf = new Float32Array(n * 3), leaf2 = new Float32Array(n * 4), prm = new Float32Array(n * 4);
     hedgeSegs.forEach((s, i) => {
       composeMatrix(hedge.instanceMatrix.array, i * 16, s.x, s.y, s.z, s.yaw, 1.15, s.h, s.len);
       prm.set([rng(), 0, 0.3, 0.15], i * 4);
     });
     hg.setAttribute('iLeaf', new THREE.InstancedBufferAttribute(leaf, 3));
+    hg.setAttribute('iLeaf2', new THREE.InstancedBufferAttribute(leaf2, 4));
     hg.setAttribute('iParams', new THREE.InstancedBufferAttribute(prm, 4));
     hedge.castShadow = !!q.shadows; hedge.receiveShadow = true;
     hedge.customDepthMaterial = depthMat;
     hedge.name = 'hedges';
     hedge.computeBoundingSphere();
     group.add(hedge);
+  }
+
+  // ---------------------------------------------------------------- sidewalk tree pits (mulch square + steel frame)
+  let pitMesh = null;
+  const nPits = pits.length / 3;
+  if (nPits) {
+    const parts = [];
+    const vc = (g, hex) => {
+      g = g.index ? g.toNonIndexed() : g;
+      g.deleteAttribute('uv');
+      const c = new THREE.Color(hex), a = new Float32Array(g.attributes.position.count * 3);
+      for (let i = 0; i < a.length; i += 3) { a[i] = c.r; a[i + 1] = c.g; a[i + 2] = c.b; }
+      g.setAttribute('color', new THREE.BufferAttribute(a, 3));
+      return g;
+    };
+    const bx = (w, h, d, x, y, z, hex) => { const g = new THREE.BoxGeometry(w, h, d); g.translate(x, y, z); return vc(g, hex); };
+    parts.push(bx(1.2, 0.12, 1.2, 0, -0.03, 0, '#3a2d22'));                          // mulch
+    for (const s of [-1, 1]) {
+      parts.push(bx(1.34, 0.14, 0.07, 0, -0.02, s * 0.635, '#8d918f'));              // kerb frame
+      parts.push(bx(0.07, 0.14, 1.2, s * 0.635, -0.02, 0, '#8d918f'));
+    }
+    const pg = mergeGeometries(parts, false);
+    const pm = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.95 });
+    pm.name = 'treePits';
+    pitMesh = new THREE.InstancedMesh(pg, pm, nPits);
+    for (let i = 0; i < nPits; i++) {
+      const x = pits[i * 3], z = pits[i * 3 + 1];
+      composeMatrix(pitMesh.instanceMatrix.array, i * 16, x, ctx.heightAt(x, z) + 0.02, z, pits[i * 3 + 2], 1, 1, 1);
+    }
+    pitMesh.receiveShadow = true;
+    pitMesh.name = 'trees:pits';
+    pitMesh.computeBoundingSphere();
+    group.add(pitMesh);
   }
 
   mark('meshes');
@@ -451,13 +622,17 @@ export async function createVegetation(ctx) {
   let dirty = true;
   function applySeason(s) {
     season = ['spring', 'summer', 'autumn', 'winter'].includes(s) ? s : 'autumn';
+    const IL = imp?.geometry.attributes.iLeaf, IL2 = imp?.geometry.attributes.iLeaf2;
     for (const L of layers) {
-      for (let i = 0; i < L.n; i++) seasonColor(L.key, season, L.r1[i], L.r2[i], L.leaf, i * 3, !!L.evg[i]);
+      for (let i = 0; i < L.n; i++) seasonColor(L.key, season, L.r1[i], L.r2[i], L.leaf, i * 3, !!L.evg[i], L.leaf2, i * 4);
+      if (IL && L.impOff >= 0) { IL.array.set(L.leaf, L.impOff * 3); IL2.array.set(L.leaf2, L.impOff * 4); }
     }
+    if (IL) { IL.needsUpdate = true; IL2.needsUpdate = true; }
     if (hedge) {
-      const arr = hedge.geometry.attributes.iLeaf.array;
-      for (let i = 0; i < hedgeSegs.length; i++) seasonColor('shrub', season === 'winter' ? 'winter' : 'summer', 0.3 + (i % 3) * 0.2, 0.5, arr, i * 3, true);
+      const arr = hedge.geometry.attributes.iLeaf.array, arr2 = hedge.geometry.attributes.iLeaf2.array;
+      for (let i = 0; i < hedgeSegs.length; i++) seasonColor('shrub', season === 'winter' ? 'winter' : 'summer', 0.3 + (i % 3) * 0.2, 0.5, arr, i * 3, true, arr2, i * 4);
       hedge.geometry.attributes.iLeaf.needsUpdate = true;
+      hedge.geometry.attributes.iLeaf2.needsUpdate = true;
     }
     shared.uBare.value = season === 'winter' ? 1 : 0;
     dirty = true;
@@ -466,24 +641,25 @@ export async function createVegetation(ctx) {
   const offSeason = ctx.events.on('env:season', (s) => applySeason(s));
 
   // ---------------------------------------------------------------- LOD partition + culling
-  let nearR2 = nearR * nearR;
+  let lod = LOD[lvl];
   let shadowsOn = !!q.shadows;
   // runtime quality switch (engine emits 'quality' after applying a preset)
   const offQuality = ctx.events.on('quality', (qp) => {
     if (!qp) return;
-    const r = nearRFor(qp.level);
-    nearR2 = r * r;
+    if (LOD[qp.level]) { lod = LOD[qp.level]; setBands(qp.level); }
     shadowsOn = !!qp.shadows;
-    for (const L of layers) { L.nearC.castShadow = shadowsOn; L.mid.castShadow = shadowsOn && L.key !== 'shrub'; }
+    for (const L of layers) { L.nearC.castShadow = shadowsOn; L.mid.castShadow = shadowsOn && !L.shrub; }
     if (hedge) hedge.castShadow = shadowsOn;
     dirty = true;
   });
   const cull = createCuller();
   const watch = createCameraWatch(12, 12);
   const MOVE = 13;          // the partition stays valid while the camera moves < 12 m / turns < 12° (+18° pad)
-  // Copy each instance that is in view (or throws a shadow into it) into the mesh of its LOD ring.
-  // Shadow-only instances (outside the view, or near trees whose shadow comes from the low-poly model) carry
-  // iParams.w < 0 and are collapsed in the colour pass.
+  const TILE_R = TILE * 0.7072;
+  let lastVisited = 0, overflow = 0;
+  // Copy each instance that is in view (or throws a shadow into it) into the mesh of its LOD tier. Instances in a
+  // cross-fade band go into both tiers (the shaders dither between them). Shadow-only instances (outside the view,
+  // or near trees whose shadow comes from the low-poly model) carry iParams.w < 0 and are collapsed in the colour pass.
   function partition() {
     const cam = ctx.camera;
     const sun = ctx.env?.sun;
@@ -493,48 +669,83 @@ export async function createVegetation(ctx) {
     // The near-cast/near and mid/far pairs differ only in shadow casting (same geometry and material). Without
     // shadows each pair is drawn as ONE mesh (tiers 1 → 0 and 3 → 2): up to 2 fewer draw calls per species.
     const tNear = shOn ? 1 : 0, tFar = shOn ? 3 : 2;
+    // (+ the ±15 m per-tree LOD jitter of the shaders)
+    const nearHi = lod.near + MOVE + 15, nearLo = Math.max(0, lod.near - NEAR_BAND - MOVE - 15), reach = lod.imp + MOVE + 15;
     for (const L of layers) {
-      const tiers = L.tiers;
-      const M4 = tiers.map((m) => m.instanceMatrix.array);
-      const LF = tiers.map((m) => m.geometry.attributes.iLeaf.array);
-      const PR = tiers.map((m) => m.geometry.attributes.iParams.array);
-      const cnt = [0, 0, 0, 0, 0];
-      const nR2 = L.key === 'shrub' ? nearR2 * 0.5 : nearR2;
-      const nC2 = Math.min(SHADOW_NEAR_R2, nR2);
-      const castMid = shOn && L.key !== 'shrub';
-      const mats = L.mats, leaf = L.leaf, params = L.params;
-      const put = (t, i, shadowOnly) => {
-        const c = cnt[t]++, m = M4[t], lf = LF[t], pr = PR[t];
-        const o = c * 16, s = i * 16;
-        for (let k = 0; k < 16; k++) m[o + k] = mats[s + k];
-        lf[c * 3] = leaf[i * 3]; lf[c * 3 + 1] = leaf[i * 3 + 1]; lf[c * 3 + 2] = leaf[i * 3 + 2];
-        pr[c * 4] = params[i * 4]; pr[c * 4 + 1] = params[i * 4 + 1]; pr[c * 4 + 2] = params[i * 4 + 2];
-        pr[c * 4 + 3] = shadowOnly ? -Math.abs(params[i * 4 + 3]) - 1e-3 : params[i * 4 + 3];
-      };
-      for (let i = 0; i < L.n; i++) {
-        const x = L.xs[i], z = L.zs[i];
-        const dx = x - cx, dy = L.ys[i] - cy, dz = z - cz;
-        const d2 = dx * dx + dy * dy + dz * dz;
-        if (d2 >= L.farR2) continue;
-        const y = L.cy[i], r = L.rad[i] + MOVE;
-        const vis = cull.inView(x, y, z, r);
-        if (d2 < nC2) {
-          if (vis) put(0, i, false);
-          else if (shOn && cull.inShadow(x, y, z, r)) put(0, i, true);
-        } else if (d2 < nR2) {
-          if (vis) put(tNear, i, false);
-          if (castMid && cull.inShadow(x, y, z, r)) put(2, i, true);
-        } else if (d2 < MID_R2) {
-          if (vis) put(2, i, false);
-          else if (castMid && cull.inShadow(x, y, z, r)) put(2, i, true);
-        } else if (vis) put(d2 < VFAR_R2 ? tFar : 4, i, false);
+      L.cnt = L.cnt || new Int32Array(4);
+      L.cnt.fill(0);
+      L.M4 = L.tiers.map((m) => m.instanceMatrix.array);
+      L.LF = L.tiers.map((m) => m.geometry.attributes.iLeaf.array);
+      L.LF2 = L.tiers.map((m) => m.geometry.attributes.iLeaf2.array);
+      L.PR = L.tiers.map((m) => m.geometry.attributes.iParams.array);
+    }
+    const put = (L, t, i, shadowOnly) => {
+      if (L.cnt[t] >= L.caps[t]) { overflow++; return; }
+      const c = L.cnt[t]++, m = L.M4[t], lf = L.LF[t], lf2 = L.LF2[t], pr = L.PR[t];
+      const mats = L.mats, leaf = L.leaf, leaf2 = L.leaf2, params = L.params;
+      const o = c * 16, s = i * 16;
+      for (let k = 0; k < 16; k++) m[o + k] = mats[s + k];
+      lf[c * 3] = leaf[i * 3]; lf[c * 3 + 1] = leaf[i * 3 + 1]; lf[c * 3 + 2] = leaf[i * 3 + 2];
+      lf2[c * 4] = leaf2[i * 4]; lf2[c * 4 + 1] = leaf2[i * 4 + 1]; lf2[c * 4 + 2] = leaf2[i * 4 + 2]; lf2[c * 4 + 3] = leaf2[i * 4 + 3];
+      pr[c * 4] = params[i * 4]; pr[c * 4 + 1] = params[i * 4 + 1]; pr[c * 4 + 2] = params[i * 4 + 2];
+      pr[c * 4 + 3] = shadowOnly ? -Math.abs(params[i * 4 + 3]) - 1e-3 : params[i * 4 + 3];
+    };
+    const tx0 = Math.max(0, Math.floor((cx - reach - 24) / TILE) - TX0), tx1 = Math.min(NTX - 1, Math.floor((cx + reach + 24) / TILE) - TX0);
+    const tz0 = Math.max(0, Math.floor((cz - reach - 24) / TILE) - TZ0), tz1 = Math.min(NTZ - 1, Math.floor((cz + reach + 24) / TILE) - TZ0);
+    let visited = 0;
+    for (let tz = tz0; tz <= tz1; tz++) {
+      for (let tx = tx0; tx <= tx1; tx++) {
+        const t = tz * NTX + tx;
+        if (!tN[t]) continue;
+        const wx0 = (tx + TX0) * TILE, wz0 = (tz + TZ0) * TILE;
+        const ddx = Math.max(0, wx0 - cx, cx - wx0 - TILE), ddz = Math.max(0, wz0 - cz, cz - wz0 - TILE);
+        if (ddx * ddx + ddz * ddz > (reach + 16) * (reach + 16)) continue;
+        const tcx = wx0 + TILE / 2, tcz = wz0 + TILE / 2, tcy = (tY0[t] + tY1[t]) / 2;
+        const tr = Math.hypot(TILE_R, (tY1[t] - tY0[t]) / 2) + 16 + MOVE;
+        if (!cull.inView(tcx, tcy, tcz, tr) && !(shOn && cull.inShadow(tcx, tcy, tcz, tr))) continue;
+        for (const L of layers) {
+          const i0 = L.ts[t], i1 = L.ts[t + 1];
+          if (i0 === i1) continue;
+          const s2 = L.lodScale * L.lodScale;
+          const nH2 = nearHi * nearHi, nL2 = nearLo * nearLo, R2 = reach * reach;
+          const nC2 = SHADOW_NEAR_R * SHADOW_NEAR_R, castR2 = MID_CAST_R * MID_CAST_R;
+          const castMid = shOn && !L.shrub;
+          for (let i = i0; i < i1; i++) {
+            visited++;
+            const x = L.xs[i], z = L.zs[i];
+            const dx = x - cx, dy = L.ys[i] - cy, dz = z - cz;
+            const e2 = (dx * dx + dy * dy + dz * dz) * s2;
+            if (e2 >= R2) continue;
+            const y = L.cy[i], r = L.rad[i] + MOVE;
+            const vis = cull.inView(x, y, z, r);
+            const inMid = e2 > nL2;
+            if (e2 < nH2) {
+              if (e2 < nC2) {
+                if (vis) put(L, 0, i, false);
+                else if (shOn && cull.inShadow(x, y, z, r)) put(L, 0, i, true);
+              } else {
+                if (vis) put(L, tNear, i, false);
+                if (!inMid && castMid && cull.inShadow(x, y, z, r)) put(L, 2, i, true);
+              }
+            }
+            if (inMid) {
+              const cast = castMid && e2 < castR2;
+              if (vis) put(L, cast ? 2 : tFar, i, false);
+              else if (cast && cull.inShadow(x, y, z, r)) put(L, 2, i, true);
+            }
+          }
+        }
       }
-      tiers.forEach((m, t) => {
-        m.count = cnt[t];
-        m.visible = cnt[t] > 0;
-        for (const [attr, sz] of [[m.instanceMatrix, 16], [m.geometry.attributes.iLeaf, 3], [m.geometry.attributes.iParams, 4]]) {
+    }
+    lastVisited = visited;
+    for (const L of layers) {
+      L.tiers.forEach((m, t) => {
+        const c = L.cnt[t];
+        m.count = c;
+        m.visible = c > 0;
+        for (const [attr, sz] of [[m.instanceMatrix, 16], [m.geometry.attributes.iLeaf, 3], [m.geometry.attributes.iLeaf2, 4], [m.geometry.attributes.iParams, 4]]) {
           attr.clearUpdateRanges();
-          if (cnt[t] > 0) { attr.addUpdateRange(0, cnt[t] * sz); attr.needsUpdate = true; }
+          if (c > 0) { attr.addUpdateRange(0, c * sz); attr.needsUpdate = true; }
         }
       });
     }
@@ -572,14 +783,14 @@ export async function createVegetation(ctx) {
   }, 10);
 
   mark('rest');
-  const stats = { phases, osm: osmCount, street: streetCount, fill: fillCount, lawnEdge: treeCount - osmCount - streetCount - fillCount, trees: treeCount, shrubs: shrubCount, hedgeSegments: hedgeSegs.length, bySpecies: counts, ms: Math.round(performance.now() - t0) };
+  const stats = { phases, osm: osmCount, street: streetCount, pits: nPits, fill: fillCount, lawnEdge: treeCount - osmCount - streetCount - fillCount, trees: treeCount, shrubs: shrubCount, hedgeSegments: hedgeSegs.length, impostors: nImp, bySpecies: counts, ms: Math.round(performance.now() - t0) };
   console.info('[vegetation]', JSON.stringify(stats));
   ctx.vegetation = {
-    group, stats, layers, shared,
+    group, stats, layers, shared, impostors: imp,
     setSeason: applySeason,
     getSeason: () => season,
     partitionMs: () => partitionMs,
-    lodCounts: () => layers.map((L) => `${L.key}:${L.nearC.count}+${L.nearN.count}/${L.mid.count}/${L.far.count}+${L.vfar.count}`).join(' '),
+    lodCounts: () => layers.map((L) => `${L.key}:${L.nearC.count}+${L.nearN.count}/${L.mid.count}+${L.far.count}`).join(' ') + ` visited:${lastVisited} overflow:${overflow}`,
     setWind(w) { shared.uWind.value = w; },
     refresh() { dirty = true; },
     dispose() { offSeason(); offQuality(); },

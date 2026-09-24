@@ -8,7 +8,7 @@ import { createBridges, GeoBuf, sweepSeg, boxAt } from './bridges.js';
 import { createRail } from './rail.js';
 import { createWater, waterLevelAt } from './water.js';
 import { markRange } from './terrain.js';
-import { resamplePolyline, mulberry, tileNoise, prepareGround, computeMarkings, slicePolyline, polyLength } from './ground-painter.js';
+import { resamplePolyline, mulberry, tileNoise, prepareGround, computeMarkings, parkingLots, lotStalls, slicePolyline, polyLength } from './ground-painter.js';
 
 // ---------------------------------------------------------------------------------------------------------------
 // procedural textures
@@ -386,7 +386,8 @@ function createCliffs(ctx) {
 // first time the camera comes within its reach (+ a 100 m margin) — nearest first, within a small per-frame time
 // budget — and only tiles within the marking range are drawn. (Building all of them up front cost 1.5–2 s of
 // init at low-end CPU speeds for a 2 × 1.8 km map, most of which a session never sees.) The ground shader fades
-// the far level's painted markings in over the last 100 m of that range (terrain.js MARK_RANGE).
+// the far level's painted markings in over the last 100 m of that range (terrain.js MARK_RANGE). Car park stall
+// lines are found per lot when its first tile is built (ground-painter lotStalls).
 const TILE = 200;
 
 function createLazyTiles(ctx, name, { build, placeholder, range }) {
@@ -494,7 +495,12 @@ function createMarkingDecals(ctx) {
     placeholder: meshOf([0, -1e4, 0, 0, -1e4, 0, 0, -1e4, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0], [0, 1, 2]),
     build(t) {
       const out = { pos: [], col: [], idx: [] };
-      for (const m of t.items) {
+      const items = [];
+      for (const it of t.items) {
+        if (it.lot) items.push(...lotStalls(P, it.lot)); // (a car park's stall lines, found on first use)
+        else items.push(it);
+      }
+      for (const m of items) {
         const c = cols[m.color] || cols.white;
         if (!m.dash) { strip(t, out, m.pts, m.w, c, m.alpha); continue; }
         const L = polyLength(m.pts), [on, off] = m.dash;
@@ -556,6 +562,10 @@ function createMarkingDecals(ctx) {
   for (const m of marks) {
     const b = m._bb;
     if (b) set.add(b[0], b[1], b[2], b[3], m);
+  }
+  for (const lot of parkingLots(P)) {
+    const b = lot._bb;
+    set.add(b[0], b[1], b[2], b[3], { lot });
   }
   return { tiles: set.stats.tiles, marks: marks.length, lazy: true, get quads() { return quads; }, get built() { return set.stats.built; }, get buildMs() { return Math.round(set.stats.buildMs); } };
 }

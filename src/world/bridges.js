@@ -98,6 +98,38 @@ function sweepSeg(buf, S, yOf, a, b, out, vOffset = 0) {
   }
 }
 
+export // Indices of samples to keep so the 3D polyline (x, y[i], z) stays within tol metres of the dense one, and no two
+// kept samples are more than maxGap apart (Douglas–Peucker).
+function simplify3(S, y, tol, maxGap) {
+  const n = S.length;
+  if (n < 3) return S.map((_, i) => i);
+  const keep = new Uint8Array(n);
+  keep[0] = keep[n - 1] = 1;
+  const stack = [[0, n - 1]];
+  while (stack.length) {
+    const [a, b] = stack.pop();
+    if (b - a < 2) continue;
+    const ax = S[a].x, ay = y[a], az = S[a].z, dx = S[b].x - ax, dy = y[b] - ay, dz = S[b].z - az;
+    const L2 = dx * dx + dy * dy + dz * dz || 1e-9;
+    let worst = -1, wd = 0;
+    for (let i = a + 1; i < b; i++) {
+      const px = S[i].x - ax, py = y[i] - ay, pz = S[i].z - az;
+      const t = (px * dx + py * dy + pz * dz) / L2;
+      const ex = px - dx * t, ey = py - dy * t, ez = pz - dz * t;
+      const d = ex * ex + ey * ey + ez * ez;
+      if (d > wd) { wd = d; worst = i; }
+    }
+    if (wd > tol * tol || S[b].s - S[a].s > maxGap) {
+      const m = wd > tol * tol ? worst : (a + b) >> 1;
+      keep[m] = 1;
+      stack.push([a, m], [m, b]);
+    }
+  }
+  const out = [];
+  for (let i = 0; i < n; i++) if (keep[i]) out.push(i);
+  return out;
+}
+
 // Axis-aligned-in-local-frame box: centre (x, y, z), size along tangent (len), lateral (wid), height (h), frame (tx,tz)
 function boxAt(buf, x, y, z, len, wid, h, tx, tz, taper = 0) {
   const nx = -tz, nz = tx;
@@ -301,6 +333,11 @@ export function createBridges(ctx) {
     const yS = S.map((p) => yDeck(p.s));
     const gS = S.map((p) => ground(p.x, p.z));
     const yOf = (i) => yS[i];
+    // the swept surfaces (deck, parapets, railings, girders) and the parapet colliders only need samples where
+    // the deck bends or its camber changes (a few centimetres' tolerance)
+    const keep = simplify3(S, yS, 0.03, 12);
+    const SK = keep.map((i) => S[i]), yK = keep.map((i) => yS[i]);
+    const yOfK = (i) => yK[i];
     const thick = isRoad ? 1.1 : 0.45;
     const historic = isRoad && L > 60;
     const parapetMat = historic ? 'stone' : 'concrete';
@@ -310,17 +347,17 @@ export function createBridges(ctx) {
     // ---- deck surfaces
     const walkBuf = new GeoBuf();
     if (isRoad) {
-      sweepSeg(buf.asphalt, S, yOf, [-width / 2, 0], [width / 2, 0], [0, 1]);
-      sweepSeg(walkBuf, S, yOf, [-width / 2, 0], [width / 2, 0], [0, 1]);
+      sweepSeg(buf.asphalt, SK, yOfK, [-width / 2, 0], [width / 2, 0], [0, 1]);
+      sweepSeg(walkBuf, SK, yOfK, [-width / 2, 0], [width / 2, 0], [0, 1]);
       for (const sgn of [1, -1]) {
         const e = sgn > 0 ? right : -left, c = sgn * width / 2;
-        sweepSeg(buf.walk, S, yOf, [c, 0], [c, curbH], [-sgn, 0]);
-        sweepSeg(buf.walk, S, yOf, [c, curbH], [e, curbH], [0, 1]);
-        sweepSeg(walkBuf, S, yOf, [c, curbH], [e, curbH], [0, 1]);
+        sweepSeg(buf.walk, SK, yOfK, [c, 0], [c, curbH], [-sgn, 0]);
+        sweepSeg(buf.walk, SK, yOfK, [c, curbH], [e, curbH], [0, 1]);
+        sweepSeg(walkBuf, SK, yOfK, [c, curbH], [e, curbH], [0, 1]);
       }
     } else {
-      sweepSeg(buf[walkMat], S, yOf, [-left, 0], [right, 0], [0, 1]);
-      sweepSeg(walkBuf, S, yOf, [-left, 0], [right, 0], [0, 1]);
+      sweepSeg(buf[walkMat], SK, yOfK, [-left, 0], [right, 0], [0, 1]);
+      sweepSeg(walkBuf, SK, yOfK, [-left, 0], [right, 0], [0, 1]);
       if (w.type === 'steps') {
         // tread nosings as thin dark lines every 0.3 m of rise would need real steps; a ramped deck reads fine here
       }
@@ -329,11 +366,11 @@ export function createBridges(ctx) {
     const parH = isRoad ? 1.05 : 0.12, parT = isRoad ? 0.4 : 0.15;
     for (const sgn of [1, -1]) {
       const e = sgn > 0 ? right : -left, o = e + sgn * parT;
-      sweepSeg(buf[parapetMat], S, yOf, [e, curbH], [e, curbH + parH], [-sgn, 0]);
-      sweepSeg(buf[parapetMat], S, yOf, [e, curbH + parH], [o, curbH + parH], [0, 1]);
-      sweepSeg(buf[parapetMat], S, yOf, [o, curbH + parH], [o, -thick], [sgn, 0]);
+      sweepSeg(buf[parapetMat], SK, yOfK, [e, curbH], [e, curbH + parH], [-sgn, 0]);
+      sweepSeg(buf[parapetMat], SK, yOfK, [e, curbH + parH], [o, curbH + parH], [0, 1]);
+      sweepSeg(buf[parapetMat], SK, yOfK, [o, curbH + parH], [o, -thick], [sgn, 0]);
     }
-    sweepSeg(buf.concrete, S, yOf, [right + parT, -thick], [-left - parT, -thick], [0, -1]);
+    sweepSeg(buf.concrete, SK, yOfK, [right + parT, -thick], [-left - parT, -thick], [0, -1]);
     // end caps of the deck slab (visible when the bridge floats over a slope)
     for (const [i, dir] of [[0, -1], [S.length - 1, 1]]) {
       const p = S[i], y = yS[i];
@@ -349,9 +386,9 @@ export function createBridges(ctx) {
         const e = sgn > 0 ? right - 0.06 : -left + 0.06;
         const rail = offsetPolyline(S.map((p) => [p.x, p.z]), e);
         for (const h of [1.1, 0.6]) {
-          sweepSeg(buf.rail, S, (i) => yS[i] + h, [e - 0.03, 0], [e + 0.03, 0], [0, 1]);
-          sweepSeg(buf.rail, S, (i) => yS[i] + h, [e + sgn * 0.03, -0.05], [e + sgn * 0.03, 0], [sgn, 0]);
-          sweepSeg(buf.rail, S, (i) => yS[i] + h, [e - sgn * 0.03, -0.05], [e - sgn * 0.03, 0], [-sgn, 0]);
+          sweepSeg(buf.rail, SK, (i) => yK[i] + h, [e - 0.03, 0], [e + 0.03, 0], [0, 1]);
+          sweepSeg(buf.rail, SK, (i) => yK[i] + h, [e + sgn * 0.03, -0.05], [e + sgn * 0.03, 0], [sgn, 0]);
+          sweepSeg(buf.rail, SK, (i) => yK[i] + h, [e - sgn * 0.03, -0.05], [e - sgn * 0.03, 0], [-sgn, 0]);
         }
         for (let i = 0; i < S.length; i += 1) {
           const p = S[i];
@@ -479,7 +516,7 @@ export function createBridges(ctx) {
         }
       }
       // girders under footbridges
-      if (!isRoad) for (const sgn of [1, -1]) sweepSeg(buf.steel, S, (i) => bottom(i), [sgn * (deckW / 2 - 0.5), 0], [sgn * (deckW / 2 - 0.5), -0.6], [sgn, 0]);
+      if (!isRoad) for (const sgn of [1, -1]) sweepSeg(buf.steel, SK, (i) => yK[i] - thick, [sgn * (deckW / 2 - 0.5), 0], [sgn * (deckW / 2 - 0.5), -0.6], [sgn, 0]);
     }
     // abutments at both ends (wall down to the terrain)
     for (const i of [0, S.length - 1]) {
@@ -490,10 +527,10 @@ export function createBridges(ctx) {
     }
 
     // ---- colliders along the parapets / railings
-    for (let i = 0; i < S.length - 1; i++) {
-      const p = S[i], q = S[i + 1];
+    for (let i = 0; i < SK.length - 1; i++) {
+      const p = SK[i], q = SK[i + 1];
       const tx = q.x - p.x, tz = q.z - p.z, len = Math.hypot(tx, tz) || 1;
-      const yMin = Math.min(yS[i], yS[i + 1]) - 0.3, yMax = Math.max(yS[i], yS[i + 1]) + 1.2;
+      const yMin = Math.min(yK[i], yK[i + 1]) - 0.3, yMax = Math.max(yK[i], yK[i + 1]) + 1.2;
       for (const sgn of [1, -1]) {
         const e = sgn > 0 ? right + parT / 2 : -left - parT / 2;
         const nx = (p.nx + q.nx) / 2, nz = (p.nz + q.nz) / 2;

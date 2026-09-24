@@ -1,13 +1,15 @@
 // Ground painter: paints the terrain's colour texture + a detail-type mask on <canvas>, straight from CAMPUS_DATA.
 //
-// Two levels are painted with exactly the same drawing code (the canvas transform maps world metres → pixels):
-//   far  — the whole data bounds (≈1.7 × 1.45 km)
-//   core — the campus core + Junction Hollow at ~2× the resolution
-// The sharper core level is painted first; the far level skips everything lying inside it and draws it in
-// downscaled instead. Canvas work is executed asynchronously by the GPU process, so the drawing is shaped for
-// Skia: ways are stroked as short pieces (small paths go through its GPU atlas; big ones become software
-// coverage masks), overlay layers are pre-composited tiles, and repetitive shapes (mowing stripes, oil stains)
-// are pattern fills instead of clip + rectangle loops.
+// Every level is painted with exactly the same drawing code (the canvas transform maps world metres → pixels):
+//   far  — the whole data bounds (≈3.3 × 3.1 km), painted once at start-up in 'far' mode: only what reads at
+//          ~0.8 m per pixel, with the ways batched per 200 m tile (see below)
+//   near — a 450 m window around the camera at ~0.22 m per pixel, repainted strip by strip as the camera moves
+//          (terrain.js keeps it in a wrap-around canvas; paintRegion() paints one rectangle of it)
+// Canvas work is executed asynchronously by the GPU process, and there its cost is mostly per drawing call, so
+// the drawing is shaped for Skia: ways are stroked as short pieces (small paths go through its GPU atlas; big
+// ones become software coverage masks) — in far mode those pieces are gathered into one path per style and tile
+// —, overlay layers are pre-composited tiles, and repetitive shapes (mowing stripes, oil stains) are pattern
+// fills instead of clip + rectangle loops.
 // Mask channels (read by the terrain shader to pick the close-up detail):
 //   R = vegetation (grass / lawn / forest floor)   G = asphalt   B = concrete / pavers / brick   black = soil, tartan, water …
 //
@@ -124,14 +126,23 @@ export function tileNoise(size, periods, seed = 1, gains = null) {
       const fx = x / cell, i0 = Math.floor(fx), tx = fx - i0;
       cx0[x] = i0 % p; cx1[x] = (i0 + 1) % p; csx[x] = tx * tx * (3 - 2 * tx);
     }
+    // the two lattice rows around y, interpolated along x once per lattice row (not per pixel)
+    const rowA = new Float32Array(size), rowB = new Float32Array(size);
+    let jCur = -1;
     for (let y = 0; y < size; y++) {
       const fy = y / cell, j0 = Math.floor(fy), ty = fy - j0, sy = ty * ty * (3 - 2 * ty);
-      const r0 = (j0 % p) * p, r1 = ((j0 + 1) % p) * p, row = y * size;
-      for (let x = 0; x < size; x++) {
-        const ii = cx0[x], i1 = cx1[x], sx = csx[x];
-        const a = lat[r0 + ii], b = lat[r0 + i1], c = lat[r1 + ii], d = lat[r1 + i1];
-        out[row + x] += amp * ((a + (b - a) * sx) * (1 - sy) + (c + (d - c) * sx) * sy);
+      if (j0 !== jCur) {
+        jCur = j0;
+        const r0 = (j0 % p) * p, r1 = ((j0 + 1) % p) * p;
+        for (let x = 0; x < size; x++) {
+          const ii = cx0[x], i1 = cx1[x], sx = csx[x];
+          const a = lat[r0 + ii], c = lat[r1 + ii];
+          rowA[x] = a + (lat[r0 + i1] - a) * sx;
+          rowB[x] = c + (lat[r1 + i1] - c) * sx;
+        }
       }
+      const row = y * size, ka = amp * (1 - sy), kb = amp * sy;
+      for (let x = 0; x < size; x++) out[row + x] += rowA[x] * ka + rowB[x] * kb;
     }
   });
   for (let i = 0; i < out.length; i++) out[i] /= total;
@@ -191,11 +202,14 @@ function makeCanvas(w, h) {
   c.width = w; c.height = h;
   return c;
 }
+const scratchCanvas = makeCanvas; // (low-resolution layers: one per use — drawImage() snapshots it anyway)
 
+// (no closePath(): fills close their subpaths anyway, and Chrome's Path2D.closePath() is O(subpaths) — a 10k-ring
+// building path took ~0.8 s to build with it; a line back to the start keeps it linear)
 function ringPath(path, ring) {
   path.moveTo(ring[0][0], ring[0][1]);
   for (let i = 1; i < ring.length; i++) path.lineTo(ring[i][0], ring[i][1]);
-  path.closePath();
+  path.lineTo(ring[0][0], ring[0][1]);
 }
 function linePath(path, pts) {
   path.moveTo(pts[0][0], pts[0][1]);
@@ -213,8 +227,12 @@ function polyPath(poly, holes) {
 // of neighbouring pieces abut exactly (see stroke()); ends = the way's true ends [x, z, outward dx, dz].
 const PIECE_M = 30;
 function piecePaths(pts, maxE = PIECE_M) {
-  const pieces = [];
-  const flush = (run) => { if (run.length > 1) { const p = new Path2D(); linePath(p, run); pieces.push(p); } };
+  const pieces = [], at = [];
+  const flush = (run) => {
+    if (run.length < 2) return;
+    const p = new Path2D(); linePath(p, run); pieces.push(p);
+    at.push((run[0][0] + run[run.length - 1][0]) / 2, (run[0][1] + run[run.length - 1][1]) / 2); // (batching tile)
+  };
   // densify so no segment is longer than maxE
   const P = [pts[0]];
   for (let i = 1; i < pts.length; i++) {
@@ -235,7 +253,40 @@ function piecePaths(pts, maxE = PIECE_M) {
   flush(run);
   const end = (p, q) => { const dx = p[0] - q[0], dz = p[1] - q[1], l = Math.hypot(dx, dz) || 1; return [p[0], p[1], dx / l, dz / l]; };
   const n = pts.length;
-  return { pieces, ends: n > 1 ? [end(pts[0], pts[1]), end(pts[n - 1], pts[n - 2])] : [] };
+  return { pieces, at, ends: n > 1 ? [end(pts[0], pts[1]), end(pts[n - 1], pts[n - 2])] : [] };
+}
+// Far-mode batching: the pieces of many ways drawn with the same style go into one Path2D per BATCH_M tile
+// (≈ 250 px at the far level's scale — small enough for Skia's GPU path atlas), stroked / filled together when the
+// painter's section ends. Tens of thousands of tiny drawing calls become a few hundred.
+const BATCH_M = 200;
+function makeBatcher(strokeNow, fillNow) {
+  const batches = new Map();
+  const ids = new Map();
+  const idOf = (style) => { if (typeof style === 'string') return style; let i = ids.get(style); if (i === undefined) ids.set(style, (i = `#p${ids.size}`)); return i; };
+  const tileOf = (x, z) => Math.floor(x / BATCH_M) * 100003 + Math.floor(z / BATCH_M);
+  const get = (key, make) => { let b = batches.get(key); if (!b) batches.set(key, (b = make())); return b; };
+  const tilePath = (b, x, z) => { const k = tileOf(x, z); let p = b.tiles.get(k); if (!p) b.tiles.set(k, (p = new Path2D())); return p; };
+  return {
+    stroke(path, style, width, opts) {
+      const key = `s|${idOf(style)}|${width.toFixed(2)}|${opts.alpha ?? 1}|${opts.dash || ''}|${opts.cap || 'round'}`;
+      const b = get(key, () => ({ stroke: true, style, width, opts, tiles: new Map() }));
+      for (let i = 0; i < path.pieces.length; i++) tilePath(b, path.at[i * 2], path.at[i * 2 + 1]).addPath(path.pieces[i]);
+    },
+    // rings (world coordinates) filled with one style
+    fillRing(ring, style, x, z) {
+      const b = get(`f|${idOf(style)}`, () => ({ stroke: false, style, tiles: new Map() }));
+      ringPath(tilePath(b, x, z), ring);
+    },
+    // a closed Path2D filled with one style (tile by its anchor point)
+    fill(path, style, x, z) {
+      const b = get(`f|${idOf(style)}`, () => ({ stroke: false, style, tiles: new Map() }));
+      tilePath(b, x, z).addPath(path);
+    },
+    flush() {
+      for (const b of batches.values()) for (const p of b.tiles.values()) { if (b.stroke) strokeNow(p, b.style, b.width, b.opts); else fillNow(p, b.style); }
+      batches.clear();
+    },
+  };
 }
 // [minX, minZ, maxX, maxZ] of a point list, grown by `pad` metres
 function bbox(pts, pad) {
@@ -243,16 +294,6 @@ function bbox(pts, pad) {
   for (const [x, z] of pts) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (z < z0) z0 = z; if (z > z1) z1 = z; }
   return [x0 - pad, z0 - pad, x1 + pad, z1 + pad];
 }
-// Ground footprints of the buildings a level has to paint itself: those on its canvas and not inside one of its
-// inner levels (their AO halo may reach ~6 m, hence the wider margin). Cached on P per level (colour + mask pass).
-function buildingPath(P, vis, key) {
-  if (P._bPathFor?.key === key) return P._bPathFor.path;
-  const path = new Path2D();
-  for (const b of P.bRings) if (vis(b, 8)) ringPath(path, b.ring);
-  P._bPathFor = { key, path };
-  return path;
-}
-
 // Tileable colour-with-alpha blotch canvas from a noise field.
 function blotchCanvas(size, noise, rgb, lo, hi, maxA) {
   const c = makeCanvas(size, size), g = c.getContext('2d');
@@ -300,22 +341,37 @@ function blotchPair(size, na, rgbA, loA, hiA, aA, nb, rgbB, loB, hiB, aB) {
   return c;
 }
 // Tileable speckle canvas: random small blobs in the given colours (wraps around the edges).
+// (rasterised here into ImageData — thousands of tiny canvas ellipse fills cost ~30 ms of drawing calls)
 function speckleCanvas(size, count, colours, rMin, rMax, seed, { alpha = 1, elong = 1 } = {}) {
-  const c = makeCanvas(size, size), g = c.getContext('2d');
   const r = mulberry(seed);
+  const cols = colours.map(hexRgb);
+  const buf = new Float32Array(size * size * 4); // premultiplied RGBA
   for (let i = 0; i < count; i++) {
     const x = r() * size, y = r() * size, rad = rMin + r() * (rMax - rMin), rot = r() * Math.PI;
-    g.fillStyle = colours[(r() * colours.length) | 0];
-    g.globalAlpha = alpha * (0.5 + r() * 0.5);
-    for (const ox of [-size, 0, size]) for (const oy of [-size, 0, size]) {
-      const px = x + ox, py = y + oy;
-      if (px < -rMax * elong || px > size + rMax * elong || py < -rMax * elong || py > size + rMax * elong) continue;
-      g.beginPath();
-      g.ellipse(px, py, rad * elong, rad, rot, 0, Math.PI * 2);
-      g.fill();
+    const col = cols[(r() * cols.length) | 0];
+    const a = alpha * (0.5 + r() * 0.5);
+    const ca = Math.cos(rot), sa = Math.sin(rot), ra = rad * elong, rb = rad, ext = Math.ceil(ra) + 1;
+    for (let py = Math.floor(y - ext); py <= Math.ceil(y + ext); py++) {
+      const row = (((py % size) + size) % size) * size;
+      for (let px = Math.floor(x - ext); px <= Math.ceil(x + ext); px++) {
+        const dx = px + 0.5 - x, dy = py + 0.5 - y;
+        const u = (dx * ca + dy * sa) / ra, v = (-dx * sa + dy * ca) / rb;
+        const cov = Math.min(1, (1 - Math.sqrt(u * u + v * v)) * rb + 0.5); // ≈ 1 px anti-aliased edge
+        if (cov <= 0) continue;
+        const k = (row + (((px % size) + size) % size)) * 4, sA = a * cov, inv = 1 - sA;
+        buf[k] = col[0] * sA + buf[k] * inv; buf[k + 1] = col[1] * sA + buf[k + 1] * inv;
+        buf[k + 2] = col[2] * sA + buf[k + 2] * inv; buf[k + 3] = sA + buf[k + 3] * inv;
+      }
     }
   }
-  g.globalAlpha = 1;
+  const c = makeCanvas(size, size), g = c.getContext('2d');
+  const img = g.createImageData(size, size), d = img.data;
+  for (let k = 0; k < size * size * 4; k += 4) {
+    const al = buf[k + 3];
+    if (al <= 0) continue;
+    d[k] = buf[k] / al; d[k + 1] = buf[k + 1] / al; d[k + 2] = buf[k + 2] / al; d[k + 3] = al * 255;
+  }
+  g.putImageData(img, 0, 0);
   return c;
 }
 
@@ -465,19 +521,149 @@ function prepare(ctx) {
   for (const b of data.buildings) {
     if (!b.footprint || b.footprint.length < 3) continue;
     if (b.minHeight > 3 || b.hidden) continue; // raised parts (bridges, overhangs) don't touch the ground
-    bRings.push({ ring: b.footprint, _bb: bbox(b.footprint, 0) });
+    const bb = bbox(b.footprint, 0);
+    bRings.push({ ring: b.footprint, _bb: bb, cx: (bb[0] + bb[2]) / 2, cz: (bb[1] + bb[3]) / 2 });
   }
 
-  // ---- OSM trees → soft shade discs
-  const treePath = new Path2D();
-  for (const [x, z] of data.trees || []) { treePath.moveTo(x + 3.2, z); treePath.arc(x, z, 3.2, 0, Math.PI * 2); }
+  // ---- OSM trees → soft shade discs (each painted rectangle builds the path of its own)
+  const trees = data.trees || [];
 
   // ---- extent of the painted ground (= the terrain grid); markings are clipped to it
   const hf = ctx.heightfield;
   const bounds = hf ? { minX: hf.minX, minZ: hf.minZ, maxX: hf.maxX ?? hf.minX + (hf.width - 1) * hf.cellSize, maxZ: hf.maxZ ?? hf.minZ + (hf.height - 1) * hf.cellSize }
     : { ...data.meta.bounds };
 
-  return { areas, roads, paths, rails, bRings, treePath, onCampus, carriagewayDist, nodeMap, vkey, bounds };
+
+  // ---- frontage paving: where buildings stand at the back of the sidewalk (Walnut St, Penn Ave, Forbes, Craig…)
+  // the whole strip between the kerb and the building face is paved — OSM maps only the sidewalk's centreline,
+  // and the rest would read as a lawn in front of the shops. Per road side, rays go out from the kerb every 2 m;
+  // a building face within reach (more in shopping streets: commercial buildings / POIs around) paves up to it.
+  // Computed lazily per road (cached; the near level asks for the roads in its window).
+  const EC = 12;
+  let edgeGrid = null, comGrid = null;
+  const RESID = new Set(['house', 'detached', 'semidetached_house', 'terrace', 'bungalow', 'residential', 'garage', 'garages', 'shed']);
+  const COMM = new Set(['commercial', 'retail', 'office', 'hotel', 'church', 'cathedral', 'bank', 'civic', 'public', 'library', 'supermarket']);
+  const COM_POI = new Set(['restaurant', 'cafe', 'fast_food', 'bar', 'bank', 'atm', 'library', 'hotel', 'pharmacy', 'shop', 'post_office', 'cinema', 'ice_cream', 'pub']);
+  const buildEdgeGrid = () => {
+    edgeGrid = new Map();
+    for (const b of data.buildings) {
+      const ring = b.footprint;
+      if (!ring || ring.length < 3 || b.minHeight > 3 || b.hidden) continue;
+      const kind = RESID.has(b.type) ? 1 : COMM.has(b.type) ? 2 : 0;
+      for (let i = 0; i < ring.length; i++) {
+        const a = ring[i], c = ring[(i + 1) % ring.length];
+        const e = [a[0], a[1], c[0], c[1], kind, 0];
+        for (let gx = Math.floor(Math.min(a[0], c[0]) / EC); gx <= Math.floor(Math.max(a[0], c[0]) / EC); gx++) {
+          for (let gz = Math.floor(Math.min(a[1], c[1]) / EC); gz <= Math.floor(Math.max(a[1], c[1]) / EC); gz++) {
+            const k = gx * 100003 + gz;
+            let l = edgeGrid.get(k);
+            if (!l) edgeGrid.set(k, (l = []));
+            l.push(e);
+          }
+        }
+      }
+    }
+    // shopping cells (60 m): at least three shops / restaurants / banks … in the cell and its neighbours
+    const count = new Map();
+    for (const p of data.pois || []) {
+      if (!COM_POI.has(p.type)) continue;
+      const k = Math.floor(p.x / 60) * 100003 + Math.floor(p.z / 60);
+      count.set(k, (count.get(k) || 0) + 1);
+    }
+    comGrid = new Set();
+    for (const k of count.keys()) {
+      const i0 = Math.round(k / 100003), j0 = k - i0 * 100003;
+      for (let i = i0 - 1; i <= i0 + 1; i++) for (let j = j0 - 1; j <= j0 + 1; j++) {
+        let n = 0;
+        for (let a = i - 1; a <= i + 1; a++) for (let b = j - 1; b <= j + 1; b++) n += count.get(a * 100003 + b) || 0;
+        if (n >= 3) comGrid.add(i * 100003 + j);
+      }
+    }
+  };
+  const shopping = (x, z) => comGrid.has(Math.floor(x / 60) * 100003 + Math.floor(z / 60));
+  // first building face hit by the ray p + d·t, t ≤ maxT → [t, kind] or null
+  let rayStamp = 0;
+  const rayHit = (px, pz, dx, dz, maxT) => {
+    let best = null;
+    const ex = px + dx * maxT, ez = pz + dz * maxT;
+    const stamp = ++rayStamp;
+    for (let gx = Math.floor(Math.min(px, ex) / EC); gx <= Math.floor(Math.max(px, ex) / EC); gx++) {
+      for (let gz = Math.floor(Math.min(pz, ez) / EC); gz <= Math.floor(Math.max(pz, ez) / EC); gz++) {
+        const l = edgeGrid.get(gx * 100003 + gz);
+        if (!l) continue;
+        for (const e of l) {
+          if (e[5] === stamp) continue;
+          e[5] = stamp;
+          const sx = e[2] - e[0], sz = e[3] - e[1];
+          const den = dx * sz - dz * sx;
+          if (Math.abs(den) < 1e-9) continue;
+          const qx = e[0] - px, qz = e[1] - pz;
+          const t = (qx * sz - qz * sx) / den, u = (qx * dz - qz * dx) / den;
+          if (t < 0 || t > maxT || u < 0 || u > 1) continue;
+          if (!best || t < best[0]) best = [t, e[4]];
+        }
+      }
+    }
+    return best;
+  };
+  const FRONT_TYPES = new Set(['primary', 'primary_link', 'secondary', 'secondary_link', 'tertiary', 'tertiary_link', 'residential', 'unclassified', 'trunk']);
+  const frontage = (r, step = 1.5) => {
+    const key = step === 1.5 ? '_front' : '_frontC';
+    if (r[key]) return r[key];
+    const out = (r[key] = []);
+    if (!FRONT_TYPES.has(r.type) || r._w < 5) return out;
+    if (!edgeGrid) buildEdgeGrid();
+    const S = resamplePolyline(r.points, step);
+    for (let i = 1; i < S.length - 1; i++) { // smoothed tangents
+      const tx = S[i + 1].x - S[i - 1].x, tz = S[i + 1].z - S[i - 1].z, l = Math.hypot(tx, tz) || 1;
+      S[i].tx = tx / l; S[i].tz = tz / l;
+    }
+    const e0 = r._w / 2 + 0.2;
+    for (const sgn of [-1, 1]) {
+      const t = S.map((p) => {
+        const nx = -p.tz * sgn, nz = p.tx * sgn, x0 = p.x + nx * e0, z0 = p.z + nz * e0;
+        const reach = shopping(x0, z0) ? 9 : 4.6;
+        const h = rayHit(x0, z0, nx, nz, reach);
+        if (!h || h[0] < 1 || (h[1] === 1 && h[0] > 3.4)) return 0;
+        if (carriagewayDist(x0 + nx * 0.6, z0 + nz * 0.6, r) < 0) return 0; // a side street / junction
+        // not across another carriageway on the way
+        if (carriagewayDist(x0 + nx * h[0] * 0.5, z0 + nz * h[0] * 0.5, r) < 0.3) return 0;
+        return h[0];
+      });
+      // close one-sample gaps, then soften the far edge (running mean over the hits)
+      const K = Math.max(1, Math.round(3 / step));
+      for (let i = 1; i < t.length - 1; i++) if (!t[i] && t[i - 1] && t[i + 1]) t[i] = (t[i - 1] + t[i + 1]) / 2;
+      const sm = t.map((v, i) => {
+        if (!v) return 0;
+        let s = 0, n = 0;
+        for (let k = Math.max(0, i - K); k <= Math.min(t.length - 1, i + K); k++) if (t[k]) { s += t[k]; n++; }
+        return Math.max(v, s / n) + 0.25; // (reach just under the wall)
+      });
+      let run = null;
+      const flush = () => {
+        if (run && run.length > 1) {
+          const inner = run.map(([p]) => [p.x - p.tz * sgn * (e0 - 0.3), p.z + p.tx * sgn * (e0 - 0.3)]);
+          const outer = run.map(([p, v]) => [p.x - p.tz * sgn * (e0 + v), p.z + p.tx * sgn * (e0 + v)]);
+          const ring = inner.concat(outer.reverse());
+          const path = new Path2D();
+          ringPath(path, ring);
+          // saw-cut joints across the paving every sample (≈ 1.5 m slabs)
+          const joints = new Path2D();
+          if (step <= 2) for (let k = 1; k < run.length - 1; k++) { joints.moveTo(inner[k][0], inner[k][1]); const o = outer[run.length - 1 - k]; joints.lineTo(o[0], o[1]); }
+          out.push({ path, joints, _bb: bbox(ring, 0.5) });
+        }
+        run = null;
+      };
+      for (let i = 0; i < S.length; i++) {
+        if (sm[i]) (run || (run = [])).push([S[i], sm[i]]);
+        else flush();
+      }
+      flush();
+    }
+    return out;
+  };
+
+  return { areas, roads, paths, rails, bRings, trees, onCampus, carriagewayDist, frontage, nodeMap, vkey, bounds };
 }
 
 // Parts of a polyline inside the axis-aligned rectangle [x0,x1]×[z0,z1] (exact segment clipping, Liang–Barsky;
@@ -507,7 +693,10 @@ export function clipPolylineToRect(pts, x0, z0, x1, z1) {
 
 // ---------------------------------------------------------------------------------------------------------------
 // shared pattern sources (built once)
+// (built once and kept: the near level repaints strips with them all the time)
+let SOURCES = null;
 function makeSources() {
+  if (SOURCES) return SOURCES;
   const t0 = performance.now();
   const n256a = tileNoise(256, [4, 8, 16, 32], 11);
   const n256b = tileNoise(256, [3, 6, 12, 24, 48], 23);
@@ -517,6 +706,8 @@ function makeSources() {
     lushBlotch: blotchCanvas(256, n256b, hexRgb(COL.lush), 0.38, 0.78, 0.45),
     softGrey: modCanvases(256, n256c, 1.2),
     softGrey2: modCanvases(256, n256b, 1.6),
+    // concrete mottling at slab scale (≈ 1–3 m blotches over a 12 m tile)
+    slabs: modCanvases(128, tileNoise(128, [8, 16], 41, [1, 0.5]), 1.5),
     litter: speckleCanvas(256, 1400, ['#7a5a32', '#5e4a2a', '#8a6a3a', '#3f3f24', '#6b6a38', '#9a7440'], 1.2, 3.2, 5, { elong: 1.6 }),
     moss: blotchCanvas(256, n256c, [70, 92, 40], 0.5, 0.7, 0.6),
     flowers: speckleCanvas(256, 1800, ['#c8323c', '#e0b030', '#d86aa0', '#f0eee6', '#8a52b8', '#e87a2a', '#4f7d31', '#3f6d2a'], 1.5, 3.5, 9),
@@ -545,6 +736,7 @@ function makeSources() {
     })(),
   };
   src.ms = performance.now() - t0;
+  SOURCES = src;
   return src;
 }
 
@@ -594,20 +786,30 @@ function paintAll(g, mode, ppm, P, S, level) {
     g.fillStyle = style; g.fill(path, rule);
     g.globalAlpha = 1; g.globalCompositeOperation = 'source-over';
   };
-  const stroke = (path, style, width, { alpha = 1, dash = null, cap = 'round', join = 'round', op = 'source-over' } = {}) => {
+  const stroke = (path, style, width, opts = {}) => {
+    if (batch && path.pieces) batch.stroke(path, style, width, opts); else rawStroke(path, style, width, opts);
+  };
+  const rawStroke = (path, style, width, opts = {}) => {
+    const { alpha = 1, dash = null, cap = 'round', join = 'round', op = 'source-over' } = opts;
     g.globalAlpha = alpha; g.globalCompositeOperation = op;
     g.strokeStyle = style; g.lineWidth = Math.max(width, px * 0.7);
     g.lineCap = cap; g.lineJoin = join;
     if (dash) g.setLineDash(dash);
+    // (pieces lying off the painted rectangle are not submitted: a near-level strip is a thin slice of the ways
+    // crossing it; a piece lies within 43 m of its anchor)
+    const m = 44 + g.lineWidth / 2;
+    const inRect = (x, z) => x > x0 - m && x < x0 + W + m && z > z0 - m && z < z0 + H + m;
+    const pcs = path.pieces ? path.pieces.filter((q, i) => inRect(path.at[i * 2], path.at[i * 2 + 1])) : null;
     if (!path.pieces) g.stroke(path);
-    else if (path.pieces.length === 1 || cap !== 'round' || (alpha >= 1 && typeof style === 'string')) for (const q of path.pieces) g.stroke(q);
+    else if (path.pieces.length === 1 || cap !== 'round' || (alpha >= 1 && typeof style === 'string')) for (const q of pcs) g.stroke(q);
     else {
       // translucent: butt-capped pieces (they abut, no double blending) + the round caps at the true ends
       g.lineCap = 'butt';
-      for (const q of path.pieces) g.stroke(q);
+      for (const q of pcs) g.stroke(q);
       const r = g.lineWidth / 2;
       g.fillStyle = style;
       for (const [x, z, dx, dz] of path.ends) {
+        if (!inRect(x, z)) continue;
         const a = Math.atan2(dz, dx), cap = new Path2D();
         cap.moveTo(x, z); cap.arc(x, z, r, a - Math.PI / 2, a + Math.PI / 2); cap.closePath();
         g.fill(cap);
@@ -636,6 +838,12 @@ function paintAll(g, mode, ppm, P, S, level) {
   // 'lite' (the far level at low quality, ~1 m per pixel): only the fills that read at that scale — no worn
   // edges, joints, speckle overlays, wheel paths or blurred tree shade
   const lite = !!level.lite;
+  // 'far' (the far level, ~0.8 m per pixel): what is finer than a pixel or two is left out (worn path edges,
+  // joints, speckles, per-road asphalt patches — the terrain shader adds close-up detail and macro variation
+  // anyway), and ways / building footprints are batched per tile (makeBatcher)
+  const far = !!level.far || lite;
+  const batch = far ? makeBatcher((p, style, width, opts) => rawStroke(p, style, width, opts), (p, style) => fillPath(p, style, 1, 'source-over', 'nonzero')) : null;
+  const flush = () => { if (batch) batch.flush(); };
   if (mode === 'marks') {
     // road / field markings only, on black: R = white coverage, G = yellow (the terrain shader lays them over the
     // colour texture and fades them out near the camera, where roads.js draws them as crisp decals)
@@ -650,28 +858,39 @@ function paintAll(g, mode, ppm, P, S, level) {
     else if (path) fillPath(path, style, strength);
     else fillAll(style, strength);
   };
-  // Soft (blurred) shade: rasterised at 1/4 resolution with the blur there, then scaled up — a full-resolution
-  // blur filter over a 4096² canvas costs hundreds of milliseconds.
-  let shadeCanvas = null;
-  const softShade = (path, color, alpha, blurM, rule = 'nonzero') => {
-    const SH = 4, cw = g.canvas.width, ch = g.canvas.height;
-    if (!shadeCanvas) shadeCanvas = makeCanvas(Math.ceil(cw / SH), Math.ceil(ch / SH));
-    const sg = shadeCanvas.getContext('2d');
+  // A layer composed at 1/SH resolution over the painted rectangle (+ margin m metres) and drawn scaled up in one
+  // go: the blurred shades and the low-frequency base ground (full-resolution blur filters / big pattern fills
+  // cost hundreds of milliseconds on a 4096² canvas). Its cells are aligned to a grid fixed in world space, so
+  // neighbouring strips of the near level compose exactly the same layer where they meet.
+  const lowRes = (SH, m, alpha, draw) => {
+    const t = g.getTransform();
+    const ph = (v) => ((v % SH) + SH) % SH;
+    const phx = ph(t.e), phz = ph(t.f);
+    const dx0 = Math.floor(((x0 - m) * t.a + t.e - phx) / SH) * SH + phx, dz0 = Math.floor(((z0 - m) * t.d + t.f - phz) / SH) * SH + phz;
+    const dx1 = (x0 + W + m) * t.a + t.e, dz1 = (z0 + H + m) * t.d + t.f;
+    const cw = Math.max(1, Math.ceil((dx1 - dx0) / SH)), ch = Math.max(1, Math.ceil((dz1 - dz0) / SH));
+    const c = scratchCanvas(cw, ch);
+    const sg = c.getContext('2d');
     sg.setTransform(1, 0, 0, 1, 0, 0);
-    sg.clearRect(0, 0, shadeCanvas.width, shadeCanvas.height);
-    const m = g.getTransform();
-    sg.setTransform(m.a / SH, m.b / SH, m.c / SH, m.d / SH, m.e / SH, m.f / SH);
-    sg.filter = `blur(${Math.max(0.6, (blurM * ppm) / SH).toFixed(2)}px)`;
-    sg.fillStyle = color;
-    sg.fill(path, rule);
-    sg.filter = 'none';
+    sg.clearRect(0, 0, cw, ch);
+    sg.setTransform(t.a / SH, 0, 0, t.d / SH, (t.e - dx0) / SH, (t.f - dz0) / SH);
+    draw(sg);
     g.save();
     g.setTransform(1, 0, 0, 1, 0, 0);
     g.globalAlpha = alpha;
     g.imageSmoothingEnabled = true;
-    g.drawImage(shadeCanvas, 0, 0, cw, ch);
+    g.drawImage(c, 0, 0, cw, ch, dx0, dz0, cw * SH, ch * SH);
     g.restore();
   };
+  // Soft (blurred) shade of a path (or of a list of tile paths)
+  // (sharp levels: no blur filter — the layer's own 4× upscaling softens the edges over ~1 m, and a canvas blur
+  // costs the GPU several ms per near-level strip)
+  const softShade = (path, color, alpha, blurM, rule = 'nonzero') => lowRes(4, 3 * blurM + 2, alpha, (sg) => {
+    if (ppm < 2) sg.filter = `blur(${Math.max(0.6, (blurM * ppm) / 4).toFixed(2)}px)`;
+    sg.fillStyle = color;
+    for (const p of Array.isArray(path) ? path : [path]) sg.fill(p, rule);
+    sg.filter = 'none';
+  });
   // draw inside a polygon clip, in the polygon's oriented frame (u along the long axis)
   const inFrame = (path, frame, fn) => {
     g.save();
@@ -690,21 +909,14 @@ function paintAll(g, mode, ppm, P, S, level) {
   if (C) {
     // Only low-frequency variation (≥ 37 m blotches) here, so it is composed at 1/4 resolution and scaled up in a
     // single draw — five full-resolution fills of a 4096² canvas are the most expensive part of the painting.
-    const SB = 4, cw = g.canvas.width, ch = g.canvas.height;
-    const base = makeCanvas(Math.ceil(cw / SB), Math.ceil(ch / SB));
-    const bg = base.getContext('2d', { alpha: false });
-    const m = g.getTransform();
-    bg.setTransform(m.a / SB, m.b / SB, m.c / SB, m.d / SB, m.e / SB, m.f / SB);
-    const fillB = (style, alpha = 1) => { bg.globalAlpha = alpha; bg.fillStyle = style; bg.fillRect(x0 - 10, z0 - 10, W + 20, H + 20); };
-    fillB(COL.grass);
-    fillB(pat(S.dryBlotch, 420, 0.3), 0.8);
-    fillB(pat(S.lushBlotch, 170, 1.1, 37, 11), 0.9);
-    fillB(pat(S.softGrey.both, 37, 0.7), 0.3);
-    g.save();
-    g.setTransform(1, 0, 0, 1, 0, 0);
-    g.imageSmoothingEnabled = true;
-    g.drawImage(base, 0, 0, cw, ch);
-    g.restore();
+    lowRes(4, 8, 1, (bg) => {
+      const fillB = (style, alpha = 1) => { bg.globalAlpha = alpha; bg.fillStyle = style; bg.fillRect(x0 - 20, z0 - 20, W + 40, H + 40); };
+      fillB(COL.grass);
+      fillB(pat(S.dryBlotch, 420, 0.3), 0.8);
+      fillB(pat(S.lushBlotch, 170, 1.1, 37, 11), 0.9);
+      fillB(pat(S.softGrey.both, 37, 0.7), 0.3);
+      bg.globalAlpha = 1;
+    });
   } else {
     fillAll(MASK.veg);
   }
@@ -795,66 +1007,109 @@ function paintAll(g, mode, ppm, P, S, level) {
     const rusty = r.type !== 'rail';
     stroke(path, rusty ? '#6a6150' : '#5f5a53', 5.2, { alpha: 0.9 });
     stroke(path, rusty ? '#7a7060' : COL.ballast, 3.6);
-    if (lite) continue;
+    if (far) continue;
     stroke(path, pat(S.gravelSpeck, 2.2), 3.6, { alpha: 0.7 });
     if (rusty) stroke(path, pat(S.moss, 20), 5, { alpha: 0.45 });
   }
 
   // ======================================================================= 4. tree shade (OSM trees)
-  if (C && !lite) softShade(P.treePath, '#1e2a12', 0.18, 1.5);
+  if (C && !lite) {
+    const tp = new Path2D();
+    let nT = 0;
+    for (const [x, z] of P.trees) {
+      if (x < x0 - OM || x > x0 + W + OM || z < z0 - OM || z > z0 + H + OM) continue;
+      tp.moveTo(x + 3.2, z); tp.arc(x, z, 3.2, 0, Math.PI * 2); nT++;
+    }
+    if (nT) softShade(tp, '#1e2a12', 0.18, 1.5);
+  }
 
   // ======================================================================= 5. paths (not sidewalks / crossings / steps)
   const pathStyle = {
     concrete: [COL.concrete, MASK.hard], sidewalk: [COL.sidewalk, MASK.hard], paver: [COL.paver, MASK.hard],
     asphaltPath: ['#56585a', MASK.asph], dirt: [COL.dirt, MASK.soil], gravel: [COL.gravel, MASK.soil],
   };
-  // NB: every way is stroked on its own on purpose. Joining many ways into one big Path2D makes Skia rasterise
-  // a software coverage mask over the whole union's bounds (measured: twice as slow); small per-way paths go
-  // through its GPU atlas instead.
+  // NB: outside far mode every way is stroked on its own on purpose. Joining many ways into one big Path2D makes
+  // Skia rasterise a software coverage mask over the whole union's bounds (measured: twice as slow); small
+  // per-way paths go through its GPU atlas instead. (Far mode joins them per 200 m tile: few, atlas-sized paths.)
   const general = P.paths.filter((p) => p._kind !== 'crossing' && p._kind !== 'steps' && p._kind !== 'sidewalk' && vis(p));
   // soft worn edges first (all), then fills
-  if (C && !lite) for (const p of general) {
+  if (C && !far) for (const p of general) {
     if (p._kind === 'dirt' || p._kind === 'gravel') stroke(p._path, '#6d6146', p._w + 0.9, { alpha: 0.35 });
     else stroke(p._path, '#5b5a45', p._w + 0.45, { alpha: 0.45 });
   }
   for (const p of general) {
     const [c, m] = pathStyle[p._kind] || pathStyle.concrete;
-    stroke(p._path, C ? c : m, p._w);
-    if (C && !lite && (p._kind === 'dirt' || p._kind === 'gravel')) stroke(p._path, pat(S.gravelSpeck, 2.5), p._w * 0.8, { alpha: 0.35 });
-    if (C && p._kind === 'concrete' && ppm > 3) stroke(p._path, '#8f8a80', p._w, { alpha: 0.35, dash: [0.07, 1.6], cap: 'butt' });
+    stroke(p._path, C ? c : m, far ? Math.round(p._w * 2) / 2 : p._w);
+    if (!C || far) continue;
+    if (p._kind === 'dirt' || p._kind === 'gravel') stroke(p._path, pat(S.gravelSpeck, 2.5), p._w * 0.8, { alpha: 0.35 });
+    else if (p._kind === 'concrete') modulate(p._path, S.slabs, 12, 0.2, 0.22, { width: p._w });
+    else if (p._kind === 'asphaltPath') stroke(p._path, pat(S.asphVar, 23, 1.1), p._w, { alpha: 0.6 });
+    if (p._kind === 'concrete' && ppm > 3) stroke(p._path, '#8a857b', p._w, { alpha: 0.4, dash: [0.07, 1.5], cap: 'butt' });
   }
+  flush();
 
   // ======================================================================= 6. sidewalks
+  const roads = P.roads.filter(vis);
+  // paved frontage of shopping streets / buildings at the back of the sidewalk (far level: sampled coarser; not
+  // at all in lite mode — the low-quality far level, ~1.6 m per pixel)
+  const fronts = [];
+  if (!lite) for (const r of roads) for (const fr of P.frontage(r, far ? 6 : 1.5)) if (onCanvas(fr)) fronts.push(fr);
+  if (far) {
+    for (const fr of fronts) batch.fill(fr.path, C ? COL.sidewalk : MASK.hard, (fr._bb[0] + fr._bb[2]) / 2, (fr._bb[1] + fr._bb[3]) / 2);
+    flush();
+  } else {
+    for (const fr of fronts) fillPath(fr.path, C ? COL.sidewalk : MASK.hard, 1, 'source-over', 'nonzero');
+    if (C) for (const fr of fronts) {
+      fillPath(fr.path, pat(S.slabs.both, 12, 0.2), 0.22, 'source-over', 'nonzero');
+      fillPath(fr.path, pat(S.softGrey.both, 9, 0), 0.12, 'source-over', 'nonzero');
+      if (ppm > 2) rawStroke(fr.joints, '#86817a', 0.07, { alpha: 0.5, cap: 'butt' });
+    }
+  }
   const sidewalks = P.paths.filter((p) => p._kind === 'sidewalk' && vis(p));
-  for (const p of sidewalks) stroke(p._path, C ? COL.sidewalk : MASK.hard, p._w + 0.2);
-  if (C && !lite) for (const p of sidewalks) {
-    modulate(p._path, S.softGrey, 9, 0, 0.2, { width: p._w });
-    if (ppm > 2) stroke(p._path, '#8e8980', p._w, { alpha: 0.45, dash: [0.08, 1.45], cap: 'butt' });
+  for (const p of sidewalks) stroke(p._path, C ? COL.sidewalk : MASK.hard, far ? Math.round(p._w * 2) / 2 + 0.2 : p._w + 0.2);
+  flush();
+  if (C && !far) for (const p of sidewalks) {
+    // weathered slabs: tone variation at slab scale + slow mottling, then the saw-cut joints every ~1.5 m
+    modulate(p._path, S.slabs, 12, 0.2, 0.3, { width: p._w });
+    modulate(p._path, S.softGrey, 9, 0, 0.18, { width: p._w });
+    if (ppm > 2) stroke(p._path, '#86817a', p._w, { alpha: 0.5, dash: [0.07, 1.45], cap: 'butt' });
   }
 
   // ======================================================================= 7. roads
-  const roads = P.roads.filter(vis);
   // curbs / gutters
   for (const r of roads) {
     if (r.type === 'service') stroke(r._path, C ? '#6f6d66' : MASK.asph, r._w + 0.4, { alpha: C ? 0.5 : 1 });
     else stroke(r._path, C ? COL.curb : MASK.hard, r._w + 0.7);
   }
+  flush();
   // asphalt (base tone includes the per-road resurfacing age; patches + stains are one pre-composited tile)
   const asphVar = C ? pat(S.asphVar, 68, 0.4) : null;
   for (const r of roads) {
     if (!C) { stroke(r._path, r._brick || r._concrete ? MASK.hard : MASK.asph, r._w); continue; }
     let base = r._brick ? COL.brick : r._concrete ? '#9c9990' : r.type === 'service' ? '#4c4e51' : COL.asphalt;
-    if (!r._brick && !r._concrete) base = mixHex(base, r._age > 0.5 ? '#5a5c5e' : '#2e3033', 0.08 + 0.12 * Math.abs(r._age - 0.5) * 2);
+    // (far mode: the age quantised to three tones, so the roads batch into a few styles)
+    const age = far ? Math.round(r._age * 2) / 2 : r._age;
+    if (!r._brick && !r._concrete) base = mixHex(base, age > 0.5 ? '#5a5c5e' : '#2e3033', 0.08 + 0.12 * Math.abs(age - 0.5) * 2);
     stroke(r._path, base, r._w);
-    if (!r._brick && !r._concrete) {
-      stroke(r._path, asphVar, r._w);
-      // oil / wear darkening along wheel paths of two-lane roads
-      if (r._w >= 7 && ppm > 2) {
-        if (!r._wheel) r._wheel = [-r._w / 4, r._w / 4].map((d) => { const w = new Path2D(); linePath(w, offsetPolyline(r.points, d)); return w; });
-        for (const w of r._wheel) stroke(w, '#26282a', 1.2, { alpha: 0.12 });
+  }
+  flush();
+  if (C && !far) {
+    for (const r of roads) {
+      if (!r._brick && !r._concrete) {
+        stroke(r._path, asphVar, r._w);
+        if (r._w >= 6.5) {
+          if (!r._edges) {
+            const off = (d) => { const w = new Path2D(); linePath(w, offsetPolyline(r.points, d)); return w; };
+            r._edges = { wheel: [off(-r._w / 4), off(r._w / 4)], gutter: r.type === 'service' ? [] : [off(-r._w / 2 + 0.3), off(r._w / 2 - 0.3)] };
+          }
+          // oil / wear darkening along the wheel paths, grime along the gutters
+          for (const w of r._edges.wheel) stroke(w, '#26282a', 1.2, { alpha: 0.12 });
+          for (const w of r._edges.gutter) stroke(w, '#2b2a27', 0.55, { alpha: 0.22 });
+        }
+        roadPatches(r);
+      } else if (r._brick) {
+        modulate(r._path, S.softGrey2, 6, 0, 0.3, { width: r._w });
       }
-    } else if (r._brick) {
-      modulate(r._path, S.softGrey2, 6, 0, 0.3, { width: r._w });
     }
   }
 
@@ -862,16 +1117,28 @@ function paintAll(g, mode, ppm, P, S, level) {
   for (const p of P.paths) {
     if (p._kind !== 'steps' || !vis(p)) continue;
     stroke(p._path, C ? '#b5b0a5' : MASK.hard, p._w + 0.3, { cap: 'butt' });
-    if (C && !lite) stroke(p._path, '#6e6a62', p._w + 0.3, { dash: [0.09, 0.23], cap: 'butt', alpha: 0.8 });
+    if (C && !far) stroke(p._path, '#6e6a62', p._w + 0.3, { dash: [0.09, 0.23], cap: 'butt', alpha: 0.8 });
   }
+  flush();
 
   // ======================================================================= 9. buildings: ground + ambient occlusion halo
-  const bPath = buildingPath(P, vis, `${x0},${z0},${W},${H}`);
+  // (the ones on this canvas and not inside one of its inner levels; their AO halo may reach ~6 m)
+  const bPaths = new Map();
+  for (const b of P.bRings) {
+    if (!vis(b, 8)) continue;
+    const k = far ? Math.floor(b.cx / BATCH_M) * 100003 + Math.floor(b.cz / BATCH_M) : 0;
+    let p = bPaths.get(k);
+    if (!p) bPaths.set(k, (p = new Path2D()));
+    ringPath(p, b.ring);
+  }
+  const bList = [...bPaths.values()];
   if (C) {
-    if (!lite) softShade(bPath, '#000000', 0.42, 2.2);
-    fillPath(bPath, COL.building, 1, 'source-over', 'nonzero');
+    // (a broad halo reads as contact shade from the air; up close — near level — it is kept tight: the renderer's
+    // SSAO darkens the wall foot there)
+    if (!lite && bList.length) { if (far) softShade(bList, '#000000', 0.42, 2.2); else softShade(bList, '#000000', 0.3, 0.9); }
+    for (const p of bList) fillPath(p, COL.building, 1, 'source-over', 'nonzero');
   } else {
-    fillPath(bPath, MASK.soil, 1, 'source-over', 'nonzero');
+    for (const p of bList) fillPath(p, MASK.soil, 1, 'source-over', 'nonzero');
   }
 
   // ======================================================================= 10. the sharper inner levels, downscaled
@@ -888,6 +1155,31 @@ function paintAll(g, mode, ppm, P, S, level) {
   if (C && level.markings === true) paintMarkings(false);
 
   // ======================================================================= helpers used above
+  // Street furniture of the carriageway (near level only): utility-cut patches, manhole covers, storm drains
+  function roadPatches(r) {
+    if (!r._decor) r._decor = roadDecor(r);
+    for (const d of r._decor) {
+      if (d.x < x0 - 6 || d.x > x0 + W + 6 || d.z < z0 - 6 || d.z > z0 + H + 6) continue;
+      g.save();
+      g.translate(d.x, d.z);
+      g.rotate(d.a);
+      if (d.kind === 'patch') {
+        g.globalAlpha = d.alpha; g.fillStyle = d.col;
+        g.fillRect(-d.l / 2, -d.w / 2, d.l, d.w);
+        g.globalAlpha = d.alpha * 0.6; g.strokeStyle = '#1c1d1f'; g.lineWidth = Math.max(0.05, px * 0.8);
+        g.strokeRect(-d.l / 2, -d.w / 2, d.l, d.w); // (sealed seam)
+      } else if (d.kind === 'manhole') {
+        g.fillStyle = '#34322e'; g.beginPath(); g.arc(0, 0, 0.36, 0, Math.PI * 2); g.fill();
+        g.strokeStyle = '#5e5a53'; g.lineWidth = 0.05; g.beginPath(); g.arc(0, 0, 0.3, 0, Math.PI * 2); g.stroke();
+      } else {
+        g.fillStyle = '#6d6a64'; g.fillRect(-0.55, -0.3, 1.1, 0.6);   // concrete frame
+        g.fillStyle = '#1d1c1a'; g.fillRect(-0.45, -0.21, 0.9, 0.42); // grate
+        g.strokeStyle = '#4a4741'; g.lineWidth = 0.05;
+        g.beginPath(); for (let k = -0.35; k <= 0.36; k += 0.1) { g.moveTo(k, -0.2); g.lineTo(k, 0.2); } g.stroke();
+      }
+      g.restore();
+    }
+  }
   function paintParking(a, path, frame) {
     const gravel = a.surface === 'gravel';
     if (!C) { fillPath(path, gravel ? MASK.soil : MASK.asph); return; }
@@ -992,6 +1284,34 @@ function paintAll(g, mode, ppm, P, S, level) {
 // ---------------------------------------------------------------------------------------------------------------
 // Local oriented-frame (u along the long axis, v across) → world transform, with the same angle normalisation as
 // the painter's inFrame() so painted fills and marking lines agree.
+// Deterministic carriageway details of a road (see roadPatches): positions along the way from a per-road seed.
+function roadDecor(r) {
+  let h = 2166136261;
+  for (const ch of String(r.id)) h = Math.imul(h ^ ch.charCodeAt(0), 16777619);
+  const rnd = mulberry(h >>> 0);
+  const out = [];
+  const w = r._w, curb = r.type !== 'service';
+  for (const p of resamplePolyline(r.points, 9)) {
+    const a = Math.atan2(p.tz, p.tx), nx = -p.tz, nz = p.tx;
+    const at = (lat, along = 0) => [p.x + nx * lat + p.tx * along, p.z + nz * lat + p.tz * along];
+    const k = rnd();
+    if (k < 0.07) {                                   // utility-cut patch: newer (darker) or older (greyer) asphalt
+      const pw = 0.8 + rnd() * 1.6, pl = 1.4 + rnd() * 4.5, lat = (rnd() - 0.5) * Math.max(0, w - pw - 1);
+      const [x, z] = at(lat);
+      const fresh = rnd() < 0.6;
+      out.push({ kind: 'patch', x, z, a: a + (rnd() < 0.25 ? Math.PI / 2 : 0), l: pl, w: pw, col: fresh ? '#25272a' : '#6a6a67', alpha: fresh ? 0.45 + rnd() * 0.2 : 0.22 + rnd() * 0.12 });
+    } else if (k < 0.13 && w >= 6) {                  // manhole cover in a lane
+      const lane = w >= 10 ? (rnd() < 0.5 ? -1 : 1) * w / 4 : (rnd() - 0.5) * 1.2;
+      const [x, z] = at(lane);
+      out.push({ kind: 'manhole', x, z, a: 0 });
+    } else if (k < 0.2 && curb && w >= 6) {           // storm drain inlet at the kerb
+      const [x, z] = at((rnd() < 0.5 ? -1 : 1) * (w / 2 - 0.3));
+      out.push({ kind: 'drain', x, z, a });
+    }
+  }
+  return out;
+}
+
 function frameToWorld(frame) {
   let ang = frame.angle;
   while (ang > Math.PI / 2) ang -= Math.PI;
@@ -1018,15 +1338,20 @@ const DIGITS = {
 // Returns [{ pts:[[x,z]...], w, color:'white'|'yellow', dash:[on,off]|null, alpha }]
 // Clipped to the painted ground (the data bounds, 2 m inset): beyond it the terrain is the procedural skirt and
 // lines would float across the fields. Cached on P (the far painter level and roads.js both use it).
-export function computeMarkings(P) {
-  if (P._markings) return P._markings;
-  const out = [];
+// Parking stall lines are not in it (at the far level's ~1.6 m markings texels they vanish, and finding them
+// for ~200 lots costs ~50 ms): lotStalls() gives them per lot, when the decals near the camera need them.
+function markingAdder(P, out) {
   const B = P.bounds;
-  const add = (pts, w, color, dash = null, alpha = 1) => {
+  return (pts, w, color, dash = null, alpha = 1) => {
     if (pts.length < 2) return;
     if (!B) { out.push({ pts, w, color, dash, alpha, _bb: bbox(pts, w) }); return; }
     for (const run of clipPolylineToRect(pts, B.minX + 2, B.minZ + 2, B.maxX - 2, B.maxZ - 2)) out.push({ pts: run, w, color, dash, alpha, _bb: bbox(run, w) });
   };
+}
+export function computeMarkings(P) {
+  if (P._markings) return P._markings;
+  const out = [];
+  const add = markingAdder(P, out);
   for (const r of P.roads) {
     if (!MAJOR.has(r.type) || r._w < 6 || r._brick) continue;
     // split the road into marked pieces between junctions
@@ -1081,26 +1406,40 @@ export function computeMarkings(P) {
     for (const run of clipToCarriageway(p.points, P.carriagewayDist)) add(run, 3.0, 'white', [0.6, 0.6], 0.92);
   }
   fieldMarkings(P, add);
-  parkingStalls(P, add);
   P._markings = out;
   return out;
 }
 
-// Stall lines of surface car parks, clipped to the lot polygon and kept off the service aisles painted as roads.
-function parkingStalls(P, add) {
-  for (const { a, frame } of P.areas) {
-    if (a.type !== 'parking' || a.surface === 'gravel' || !frame || frame.width < 8) continue;
+// Surface car parks that get stall lines: [{ a, frame, _bb }] (entries of P.areas)
+export function parkingLots(P) {
+  return P.areas.filter(({ a, frame }) => a.type === 'parking' && a.surface !== 'gravel' && frame && frame.width >= 8);
+}
+// Stall lines of one car park (cached on its entry), clipped to the lot polygon and kept off the service aisles
+// painted as roads. Same format as computeMarkings().
+export function lotStalls(P, lot) {
+  if (lot._stalls) return lot._stalls;
+  const out = (lot._stalls = []);
+  const add = markingAdder(P, out);
+  {
+    const { a, frame } = lot;
     const W = frameToWorld(frame), L = frame.length, Wd = frame.width;
-    const inside = (x, z) => pointInRing(x, z, a.polygon) && !(a.holes || []).some((h) => pointInRing(x, z, h)) && !(P.carriagewayDist(x, z) < 0.2);
+    // the lot's rings (exact segment clipping), then off the service aisles painted as roads (sampled, only
+    // where the lot has carriageways at all)
+    const rings = [a.polygon, ...(a.holes || [])];
+    const [bx0, bz0, bx1, bz1] = bbox(a.polygon, 1);
+    let roads = false;
+    for (let gx = Math.floor(bx0 / 24); gx <= Math.floor(bx1 / 24) && !roads; gx++) {
+      for (let gz = Math.floor(bz0 / 24); gz <= Math.floor(bz1 / 24) && !roads; gz++) if (P.carriagewayDist((gx + 0.5) * 24, (gz + 0.5) * 24) < Infinity) roads = true;
+    }
+    const free = (x, z) => !(P.carriagewayDist(x, z) < 0.2);
     const clip = (p0, p1) => {
-      const n = Math.max(1, Math.ceil(Math.hypot(p1[0] - p0[0], p1[1] - p0[1]) / 0.35));
-      let cur = [];
-      for (let k = 0; k <= n; k++) {
-        const q = [p0[0] + ((p1[0] - p0[0]) * k) / n, p0[1] + ((p1[1] - p0[1]) * k) / n];
-        if (inside(q[0], q[1])) cur.push(q);
-        else { if (cur.length > 1 && polyLength(cur) > 1.2) add(cur, 0.12, 'white', null, 0.75); cur = []; }
+      const dx = p1[0] - p0[0], dz = p1[1] - p0[1], L = Math.hypot(dx, dz);
+      const at = (t) => [p0[0] + dx * t, p0[1] + dz * t];
+      for (const [a0, a1] of segmentInRings(p0, p1, rings)) {
+        const q0 = at(a0), q1 = at(a1);
+        const parts = roads ? intervalsWhere(q0, q1, free, 0.8).map(([u0, u1]) => [a0 + (a1 - a0) * u0, a0 + (a1 - a0) * u1]) : [[a0, a1]];
+        for (const [t0, t1] of parts) if ((t1 - t0) * L > 1.2) add([at(t0), at(t1)], 0.12, 'white', null, 0.75);
       }
-      if (cur.length > 1 && polyLength(cur) > 1.2) add(cur, 0.12, 'white', null, 0.75);
     };
     for (let v = -Wd / 2 + STALL.v0; v < Wd / 2 - 4; v += STALL.period) {
       const vEnd = Math.min(v + 2 * STALL.depth, Wd / 2 - 0.5);
@@ -1108,18 +1447,75 @@ function parkingStalls(P, add) {
       if (v + STALL.depth < vEnd) clip(W(-L / 2 + 1.5, v + STALL.depth), W(L / 2 - 1.5, v + STALL.depth));
     }
   }
+  return out;
+}
+
+// Parameter intervals [t0, t1] of the segment p0 → p1 inside a polygon with holes (even–odd over all rings).
+function segmentInRings(p0, p1, rings) {
+  const dx = p1[0] - p0[0], dz = p1[1] - p0[1];
+  const ts = [];
+  let inside = false;
+  for (const ring of rings) {
+    if (pointInRing(p0[0], p0[1], ring)) inside = !inside;
+    for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+      const ax = ring[j][0], az = ring[j][1], ex = ring[i][0] - ax, ez = ring[i][1] - az;
+      const den = dx * ez - dz * ex;
+      if (Math.abs(den) < 1e-12) continue;
+      const qx = ax - p0[0], qz = az - p0[1];
+      const t = (qx * ez - qz * ex) / den, u = (qx * dz - qz * dx) / den;
+      if (t > 0 && t < 1 && u >= 0 && u < 1) ts.push(t);
+    }
+  }
+  ts.sort((x, y) => x - y);
+  const out = [];
+  let t0 = inside ? 0 : -1;
+  for (const t of ts) {
+    if (t0 >= 0) { out.push([t0, t]); t0 = -1; } else t0 = t;
+  }
+  if (t0 >= 0) out.push([t0, 1]);
+  return out;
+}
+
+// Parameter intervals [t0, t1] of the segment p0 → p1 where pred(x, z) holds: sampled every ~step metres, each
+// change of state located by bisection to ~1/128 of a step (a few times fewer tests than dense sampling).
+function intervalsWhere(p0, p1, pred, step) {
+  const dx = p1[0] - p0[0], dz = p1[1] - p0[1];
+  const n = Math.max(1, Math.ceil(Math.hypot(dx, dz) / step));
+  const at = (t) => pred(p0[0] + dx * t, p0[1] + dz * t);
+  const edge = (a, b, va) => { for (let k = 0; k < 7; k++) { const m = (a + b) / 2; if (at(m) === va) a = m; else b = m; } return (a + b) / 2; };
+  const out = [];
+  let prev = at(0), start = prev ? 0 : -1;
+  for (let k = 1; k <= n; k++) {
+    const t = k / n, v = at(t);
+    if (v !== prev) {
+      const e = edge((k - 1) / n, t, prev);
+      if (v) start = e; else { out.push([start, e]); start = -1; }
+      prev = v;
+    }
+  }
+  if (start >= 0) out.push([start, 1]);
+  return out;
 }
 
 // Parts of a polyline that lie on a painted road surface (≥ 0.25 m inside the carriageway edge).
 function clipToCarriageway(pts, dist) {
   const runs = [];
   if (!dist) return [pts];
-  let cur = [];
-  for (const q of resamplePolyline(pts, 0.3)) {
-    if (dist(q.x, q.z) < -0.25) cur.push([q.x, q.z]);
-    else if (cur.length) { runs.push(cur); cur = []; }
+  const on = (x, z) => dist(x, z) < -0.25;
+  let cur = null;
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1], b = pts[i];
+    let last = 0;
+    for (const [t0, t1] of intervalsWhere(a, b, on, 0.9)) {
+      const p = [a[0] + (b[0] - a[0]) * t0, a[1] + (b[1] - a[1]) * t0], q = [a[0] + (b[0] - a[0]) * t1, a[1] + (b[1] - a[1]) * t1];
+      if (cur && t0 === 0 && last === 0) cur.push(q);              // continues the run from the previous segment
+      else { if (cur) runs.push(cur); cur = [p, q]; }
+      last = t1;
+      if (t1 < 1) { runs.push(cur); cur = null; }
+    }
+    if (last < 1 && cur) { runs.push(cur); cur = null; }
   }
-  if (cur.length) runs.push(cur);
+  if (cur) runs.push(cur);
   return runs.filter((r) => r.length > 1 && polyLength(r) > 1.5);
 }
 
@@ -1297,6 +1693,28 @@ function trackLanes(a, add) {
   }
 }
 
+/**
+ * Paint one rectangle of a level into an existing canvas (the near level's wrap-around canvas, terrain.js).
+ * g: its 2D context; rect: world rectangle { minX, minZ, w, h }; (cx, cz): the canvas pixel of its top-left
+ * corner; ppm: pixels per metre (rect edges must fall on whole pixels). The drawing is clipped to the rectangle.
+ * mode: 'color' | 'mask'. Features within a few metres outside are drawn too (clipped), so neighbouring
+ * rectangles painted separately join without seams.
+ */
+export function paintRegion(g, mode, P, rect, cx, cz, ppm, opts = {}) {
+  const S = makeSources();
+  const w = Math.round(rect.w * ppm), h = Math.round(rect.h * ppm);
+  g.save();
+  g.setTransform(1, 0, 0, 1, 0, 0);
+  g.beginPath();
+  g.rect(cx, cz, w, h);
+  g.clip();
+  g.setTransform(ppm, 0, 0, ppm, cx - rect.minX * ppm, cz - rect.minZ * ppm);
+  g.imageSmoothingEnabled = true;
+  g.imageSmoothingQuality = 'high';
+  paintAll(g, mode, ppm, P, S, { name: opts.name || 'region', markings: false, ...opts, minX: rect.minX, minZ: rect.minZ, w: rect.w, h: rect.h });
+  g.restore();
+}
+
 /** Road/path preparation without painting (for modules that need the same classification). */
 export function prepareGround(ctx) { return prepare(ctx); }
 
@@ -1315,7 +1733,9 @@ export function prepareGround(ctx) { return prepare(ctx); }
 export function paintGround(ctx, levelDefs, prepared = null) {
   const t0 = performance.now();
   const P = prepared || prepare(ctx);
+  const tP = performance.now();
   const S = makeSources();
+  const tS = performance.now();
   const out = new Array(levelDefs.length);
   // Smaller (sharper) levels first: a level that contains one of them reuses it (see paintAll → level.inner).
   const order = levelDefs.map((_, i) => i).sort((a, b) => levelDefs[a].w * levelDefs[a].h - levelDefs[b].w * levelDefs[b].h);
@@ -1343,5 +1763,5 @@ export function paintGround(ctx, levelDefs, prepared = null) {
     }
     out[i] = { ...L, color, mask, marks };
   }
-  return { levels: out, ms: performance.now() - t0, prepared: P };
+  return { levels: out, ms: performance.now() - t0, prepared: P, prepMs: Math.round(tP - t0), sourcesMs: Math.round(tS - tP) };
 }

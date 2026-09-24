@@ -136,6 +136,60 @@ export const NIGHT = {
 };
 
 // ------------------------------------------------------------------------------------------------ GLSL
+// Aerial perspective shared by the fog chunk (env.js, every lit material) and the sky dome (its far-ground band), so
+// geometry and the land drawn beyond the end of the terrain fog identically.
+//  · cmuFogLayer: mean relative density along a ray rising dy metres from height h (density ∝ exp(-b·h)), written as
+//    a difference of the two end densities so it cannot overflow for high cameras.
+//  · cmuFogTau: optical depth of the atmospheric haze (1.2 km scale height, so it thins when seen from above) plus the
+//    exponential ground fog, for a ray of length d from a camera at height camH (relative to the fog reference height).
+//  · cmuFogAmount: chromatic extinction — the blue channel saturates first (Rayleigh), so the near haze is blue and
+//    only the far haze reaches the white horizon colour; chroma = (0,0,0) (uniform missing) means neutral.
+//  · cmuFarGround: the land beyond the modelled world (fields, woods and towns under the haze) as seen from above:
+//    albedo-weighted irradiance, mottled at the scale of neighbourhoods and woods.
+export const GLSL_AERIAL = /* glsl */`
+float cmuFogLayer( float b, float h, float dy ) {
+	float t = b * dy;
+	if ( abs( t ) < 1e-3 ) return exp( - b * h ) * ( 1.0 - 0.5 * t );
+	return ( exp( - b * h ) - exp( - b * ( h + dy ) ) ) / t;
+}
+float cmuFogTau( float d, float camH, float dy, float density, vec4 params ) {
+	float haze = max( cmuFogLayer( 1.0 / 1000.0, camH, dy ), 0.05 );
+	float low = min( cmuFogLayer( params.x, camH, dy ), 8.0 );
+	return density * d * haze + params.z * d * low;
+}
+// downward rays: the air in front of the ground is dimmer and cooler than the horizon sky (drops quickly just below
+// the horizon, so land seen from above keeps a defined horizon instead of fading into a white band)
+vec3 cmuAirDown( float dy ) {
+	return mix( vec3( 1.0 ), vec3( 0.76, 0.8, 0.87 ), 1.0 - exp( min( dy, 0.0 ) * 7.0 ) );
+}
+vec3 cmuFogAmount( float tau, vec3 chroma ) {
+	return 1.0 - exp( - tau * ( chroma.x + chroma.y + chroma.z > 0.0 ? chroma : vec3( 1.0 ) ) );
+}
+`;
+// The far land's texture (sky dome only — the fog chunk fades the world edge into the plain colour, and the sky
+// fades the mottling in beyond that edge, so both meet without a seam).
+export const GLSL_FARGROUND = /* glsl */`
+float cmuFgHash( vec2 p ) {
+	vec3 p3 = fract( vec3( p.xyx ) * 0.1031 );
+	p3 += dot( p3, p3.yzx + 33.33 );
+	return fract( ( p3.x + p3.y ) * p3.z );
+}
+float cmuFgNoise( vec2 p ) {
+	vec2 i = floor( p ), f = fract( p );
+	vec2 u = f * f * ( 3.0 - 2.0 * f );
+	return mix( mix( cmuFgHash( i ), cmuFgHash( i + vec2( 1.0, 0.0 ) ), u.x ), mix( cmuFgHash( i + vec2( 0.0, 1.0 ) ), cmuFgHash( i + vec2( 1.0, 1.0 ) ), u.x ), u.y );
+}
+// fp: ground footprint of a pixel (m) — the finer noise fades out before it could alias
+vec3 cmuFarGround( vec3 base, vec2 xz, float fp ) {
+	float big = mix( cmuFgNoise( xz * ( 1.0 / 1500.0 ) + 3.1 ), 0.5, smoothstep( 300.0, 900.0, fp ) );
+	float mid = mix( cmuFgNoise( xz * ( 1.0 / 420.0 ) + 11.7 ), 0.5, smoothstep( 80.0, 250.0, fp ) );
+	float town = mix( smoothstep( 0.45, 0.8, cmuFgNoise( xz * ( 1.0 / 900.0 ) + 5.3 ) ), 0.25, smoothstep( 200.0, 600.0, fp ) );
+	float l = dot( base, vec3( 0.2126, 0.7152, 0.0722 ) );
+	vec3 c = mix( base, l * vec3( 1.14, 1.1, 1.04 ), town * 0.6 );   // built-up patches: greyer, a little lighter
+	return c * ( 0.7 + 0.42 * big + 0.22 * mid );
+}
+`;
+
 const GLSL_NOISE = /* glsl */`
 float skyHash12(vec2 p) {
   vec3 p3 = fract(vec3(p.xyx) * 0.1031);
@@ -375,6 +429,12 @@ uniform vec3 uSurroundSun;    // direct sun on skyline faces turned towards it (
 uniform float uEnvPass;       // 1 while rendering the PMREM environment
 uniform mat3 uStarRot;        // celestial rotation (for the Milky Way band)
 uniform float uMilkyWay;
+uniform float uFogDensity;    // = scene fog density (haze extinction at the reference height, 1/m)
+uniform vec4 uFogP;           // = fogParams: x height-fog falloff · y reference height · z height-fog density
+uniform vec3 uFogChroma;      // per-channel extinction weights (aerial perspective)
+uniform vec3 uFarGround;      // radiance of the land beyond the modelled world (HDR, before mottling)
+uniform vec4 uFarP;           // x: height of that land (world y) · y: 1 = draw it below the horizon
+uniform vec4 uFarC;           // world edge: xy centre · z radius where the terrain has faded out · w: where it ends
 varying vec3 vDir;
 #include <common>
 #include <dithering_pars_fragment>
@@ -382,6 +442,8 @@ varying vec3 vDir;
 ${GLSL_NOISE}
 ${GLSL_CLOUDS}
 ${GLSL_LUT}
+${GLSL_AERIAL}
+${GLSL_FARGROUND}
 
 vec3 nightSky(vec3 dir) {
   float h = max(dir.y, 0.0);
@@ -454,9 +516,26 @@ void main() {
   float sunLobe = pow(max(dot(dir, uSunDir), 0.0), uHorizonK);
   vec3 haze = mix(uHorizonAnti, uHorizon, hw) + uHorizonSun * sunLobe;
   // below the horizon (beyond the terrain skirt) the airlight is dimmer and cooler, as on the fogged ground
-  haze *= mix(vec3(1.0), vec3(0.74, 0.79, 0.86), smoothstep(0.0, -0.35, dir.y));
+  vec3 hazeUp = haze, down = cmuAirDown(dir.y);
+  haze *= down;
   float hb = 1.0 - smoothstep(-0.015, uHorizonBand, dir.y);
   col = mix(col, haze, hb);
+  // Below the horizon, beyond the end of the terrain: the land continues to the horizon under the haze (fogged
+  // exactly like geometry, see fog_fragment in env.js), instead of a disc of flat haze around the world.
+  bool farLand = false;
+  vec3 farG = vec3(0.0), farF = vec3(0.0);
+  if (uEnvPass < 0.5 && uFarP.y > 0.5 && dir.y < 0.0) {
+    float camH = cameraPosition.y - uFarP.x;
+    if (camH > 0.5) {
+      float t = camH / max(-dir.y, 1e-5);
+      vec2 xz = cameraPosition.xz + dir.xz * t;
+      farG = mix(uFarGround, cmuFarGround(uFarGround, xz, t * 0.0012 / max(-dir.y, 0.01)), smoothstep(uFarC.w, uFarC.w + 1500.0, length(xz - uFarC.xy)));
+      farF = cmuFogAmount(cmuFogTau(t, cameraPosition.y - uFogP.y, -camH, uFogDensity, uFogP), uFogChroma);
+      farF = 1.0 - pow(1.0 - farF, vec3(1.0 + 1.6 * sunLobe));   // forward scattering, as in fog_fragment
+      col = mix(farG, haze, farF);
+      farLand = true;
+    }
+  }
   if (uEnvPass > 0.5) {
     col = surroundings(dir, haze, col);
     col = mix(col, uGround, smoothstep(-0.01, -0.2, dir.y));
@@ -465,6 +544,12 @@ void main() {
   gl_FragColor = vec4(col, 1.0);
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
+  #if defined( TONE_MAPPING )
+  // Without post-processing, geometry is fogged after tone mapping, in display space (fog_fragment): fog the far
+  // land the same way, or the end of the terrain shows as an edge.
+  // (the downward dimming of the airlight is applied to display values there, too)
+  if (farLand) gl_FragColor.rgb = mix(linearToOutputTexel(vec4(toneMapping(farG), 1.0)).rgb, linearToOutputTexel(vec4(toneMapping(hazeUp), 1.0)).rgb * down, farF);
+  #endif
   #include <dithering_fragment>
 }
 `;
@@ -621,6 +706,12 @@ export function createSkyObjects({ starCount = 3400, pixelRatio = 1 } = {}) {
     uCloudSun: { value: new THREE.Vector3(1, 1, 1) },
     uCloudAmb: { value: new THREE.Vector3(0.5, 0.55, 0.65) },
     uTime: { value: 0 },
+    uFogDensity: { value: 0 },
+    uFogP: { value: new THREE.Vector4(0, 0, 0, 8) },
+    uFogChroma: { value: new THREE.Vector3(1, 1, 1) },
+    uFarGround: { value: new THREE.Vector3(0.05, 0.06, 0.04) },
+    uFarP: { value: new THREE.Vector4(40, 0, 0, 0) },
+    uFarC: { value: new THREE.Vector4(0, 0, 1e6, 0) },
   };
 
   // ---- sky-view LUT

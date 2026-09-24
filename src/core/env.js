@@ -5,22 +5,27 @@
 //  · Physically-based sky (sky.js) whose JS twin drives the sun colour, the hemisphere light, the fog colour and the
 //    horizon haze, so terrain, fog and sky always agree.
 //  · Sun DirectionalLight with a shadow frustum that follows the view (sized by camera distance, texel-snapped),
-//    stretched to always cover the viewer's foreground; on 'high' plus a second, near shadow cascade (sunNear) of
-//    ~140 m in front of a low viewer. After dusk the same light becomes weak, cool moonlight.
+//    stretched to always cover the viewer's foreground; on 'high' plus a second shadow map (sunNear): a near cascade
+//    of ~140 m in front of a low viewer, or for an aerial viewer a coarse far cascade over all the visible ground (so
+//    distant buildings keep their shadows), re-rendered only when it moves. After dusk the light becomes moonlight.
 //  · Fill balance: under a clear sky with a high sun the sky fill (hemisphere light + diffuse IBL) is reduced where
 //    the sun shines and the sun made a little stronger → deeper, more legible shadows (patched light chunks).
 //  · Distance haze + height fog with sun in-scattering, installed globally by patching three's fog shader chunks (so
 //    every built-in material and every ShaderMaterial using the standard fog chunks gets it for free). Two separate
 //    terms: a light, physically-shaped atmospheric haze (Beer–Lambert, thins with altitude, independent of the draw
-//    distance) and a world-edge fade by horizontal radius around the data centre that hides the end of the terrain
-//    skirt. The airlight is warm towards the sun, cooler on the anti-solar side at low sun, and dimmer on downward rays.
-//  · Cloud shadows: the sun/moon light is attenuated by the same drifting cloud layer the sky draws (patched
-//    lights_fragment_begin chunk; off on 'low').
+//    distance; chromatic, so near haze is bluish and far haze reaches the horizon white; stronger towards a low sun)
+//    and a world-edge fade by horizontal radius around the data centre that hides the end of the terrain skirt. The
+//    edge fades into the far land that the sky dome draws below the horizon, fogged with the same functions (GLSL_AERIAL
+//    in sky.js), so aerial views show land out to the horizon instead of a disc of haze. The airlight is warm towards
+//    the sun, cooler on the anti-solar side at low sun, and dimmer on downward rays.
+//  · Cloud shadows: the sun/moon light is attenuated by the same drifting cloud layer the sky draws, rendered into a
+//    small cloud-shadow map around the view (one texture lookup in the patched lights_fragment_begin chunk; off on
+//    'low').
 //  · scene.environment = PMREM of the sky (with a generic skyline of trees / buildings just above the horizon, so
 //    glass reflects a structured band of surroundings), re-generated only when the sun/weather changed noticeably.
 //  · Night: nightFactor, stars (sidereal rotation), moon disc, Milky Way, city glow. Clouds, weather and winter snow.
 import * as THREE from 'three';
-import { createSkyObjects, scatter, transmittance, acesFilmic, nightSkyJS, ATMO, NIGHT } from './sky.js';
+import { createSkyObjects, scatter, transmittance, acesFilmic, nightSkyJS, ATMO, NIGHT, GLSL_AERIAL } from './sky.js';
 import { WEATHER, SEASON_WEATHER, createSnow } from './weather.js';
 
 const LAT = 40.4433, LON = -79.9436;
@@ -44,9 +49,12 @@ const K = {
   HEIGHT_REF: 32,     // height-fog reference altitude (world y, m) — Junction Hollow floor is ~15–30
   HAZE_GAIN: 0.85,    // horizon haze brightness relative to the physical sky at HZ_EL
   CLOUD_SHADOW: 0.8,  // how much a cloud dims direct sun/moon light
-  HAZE_M: 9000,       // atmospheric haze: extinction 1/HAZE_M per metre at ground level (× weather fog) on 'high'
+  HAZE_M: 12000,      // atmospheric haze: extinction 1/HAZE_M per metre at ground level (× weather fog) on 'high'
   EDGE_FADE: 1300,    // world-edge fade width (m), ending just inside the terrain skirt's outer edge
   SKIRT: 3150,        // how far the terrain skirt reaches beyond the data bounds (terrain.js SKIRT_OFFSETS ≈ 3200)
+  CHROMA: [0.88, 0.98, 1.14],        // aerial perspective: relative haze extinction per channel in clear air
+  FAR_ALB: [0.13, 0.145, 0.1],    // albedo of the far land (woods, suburbs, their shadows) seen from afar
+  FAR_SNOW: [0.5, 0.52, 0.56],     // … under snow
 };
 const HZ_EL = 3;      // elevation (deg) at which the horizon haze colour is sampled
 // Anti-solar haze tint at low sun (Earth's shadow / Belt of Venus side: lavender-blue), luminance-normalised below
@@ -63,6 +71,8 @@ export const FOG_SHARED = {
   params: { x: 0, y: 0, z: 0, w: 8 },   // x: height falloff (1/m) · y: reference height · z: height-fog density · w: sun lobe exponent
   anti: { x: 0, y: 0, z: 0 },           // anti-solar haze colour (0 = same as fogColor)
   edge: { x: 0, y: 0, z: 0, w: 0 },     // world-edge fade: xy centre · z start radius · w end radius (w ≤ z = off)
+  chroma: { x: 1, y: 1, z: 1 },         // per-channel extinction weights (0 = neutral)
+  ground: { x: 0, y: 0, z: 0 },         // colour of the far land the world edge fades into (0 = fog colour)
 };
 
 function installFogChunks() {
@@ -96,37 +106,33 @@ function installFogChunks() {
 	uniform vec4 fogParams;
 	uniform vec3 fogAnti;
 	uniform vec4 fogEdge;
-	// mean relative density along a ray rising dy metres from height h (density ∝ exp(-b·h)); written as a
-	// difference of the two end densities so it cannot overflow for high cameras
-	float cmuFogLayer( float b, float h, float dy ) {
-		float t = b * dy;
-		if ( abs( t ) < 1e-3 ) return exp( - b * h ) * ( 1.0 - 0.5 * t );
-		return ( exp( - b * h ) - exp( - b * ( h + dy ) ) ) / t;
-	}
+	uniform vec3 fogChroma;
+	uniform vec3 fogGround;
+	${GLSL_AERIAL}
 #endif
 `;
   C.fog_fragment = /* glsl */`
 #ifdef USE_FOG
 	vec3 fogRay = vFogWorldPos - cameraPosition;
 	float fogDist = length( fogRay );
+	vec3 fogDir = fogRay / max( fogDist, 1e-3 );
 	#ifdef FOG_EXP2
-		// atmospheric haze (Beer–Lambert; density falls off with a 1.2 km scale height, so it thins when seen from
-		// above) + exponential ground fog, both integrated along the ray
-		float fogCamH = cameraPosition.y - fogParams.y;
-		float fogHaze = max( cmuFogLayer( 1.0 / 1200.0, fogCamH, fogRay.y ), 0.05 );
-		float fogLow = min( cmuFogLayer( fogParams.x, fogCamH, fogRay.y ), 8.0 );
-		float fogFactor = 1.0 - exp( - fogDensity * fogDist * fogHaze - fogParams.z * fogDist * fogLow );
-		// world edge: fade by horizontal radius around the data centre (never right in front of the camera)
+		// atmospheric haze (Beer–Lambert, thinning with altitude) + exponential ground fog integrated along the ray,
+		// with chromatic extinction: the near haze is blue, only the far haze reaches the white horizon colour
+		vec3 fogFactor = cmuFogAmount( cmuFogTau( fogDist, cameraPosition.y - fogParams.y, fogRay.y, fogDensity, fogParams ), fogChroma );
+		// world edge (horizontal radius around the data centre, never right in front of the camera): the terrain gives
+		// way to the far land the sky dome draws beyond it
 		if ( fogEdge.w > fogEdge.z ) {
-			float fogR = length( vFogWorldPos.xz - fogEdge.xy );
-			fogFactor = max( fogFactor, smoothstep( fogEdge.z, fogEdge.w, fogR ) * smoothstep( 150.0, 600.0, fogDist ) );
+			float fogE = smoothstep( fogEdge.z, fogEdge.w, length( vFogWorldPos.xz - fogEdge.xy ) ) * smoothstep( 150.0, 600.0, fogDist );
+			gl_FragColor.rgb = mix( gl_FragColor.rgb, fogGround.x + fogGround.y + fogGround.z > 0.0 ? fogGround : fogColor, fogE );
 		}
 	#else
-		float fogFactor = smoothstep( fogNear, fogFar, vFogDepth );
+		vec3 fogFactor = vec3( smoothstep( fogNear, fogFar, vFogDepth ) );
 	#endif
-	vec3 fogDir = fogRay / max( fogDist, 1e-3 );
 	// sun glare lobe: for the distant landscape (on near objects the thin haze would tint whole facades)
 	float fogSun = pow( max( dot( fogDir, fogSunDir ), 0.0 ), max( fogParams.w, 1.0 ) ) * smoothstep( 100.0, 1200.0, fogDist );
+	// forward scattering: towards a low sun the same air scatters far more light (golden-hour glare over the city)
+	fogFactor = 1.0 - pow( 1.0 - fogFactor, vec3( 1.0 + 1.6 * fogSun ) );
 	// airlight: warm towards the sun, anti-solar colour away from it (same weighting as the sky's horizon band)
 	vec3 fogCol = fogColor;
 	if ( fogAnti.x + fogAnti.y + fogAnti.z > 0.0 ) {
@@ -135,7 +141,7 @@ function installFogChunks() {
 		fogCol = mix( fogAnti, fogColor, fogW );
 	}
 	// downward rays: the air in front of the ground is dimmer and cooler than the horizon sky (matches sky.js)
-	fogCol = ( fogCol + fogSunColor * fogSun ) * mix( vec3( 1.0 ), vec3( 0.74, 0.79, 0.86 ), smoothstep( 0.0, - 0.35, fogDir.y ) );
+	fogCol = ( fogCol + fogSunColor * fogSun ) * cmuAirDown( fogDir.y );
 	gl_FragColor.rgb = mix( gl_FragColor.rgb, fogCol, fogFactor );
 #endif
 `;
@@ -145,6 +151,8 @@ function installFogChunks() {
     fogParams: { value: FOG_SHARED.params },
     fogAnti: { value: FOG_SHARED.anti },
     fogEdge: { value: FOG_SHARED.edge },
+    fogChroma: { value: FOG_SHARED.chroma },
+    fogGround: { value: FOG_SHARED.ground },
   };
   Object.assign(THREE.UniformsLib.fog, extra);
   for (const key of Object.keys(THREE.ShaderLib)) {
@@ -156,18 +164,21 @@ installFogChunks();
 
 // ------------------------------------------------------------------------------------------------ cloud shadows
 // The sun/moon (directional light 0 — the shadow caster sorts first) is attenuated by the same cloud field the sky
-// draws, projected along the light direction onto the cloud layer. Uniforms shared by reference as above;
-// materials without them (x = 0) are unaffected.
+// draws, projected along the light direction onto the cloud layer. The field is not evaluated per pixel (a dozen
+// value-noise lookups in every lit shader, which also slowed down compiling every program): env renders it into a
+// small cloud-shadow map around the view (cloudShadowMap(), CLOUD_MAP) and lit materials take one bilinear lookup.
+// Uniforms shared by reference as above; materials without them (x = 0) are unaffected.
 export const CLOUD_SHADOW = {
   a: { x: 0, y: 2300, z: 0.6, w: 0.1 },  // x: strength (0 = off) · y: layer height · z: coverage threshold · w: softness
   b: { x: 0, y: 0, z: 0, w: 0 },         // xy: wind offset (m) · zw: light direction xz / y
 };
-function installCloudShadowChunks() {
-  const C = THREE.ShaderChunk;
-  if (C.lights_pars_begin.includes('cmuCloudShade')) return;
-  C.lights_pars_begin += /* glsl */`
-uniform vec4 cmuCloudShadow;
-uniform vec4 cmuCloudShadowP;
+// tex: the map. Not a Texture but a stand-in object: three clones Texture values out of ShaderLib uniforms (and
+// refuses render-target textures) but keeps plain objects by reference; env points the stand-in's GL texture at the
+// render target once it exists (an unset stand-in samples as black = no cloud shadow).
+// p: xy = cloud-layer position (m, wind offset excluded) of the map's corner · z = 1 / map size (m)
+export const CLOUD_MAP = { tex: { value: { name: 'cloudShadowMap', isRenderTargetTexture: true } }, p: { x: 0, y: 0, z: 1e-4, w: 0 } };
+// The field itself (same as cloudField() in sky.js without its billow term) for the map pass.
+const CLOUD_FIELD_GLSL = /* glsl */`
 float cmuHash12( vec2 p ) {
 	vec3 p3 = fract( vec3( p.xyx ) * 0.1031 );
 	p3 += dot( p3, p3.yzx + 33.33 );
@@ -179,10 +190,7 @@ float cmuNoise( vec2 p ) {
 	return mix( mix( cmuHash12( i ), cmuHash12( i + vec2( 1.0, 0.0 ) ), u.x ),
 	            mix( cmuHash12( i + vec2( 0.0, 1.0 ) ), cmuHash12( i + vec2( 1.0, 1.0 ) ), u.x ), u.y );
 }
-// same field as cloudField() in sky.js (4 octaves), sampled where the light ray from wp crosses the cloud layer
-float cmuCloudShade( vec3 wp ) {
-	if ( cmuCloudShadow.x <= 0.0 ) return 1.0;
-	vec2 q = wp.xz + cmuCloudShadowP.zw * ( cmuCloudShadow.y - wp.y ) + cmuCloudShadowP.xy;
+float cmuCloudField( vec2 q ) {
 	vec2 p = q * ( 1.0 / 1700.0 );
 	p += ( vec2( cmuNoise( p * 0.6 + 3.7 ), cmuNoise( p * 0.6 + 11.1 ) ) - 0.5 ) * 0.35;
 	p += ( vec2( cmuNoise( p * 2.3 + 5.2 ), cmuNoise( p * 2.3 + 17.9 ) ) - 0.5 ) * 0.12;
@@ -193,8 +201,23 @@ float cmuCloudShade( vec3 wp ) {
 		pp = mat2( 1.6, 1.2, - 1.2, 1.6 ) * pp + vec2( 3.1, 1.7 );
 		a *= 0.5;
 	}
-	float f = ( s / n ) * 0.74 + cmuNoise( p * 0.17 + 7.3 ) * 0.26;
-	return 1.0 - cmuCloudShadow.x * smoothstep( cmuCloudShadow.z, cmuCloudShadow.z + cmuCloudShadow.w, f );
+	return ( s / n ) * 0.74 + cmuNoise( p * 0.17 + 7.3 ) * 0.26;
+}
+`;
+function installCloudShadowChunks() {
+  const C = THREE.ShaderChunk;
+  if (C.lights_pars_begin.includes('cmuCloudShade')) return;
+  C.lights_pars_begin += /* glsl */`
+uniform vec4 cmuCloudShadow;
+uniform vec4 cmuCloudShadowP;
+uniform sampler2D cmuCloudMap;
+uniform vec4 cmuCloudMapP;
+// cloud coverage where the light ray from wp crosses the cloud layer (cloud-shadow map, see env.js)
+float cmuCloudShade( vec3 wp ) {
+	if ( cmuCloudShadow.x <= 0.0 ) return 1.0;
+	vec2 uv = ( wp.xz + cmuCloudShadowP.zw * ( cmuCloudShadow.y - wp.y ) - cmuCloudMapP.xy ) * cmuCloudMapP.z;
+	vec2 e = abs( uv - 0.5 );
+	return 1.0 - cmuCloudShadow.x * textureLod( cmuCloudMap, uv, 0.0 ).r * ( 1.0 - smoothstep( 0.44, 0.5, max( e.x, e.y ) ) );
 }
 `;
   const hook = 'getDirectionalLightInfo( directionalLight, directLight );';
@@ -208,7 +231,7 @@ float cmuCloudShade( vec3 wp ) {
   } else {
     console.warn('[env] lights_fragment_begin changed — cloud shadows disabled');
   }
-  const extra = { cmuCloudShadow: { value: CLOUD_SHADOW.a }, cmuCloudShadowP: { value: CLOUD_SHADOW.b }, cmuCascade: { value: CASCADE.a }, cmuIbl: { value: IBL.a } };
+  const extra = { cmuCloudShadow: { value: CLOUD_SHADOW.a }, cmuCloudShadowP: { value: CLOUD_SHADOW.b }, cmuCloudMap: CLOUD_MAP.tex, cmuCloudMapP: { value: CLOUD_MAP.p }, cmuCascade: { value: CASCADE.a }, cmuIbl: { value: IBL.a } };
   Object.assign(THREE.UniformsLib.lights, extra);
   for (const key of Object.keys(THREE.ShaderLib)) {
     const u = THREE.ShaderLib[key].uniforms;
@@ -224,7 +247,8 @@ float cmuCloudShade( vec3 wp ) {
 // the outer 12 % of the near box) and the main map elsewhere. Light 1 is skipped entirely in the lighting loop (no
 // shadow lookup, no BRDF evaluation): a stand-in light must not cost a second light's worth of shading per pixel.
 // Presets with one shadow light (medium) compile the original code (NUM_DIR_LIGHT_SHADOWS == 1).
-// x: 1 = near map in use this frame · y: blend band (fraction of the box) · z: 1 = light 1 is the stand-in
+// x: 1 = second map in use this frame · y: blend band (fraction of the box) · z: 1 = light 1 is the stand-in ·
+// w: 0 = light 1 carries the NEAR cascade (inside the main one), 1 = a FAR cascade (around it, aerial views)
 export const CASCADE = { a: { x: 0, y: 0.12, z: 0, w: 0 } };
 function installCascadeChunks() {
   const C = THREE.ShaderChunk;
@@ -260,22 +284,41 @@ uniform vec4 cmuCascade;
 			       mix( cmuCmp( shadowMap, uv + vec2( - dx, 2.0 * dy ), z ), cmuCmp( shadowMap, uv + vec2( 2.0 * dx, 2.0 * dy ), z ), f.x ), f.y );
 		return mix( 1.0, s * ( 1.0 / 9.0 ), shadowIntensity );
 	}
-	// sun shadow: near map where the fragment lies inside it (blending into the main map across the outer band)
+	// bilinear-filtered comparison (4 taps) for the coarse far cascade: at ~1 m per texel a wide PCF kernel only
+	// costs time (distant fragments are many and heavily overdrawn by trees and roofs)
+	float cmuPCF4( sampler2D shadowMap, vec2 shadowMapSize, float shadowIntensity, float shadowBias, vec4 shadowCoord ) {
+		shadowCoord.xyz /= shadowCoord.w;
+		shadowCoord.z += shadowBias;
+		if ( shadowCoord.x < 0.0 || shadowCoord.x > 1.0 || shadowCoord.y < 0.0 || shadowCoord.y > 1.0 || shadowCoord.z > 1.0 ) return 1.0;
+		vec2 texelSize = vec2( 1.0 ) / shadowMapSize;
+		vec2 f = fract( shadowCoord.xy * shadowMapSize - 0.5 );
+		vec2 uv = shadowCoord.xy - f * texelSize;
+		float z = shadowCoord.z;
+		float s = mix( mix( cmuCmp( shadowMap, uv, z ), cmuCmp( shadowMap, uv + vec2( texelSize.x, 0.0 ), z ), f.x ),
+		               mix( cmuCmp( shadowMap, uv + vec2( 0.0, texelSize.y ), z ), cmuCmp( shadowMap, uv + texelSize, z ), f.x ), f.y );
+		return mix( 1.0, s, shadowIntensity );
+	}
+	// weight of a cascade at this fragment: 1 inside its box, fading out across the outer blend band
+	float cmuInBox( vec4 c ) {
+		vec3 p = c.xyz / c.w;
+		vec2 e = abs( p.xy - 0.5 ) * 2.0;
+		return ( p.z >= 0.0 && p.z <= 1.0 ) ? 1.0 - smoothstep( 1.0 - cmuCascade.y, 1.0, max( e.x, e.y ) ) : 0.0;
+	}
+	// Sun shadow. Near mode (cmuCascade.w = 0, low viewer): map 1 is a fine box in front of the viewer inside the main
+	// map 0. Far mode (w = 1, aerial viewer): map 0 is the detailed box around the view focus, map 1 a coarse box over
+	// everything visible up to a few km. The finer map wins where the fragment lies inside it.
 	float cmuSunShadow() {
 		DirectionalLightShadow s0 = directionalLightShadows[ 0 ];
-		float wNear = 0.0;
-		if ( cmuCascade.x > 0.5 ) {
-			vec3 p1 = vDirectionalShadowCoord[ 1 ].xyz / vDirectionalShadowCoord[ 1 ].w;
-			vec2 e1 = abs( p1.xy - 0.5 ) * 2.0;
-			wNear = ( p1.z >= 0.0 && p1.z <= 1.0 ) ? 1.0 - smoothstep( 1.0 - cmuCascade.y, 1.0, max( e1.x, e1.y ) ) : 0.0;
-		}
-		float sh = 1.0;
-		if ( wNear < 0.999 ) sh = cmuPCF( directionalShadowMap[ 0 ], s0.shadowMapSize, s0.shadowIntensity, s0.shadowBias, vDirectionalShadowCoord[ 0 ] );
-		if ( wNear > 0.001 ) {
+		// weight of map 1 (two lookup sites only: every inlined PCF costs the D3D compiler time for every lit program)
+		float w1 = cmuCascade.x < 0.5 ? 0.0 : cmuCascade.w < 0.5 ? cmuInBox( vDirectionalShadowCoord[ 1 ] ) : 1.0 - cmuInBox( vDirectionalShadowCoord[ 0 ] );
+		float sh0 = 1.0, sh1 = 1.0;
+		if ( w1 < 0.999 ) sh0 = cmuPCF( directionalShadowMap[ 0 ], s0.shadowMapSize, s0.shadowIntensity, s0.shadowBias, vDirectionalShadowCoord[ 0 ] );
+		if ( w1 > 0.001 ) {
 			DirectionalLightShadow s1 = directionalLightShadows[ 1 ];
-			sh = mix( sh, cmuPCF( directionalShadowMap[ 1 ], s1.shadowMapSize, s0.shadowIntensity, s1.shadowBias, vDirectionalShadowCoord[ 1 ] ), wNear );
+			sh1 = cmuCascade.w < 0.5 ? cmuPCF( directionalShadowMap[ 1 ], s1.shadowMapSize, s0.shadowIntensity, s1.shadowBias, vDirectionalShadowCoord[ 1 ] )
+				: cmuPCF4( directionalShadowMap[ 1 ], s1.shadowMapSize, s0.shadowIntensity, s1.shadowBias, vDirectionalShadowCoord[ 1 ] );
 		}
-		return sh;
+		return mix( sh0, sh1, w1 );
 	}
 #endif
 `;
@@ -495,6 +538,61 @@ export function createEnvironment(ctx) {
   // background where KHR_parallel_shader_compile exists — and allocate the PMREM target up front, so scene.environment
   // (part of every standard material's program key) already has its final form when the app precompiles its shaders.
   // The first real LUT / cube / PMREM render happens on the first frame (envLast.pending), long after the compile.
+  // ---------------------------------------------------------------- cloud-shadow map
+  // The cloud coverage over a CM_M × CM_M square of the cloud layer around where the view's light rays cross it,
+  // re-rendered when that square moves (in steps of 1/16 of it), the wind has moved the clouds or the coverage changed.
+  // Lit materials sample it (cmuCloudShade); the field costs one small pass instead of a dozen noise lookups per pixel.
+  const CM_PX = 1024, CM_M = 12000;
+  const cloudRT = new THREE.WebGLRenderTarget(CM_PX, CM_PX, {
+    type: THREE.UnsignedByteType, depthBuffer: false, minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+    wrapS: THREE.ClampToEdgeWrapping, wrapT: THREE.ClampToEdgeWrapping, generateMipmaps: false,
+  });
+  cloudRT.texture.name = 'cloudShadowMap';
+  const cloudMat = new THREE.ShaderMaterial({
+    name: 'cloudShadowMap',
+    uniforms: { uOrigin: { value: new THREE.Vector2() }, uSize: { value: CM_M }, uWind: { value: new THREE.Vector2() }, uTh: { value: new THREE.Vector2(0.6, 0.05) } },
+    vertexShader: 'varying vec2 vUv; void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }',
+    fragmentShader: `uniform vec2 uOrigin; uniform float uSize; uniform vec2 uWind; uniform vec2 uTh; varying vec2 vUv;
+${CLOUD_FIELD_GLSL}
+void main() { gl_FragColor = vec4(smoothstep(uTh.x, uTh.x + uTh.y, cmuCloudField(uOrigin + vUv * uSize + uWind)), 0.0, 0.0, 1.0); }`,
+    depthTest: false, depthWrite: false, toneMapped: false,
+  });
+  const cloudQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), cloudMat);
+  cloudQuad.frustumCulled = false;
+  const cloudLast = { x: NaN, z: NaN, wx: NaN, wz: NaN, th: NaN, w: NaN };
+  const lutCam2 = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+  const _cfwd = new THREE.Vector3();
+  let cloudArmed = false;   // not before the first frame / precompile: its program compiles in the background until then
+  function renderCloudMap(force = false) {
+    const a = CLOUD_SHADOW.a, b = CLOUD_SHADOW.b;
+    if (a.x <= 0 || !cloudArmed) return;
+    // where the light ray from the ground ahead of the camera meets the cloud layer (wind offset excluded); the
+    // higher the camera, the farther ahead the ground it sees
+    const cam = ctx.camera, cp = cam.position, gy = ctx.heightAt(cp.x, cp.z);
+    cam.getWorldDirection(_cfwd);
+    const fl = Math.hypot(_cfwd.x, _cfwd.z), ahead = fl > 1e-3 ? Math.min(2500, Math.max(0, cp.y - gy) * 1.5 + 300) / fl : 0;
+    const gx = cp.x + _cfwd.x * ahead, gz = cp.z + _cfwd.z * ahead;
+    const step = CM_M / 16;
+    const ox = Math.round((gx + b.z * (a.y - gy) - CM_M / 2) / step) * step;
+    const oz = Math.round((gz + b.w * (a.y - gy) - CM_M / 2) / step) * step;
+    if (!force && ox === cloudLast.x && oz === cloudLast.z && Math.abs(b.x - cloudLast.wx) + Math.abs(b.y - cloudLast.wz) < 40 &&
+      a.z === cloudLast.th && a.w === cloudLast.w) {
+      // between re-renders the wind drift since the last one shifts the lookup, so the shadows move smoothly
+      CLOUD_MAP.p.x = ox - (b.x - cloudLast.wx); CLOUD_MAP.p.y = oz - (b.y - cloudLast.wz);
+      return;
+    }
+    const u = cloudMat.uniforms;
+    u.uOrigin.value.set(ox, oz); u.uWind.value.set(b.x, b.y); u.uTh.value.set(a.z, a.w);
+    const prev = renderer.getRenderTarget();
+    renderer.setRenderTarget(cloudRT);
+    renderer.render(cloudQuad, lutCam2);
+    renderer.setRenderTarget(prev);
+    const tp = renderer.properties.get(cloudRT.texture);
+    if (tp.__webglTexture) renderer.properties.get(CLOUD_MAP.tex.value).__webglTexture = tp.__webglTexture;
+    CLOUD_MAP.p.x = ox; CLOUD_MAP.p.y = oz; CLOUD_MAP.p.z = 1 / CM_M;
+    Object.assign(cloudLast, { x: ox, z: oz, wx: b.x, wz: b.y, th: a.z, w: a.w });
+  }
+
   function warmEnvironment() {
     const prev = renderer.getRenderTarget();
     try {
@@ -507,6 +605,8 @@ export function createEnvironment(ctx) {
       }
       renderer.compile(envScene, cubeCam);
       sky.compileLut(renderer);
+      renderer.setRenderTarget(cloudRT);
+      renderer.compile(cloudQuad, lutCam2);
     } catch (e) {
       console.warn('[env] environment warm-up failed', e);
       pmremRT?.dispose(); pmremRT = null;
@@ -526,6 +626,24 @@ export function createEnvironment(ctx) {
   const tmpC = new THREE.Color();
   const skyAvg = [0, 0, 0], horizonBase = [0, 0, 0], horizonSun = [0, 0, 0], horizonAnti = [0, 0, 0], ground = [0, 0, 0];
   const nightZen = [...NIGHT.zenith], nightHor = [...NIGHT.horizon];
+  const farG = [0, 0, 0];
+  // Height of the (flat) far land the sky draws beyond the terrain: the mean height of the terrain skirt near its
+  // outer edge, measured once the terrain exists (46 m — the plateau — until then).
+  let farY = null;
+  function farPlaneY() {
+    if (farY !== null) return farY;
+    const B = ctx.data?.meta?.bounds, hAt = ctx.terrain?.heightAt;
+    if (!B || typeof hAt !== 'function') return 46;
+    const cx = (B.minX + B.maxX) / 2, cz = (B.minZ + B.maxZ) / 2;
+    const r = Math.min(B.maxX - B.minX, B.maxZ - B.minZ) / 2 + K.SKIRT - K.EDGE_FADE * 0.4;
+    let sum = 0, n = 0;
+    for (let i = 0; i < 24; i++) {
+      const a = (i / 24) * Math.PI * 2, h = hAt(cx + Math.cos(a) * r, cz + Math.sin(a) * r);
+      if (Number.isFinite(h)) { sum += h; n++; }
+    }
+    farY = n ? sum / n : 46;
+    return farY;
+  }
   let horizonK = 8;
   let lightIsSun = true;
   let dateSeason = null;
@@ -731,7 +849,7 @@ export function createEnvironment(ctx) {
 
     // --- exposure (mild eye adaptation at night and under a dull sky) — before the fog, whose non-post colour
     // depends on it
-    renderer.toneMappingExposure = 1.0 + 0.3 * nf + 0.25 * overcast;
+    renderer.toneMappingExposure = 1.04 + 0.3 * nf + 0.25 * overcast;
 
     // --- fog
     applyFog();
@@ -762,12 +880,30 @@ export function createEnvironment(ctx) {
     if (B) {
       const r1 = Math.min(B.maxX - B.minX, B.maxZ - B.minZ) / 2 + K.SKIRT;
       E.x = (B.minX + B.maxX) / 2; E.y = (B.minZ + B.maxZ) / 2; E.z = r1 - K.EDGE_FADE; E.w = r1;
+      // (the skirt is rectangular: its corners reach beyond the fade circle, flat far-land coloured)
+      U.uFarC.value.set(E.x, E.y, r1, Math.hypot((B.maxX - B.minX) / 2 + K.SKIRT, (B.maxZ - B.minZ) / 2 + K.SKIRT));
     }
-    const A = FOG_SHARED.anti;
+    // aerial perspective: chromatic extinction (clear air blue, dull / hazy air more neutral)
+    const hz = smoothstep(8e-6, 26e-6, W.mie);
+    const ch = FOG_SHARED.chroma;
+    ch.x = K.CHROMA[0] + (0.96 - K.CHROMA[0]) * hz; ch.y = K.CHROMA[1] + (0.99 - K.CHROMA[1]) * hz; ch.z = K.CHROMA[2] + (1.06 - K.CHROMA[2]) * hz;
+    const cn = 0.2126 * ch.x + 0.7152 * ch.y + 0.0722 * ch.z;
+    ch.x /= cn; ch.y /= cn; ch.z /= cn;
+    // the land beyond the modelled world (sky dome below the horizon; the world edge fades into it)
+    // (in winter the land is snow-covered like the terrain's own winter paint, broken up by woods and towns)
+    const snowy = season === 'winter' ? 0.65 : 0;
+    for (let k = 0; k < 3; k++) farG[k] = ground[k] * (K.FAR_ALB[k] + (K.FAR_SNOW[k] - K.FAR_ALB[k]) * snowy) / K.GROUND[k];
+    U.uFogDensity.value = fog.density;
+    U.uFogP.value.set(FOG_SHARED.params.x, FOG_SHARED.params.y, FOG_SHARED.params.z, FOG_SHARED.params.w);
+    U.uFogChroma.value.set(ch.x, ch.y, ch.z);
+    U.uFarGround.value.fromArray(farG);
+    U.uFarP.value.set(farPlaneY(), B ? 1 : 0, 0, 0);
+    const A = FOG_SHARED.anti, G = FOG_SHARED.ground;
     if (post) {
       fog.color.setRGB(horizonBase[0], horizonBase[1], horizonBase[2]);
       FOG_SHARED.sunColor.x = horizonSun[0]; FOG_SHARED.sunColor.y = horizonSun[1]; FOG_SHARED.sunColor.z = horizonSun[2];
       A.x = Math.max(horizonAnti[0], 1e-6); A.y = Math.max(horizonAnti[1], 1e-6); A.z = Math.max(horizonAnti[2], 1e-6);
+      G.x = Math.max(farG[0], 1e-6); G.y = Math.max(farG[1], 1e-6); G.z = Math.max(farG[2], 1e-6);
     } else {
       // three converts fog.color to the output (sRGB) space itself; the plain-object uniforms must be sRGB already
       const ex = renderer.toneMappingExposure;
@@ -780,6 +916,8 @@ export function createEnvironment(ctx) {
       FOG_SHARED.sunColor.z = srgb(b3[2]) - srgb(a3[2]);
       acesFilmic(horizonAnti, ex, c3);
       A.x = Math.max(srgb(c3[0]), 1e-6); A.y = Math.max(srgb(c3[1]), 1e-6); A.z = Math.max(srgb(c3[2]), 1e-6);
+      acesFilmic(farG, ex, c3);
+      G.x = Math.max(srgb(c3[0]), 1e-6); G.y = Math.max(srgb(c3[1]), 1e-6); G.z = Math.max(srgb(c3[2]), 1e-6);
     }
     tmpC.copy(fog.color);
     renderer.setClearColor(tmpC, 1);
@@ -799,6 +937,7 @@ export function createEnvironment(ctx) {
     if (CLOUD_SHADOW.debugThreshold !== undefined) CLOUD_SHADOW.a.z = CLOUD_SHADOW.debugThreshold;
     CLOUD_SHADOW.b.x = U.uCloudOffset.value.x; CLOUD_SHADOW.b.y = U.uCloudOffset.value.y;
     CLOUD_SHADOW.b.z = L.x / ly; CLOUD_SHADOW.b.w = L.z / ly;
+    renderCloudMap();
   }
 
   // ---------------------------------------------------------------- shadow frustums that follow the view
@@ -808,6 +947,9 @@ export function createEnvironment(ctx) {
   // shadows in the foreground). NEAR cascade ('high', low cameras only): a small box from the bottom of the view
   // forward. Both are square, symmetric (props / vegetation cull their shadow casters against the main box, which
   // contains the near box), size-quantised (≈9 % steps) and texel-snapped so the shadows don't shimmer.
+  // FAR cascade ('high', aerial cameras): the near light's map instead covers the whole visible ground up to ~2.5 km
+  // (the light-space bounds of the view frustum's ground footprint) at ~1 m per texel, so distant buildings keep
+  // their shadows beyond the detailed main box. It moves in coarse steps and refreshes slowly (mostly static casters).
   const SH = { frames: 0 };
   // Refresh of the shadow maps for animated casters (people, cars, swaying trees), and the minimum number of frames
   // between two shadow passes, per CPU degrade level (engine 'perf:degrade'): on a CPU-bound machine running at
@@ -815,17 +957,51 @@ export function createEnvironment(ctx) {
   // distant casters and refreshes less often.
   const SHADOW_HZ = [30, 15, 10, 6];
   const SHADOW_HZ_FAR = [12, 8, 5, 3];
+  const SHADOW_HZ_AERIAL = [6, 4, 3, 2];    // far cascade (big box, many casters)
   const SHADOW_EVERY = [1, 2, 3, 4];
   let perfLevel = 0;
   renderer.shadowMap.autoUpdate = false;   // this module owns shadow refreshes (updateShadow sets needsUpdate)
   renderer.shadowMap.needsUpdate = true;
   const newCascade = (light) => ({ light, half: 0, far: 0, t: -1e9, center: new THREE.Vector3(1e9, 0, 0), light0: new THREE.Vector3(0, -1, 0) });
   const CM = newCascade(sun), CN = newCascade(sunNear);
-  let nearActive = false;
+  let cnMode = null;                      // what light 1's map currently holds: 'near' | 'far' | null
   const fwd = new THREE.Vector3(), lx = new THREE.Vector3(), ly = new THREE.Vector3(), center = new THREE.Vector3();
   const UP = new THREE.Vector3(0, 1, 0);
   const clamp = THREE.MathUtils.clamp;
-  const fit = { mx: 0, mz: 0, mh: 0, nx: 0, nz: 0, nh: 0, near: false };
+  const fit = { mx: 0, mz: 0, mh: 0, nx: 0, nz: 0, nh: 0, near: false, far: false, fx: 0, fz: 0, fh: 0 };
+  const _ray = new THREE.Vector3();
+  const FOOT = [[-1, -1], [1, -1], [1, 1], [-1, 1], [0, -1], [0, 1]];
+  function lightBasis(L) {
+    lx.crossVectors(UP, L);
+    if (lx.lengthSq() < 1e-8) lx.set(1, 0, 0);
+    lx.normalize();
+    ly.crossVectors(L, lx);
+  }
+  // Light-space bounds of the ground the camera sees (plane at height gy, rays clipped at maxD): sets fit.fx/fz/fh.
+  function fitFar(cam, gy, maxD, L) {
+    lightBasis(L);
+    const cp = cam.position;
+    let u0 = Infinity, u1 = -Infinity, v0 = Infinity, v1 = -Infinity;
+    for (const [nx, ny] of FOOT) {
+      _ray.set(nx, ny, 0.5).unproject(cam).sub(cp).normalize();
+      let px, pz;
+      const t = _ray.y < -1e-4 ? (cp.y - gy) / -_ray.y : Infinity;
+      if (t <= maxD) { px = cp.x + _ray.x * t; pz = cp.z + _ray.z * t; } else {
+        const h = Math.hypot(_ray.x, _ray.z) || 1;
+        px = cp.x + (_ray.x / h) * maxD; pz = cp.z + (_ray.z / h) * maxD;
+      }
+      const u = px * lx.x + pz * lx.z, v = px * ly.x + gy * ly.y + pz * ly.z;
+      u0 = Math.min(u0, u); u1 = Math.max(u1, u); v0 = Math.min(v0, v); v1 = Math.max(v1, v);
+    }
+    const uc = (u0 + u1) / 2, vc = (v0 + v1) / 2;
+    const half = Math.max(u1 - u0, v1 - v0) / 2 * 1.06 + 30;
+    const sL = (gy - ly.y * vc) / Math.max(L.y, 0.05);
+    // coarse steps (1/8 of the box): the far map is only re-rendered when the view has moved noticeably
+    const q = Math.max(16, half / 8);
+    fit.fx = Math.round((lx.x * uc + ly.x * vc + L.x * sL) / q) * q;
+    fit.fz = Math.round((lx.z * uc + ly.z * vc + L.z * sL) / q) * q;
+    fit.fh = half + q;
+  }
 
   function fitShadows() {
     const cam = ctx.camera;
@@ -879,29 +1055,34 @@ export function createEnvironment(ctx) {
     // the near cascade only pays off when it is clearly finer than the main one
     fit.near = nearWanted && half > hn * 1.35;
     fit.nx = cp.x + fx * gn; fit.nz = cp.z + fz * gn; fit.nh = hn;
+    // aerial camera: the far cascade, when the visible ground is clearly larger than the main box
+    fit.far = false;
+    if (!low && sunNear.castShadow && state.lightDir.y > 0.03) {
+      const gy = tgt ? (tgt[1] ?? tgt.y) : ctx.heightAt(cp.x + fx * half, cp.z + fz * half);
+      fitFar(cam, gy, Math.min(2600, (ctx.quality.drawDistance || 3200) * 0.8), state.lightDir);
+      fit.fh = Math.min(fit.fh, 2800);
+      fit.far = fit.fh > half * 1.3;
+    }
   }
 
   // Position cascade c (light, shadow camera, biases) around ground point (x, z) with half-size `half`. Returns
   // true when its map is re-rendered this frame. The light, its shadow camera and the biases are only touched
   // together with a new shadow pass, so a map that is not re-rendered stays consistent with the matrix it was
   // rendered with (three updates shadow.matrix inside the shadow pass).
-  function placeCascade(c, x, z, half, L, force, hz, now) {
+  function placeCascade(c, x, z, half, L, force, hz, now) {   // hz 0: only when moved
     if (!Number.isFinite(half) || !Number.isFinite(x) || !Number.isFinite(z)) return false;
     half = Math.pow(2, Math.ceil(Math.log2(half) * 8) / 8);
     center.set(x, ctx.heightAt(x, z), z);
     const texel = (2 * half) / c.light.shadow.mapSize.x;
     // light-space basis identical to the one three builds for the shadow camera (lookAt with up = +Y)
-    lx.crossVectors(UP, L);
-    if (lx.lengthSq() < 1e-8) lx.set(1, 0, 0);
-    lx.normalize();
-    ly.crossVectors(L, lx);
+    lightBasis(L);
     const u = center.dot(lx), v = center.dot(ly);
     center.addScaledVector(lx, Math.round(u / texel) * texel - u).addScaledVector(ly, Math.round(v / texel) * texel - v);
     const elev = Math.max(0.05, L.y);
     const R = clamp(260 / Math.tan(Math.asin(elev)), 300, 2600) + half;
     const far = R + half * 1.5 + 250;
     const moved = half !== c.half || Math.abs(far - c.far) > 1 || c.center.distanceToSquared(center) > 1e-6 || c.light0.dot(L) < 1 - 1e-10;
-    if (!force && !moved && now - c.t < 1000 / hz - 2) return false;
+    if (!force && !moved && (!hz || now - c.t < 1000 / hz - 2)) return false;
     const light = c.light;
     light.target.position.copy(center);
     light.position.copy(center).addScaledVector(L, R);
@@ -935,12 +1116,21 @@ export function createEnvironment(ctx) {
     const now = performance.now();
     const lvl = perfLevel;
     let did = placeCascade(CM, fit.mx, fit.mz, fit.mh, L, force, fit.near ? SHADOW_HZ_FAR[lvl] : SHADOW_HZ[lvl], now);
-    if (fit.near) {
-      // the near map must exist before the shader uses it: a freshly activated cascade is rendered this frame
-      if (placeCascade(CN, fit.nx, fit.nz, fit.nh, L, force || !nearActive, SHADOW_HZ[lvl], now)) did = true;
-      nearActive = true;
-    } else nearActive = false;
-    CASCADE.a.x = nearActive ? 1 : 0;
+    // light 1's map: near box (low viewer) or far box (aerial viewer). The map must exist before the shader uses it:
+    // a freshly activated (or re-purposed) cascade is rendered this frame.
+    const mode = fit.near ? 'near' : fit.far ? 'far' : null;
+    if (mode === 'near') {
+      if (placeCascade(CN, fit.nx, fit.nz, fit.nh, L, force || cnMode !== 'near', SHADOW_HZ[lvl], now)) did = true;
+    } else if (mode === 'far') {
+      // (beyond the main box only distant, mostly static casters: re-rendered when the box or the sun moved, at most
+      // SHADOW_HZ_AERIAL times a second)
+      if (now - CN.t >= 1000 / SHADOW_HZ_AERIAL[lvl] - 2 || cnMode !== 'far' || force) {
+        if (placeCascade(CN, fit.fx, fit.fz, fit.fh, L, force || cnMode !== 'far', 0, now)) did = true;
+      }
+    }
+    cnMode = mode;
+    CASCADE.a.x = mode ? 1 : 0;
+    CASCADE.a.w = mode === 'far' ? 1 : 0;
     if (did) { renderer.shadowMap.needsUpdate = true; SH.frames = 0; }
   }
   // Re-render every shadow map on the next frame (context restore, preset change).
@@ -966,12 +1156,14 @@ export function createEnvironment(ctx) {
       emitPending = true;
     }
     if (!!ctx.engine?.postActive !== fogMode) applyFog();
+    if (farY === null && ctx.terrain) U.uFarP.value.x = farPlaneY();
 
     // clouds drift with the wind
     const w = currentWeather().wind;
     cloudWind.set(w[0], w[1]);
     U.uCloudOffset.value.addScaledVector(cloudWind, dt * (shotMode ? 0 : 1));
     U.uTime.value = elapsed;
+    cloudArmed = true;
     updateCloudShadow();
 
     updateLut();
@@ -1011,6 +1203,7 @@ export function createEnvironment(ctx) {
     sky, snow,
     refreshShadows,
     fogUniforms: FOG_SHARED, cloudShadowUniforms: CLOUD_SHADOW, cascadeUniforms: CASCADE,   // shared shader uniforms (debug / advanced use)
+    cloudMap: { target: cloudRT, params: CLOUD_MAP.p },
     setTime(h) {
       h = Number(h);
       if (!Number.isFinite(h)) return;
@@ -1042,6 +1235,7 @@ export function createEnvironment(ctx) {
     // right now (engine.precompile() calls this before its hidden warm-up frame, so the first visible frame doesn't
     // have to render the environment map).
     prepareFrame() {
+      cloudArmed = true;
       if (!!ctx.engine?.postActive !== fogMode) applyFog();
       updateCloudShadow();
       updateLut();

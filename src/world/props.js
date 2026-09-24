@@ -386,6 +386,10 @@ export async function createProps(ctx) {
   // CAST_R (in view, or inside the sun's shadow box) go into a shadow-casting mesh; the rest never cast.
   const lvl = q.level || 'high';
   const PROP_R = lvl === 'low' ? 180 : lvl === 'medium' ? 260 : 320;
+  const TILE = 64;
+  const TX0 = Math.floor((bnd.minX - 20) / TILE), TZ0 = Math.floor((bnd.minZ - 20) / TILE);
+  const NTX = Math.floor((bnd.maxX + 20) / TILE) - TX0 + 1, NTZ = Math.floor((bnd.maxZ + 20) / TILE) - TZ0 + 1, NT = NTX * NTZ;
+  const tileOf = (x, z) => Math.min(NTZ - 1, Math.max(0, Math.floor(z / TILE) - TZ0)) * NTX + Math.min(NTX - 1, Math.max(0, Math.floor(x / TILE) - TX0));
   const CAST_R = 100;
   const sets = [];
   // list: [{x, y, z, yaw, s?, sy?, nx?, ny?, nz?}]; makeMesh(tier 'c' cast | 'n' near | 'l' low LOD, capacity)
@@ -395,10 +399,15 @@ export async function createProps(ctx) {
     counts[name] = keep.length;
     if (!keep.length) return null;
     const n = keep.length;
+    // instances are stored tile by tile (64 m) so a partition only visits the tiles within the draw distance
+    const tileK = new Int32Array(list.length);
+    for (const li of keep) tileK[li] = tileOf(list[li].x, list[li].z);
+    keep.sort((u, v) => tileK[u] - tileK[v] || u - v);
     const S = {
-      name, n, R2: R * R, lowD2: lowD * lowD, cast, radius,
+      name, n, R, R2: R * R, lowD2: lowD * lowD, cast, radius,
       xs: new Float32Array(n), ys: new Float32Array(n), zs: new Float32Array(n), mats: new Float32Array(n * 16),
       attrs: attrs.map((a) => ({ name: a.name, size: a.size, src: new Float32Array(n * a.size) })),
+      ts: new Int32Array(NT + 1),
       tiers: {},
     };
     keep.forEach((li, i) => {
@@ -406,7 +415,9 @@ export async function createProps(ctx) {
       composeMatrix(S.mats, i * 16, it.x, it.y, it.z, it.yaw || 0, it.s || 1, it.sy || it.s || 1, it.s || 1, it.nx ?? 0, it.ny ?? 1, it.nz ?? 0);
       S.xs[i] = it.x; S.ys[i] = it.y + cy * (it.sy || it.s || 1); S.zs[i] = it.z;
       attrs.forEach((a, k) => { for (let j = 0; j < a.size; j++) S.attrs[k].src[i * a.size + j] = a.src[li * a.size + j]; });
+      S.ts[tileK[li] + 1]++;
     });
+    for (let t = 0; t < NT; t++) S.ts[t + 1] += S.ts[t];
     for (const t of ['c', 'n', ...(hasLow ? ['l'] : [])]) {
       if (t === 'c' && !cast) continue;
       const m = makeMesh(t, n);
@@ -469,14 +480,21 @@ export async function createProps(ctx) {
           for (let j = 0; j < a.size; j++) dst.array[c * a.size + j] = a.src[i * a.size + j];
         }
       };
-      for (let i = 0; i < S.n; i++) {
-        const x = S.xs[i], y = S.ys[i], z = S.zs[i];
-        const dx = x - cx, dy = y - cy, dz = z - cz, d2 = dx * dx + dy * dy + dz * dz;
-        if (d2 > S.R2) continue;
-        const vis = cull.inView(x, y, z, r);
-        if (T.c && shOn && d2 < castR2) {
-          if (vis || cull.inShadow(x, y, z, r)) put('c', i);
-        } else if (vis) put(T.l && d2 > S.lowD2 ? 'l' : 'n', i);
+      const R = S.R + TILE;
+      const tx0 = Math.max(0, Math.floor((cx - R) / TILE) - TX0), tx1 = Math.min(NTX - 1, Math.floor((cx + R) / TILE) - TX0);
+      const tz0 = Math.max(0, Math.floor((cz - R) / TILE) - TZ0), tz1 = Math.min(NTZ - 1, Math.floor((cz + R) / TILE) - TZ0);
+      for (let tz = tz0; tz <= tz1; tz++) for (let tx = tx0; tx <= tx1; tx++) {
+        const t = tz * NTX + tx, i0 = S.ts[t], i1 = S.ts[t + 1];
+        if (i0 === i1) continue;
+        for (let i = i0; i < i1; i++) {
+          const x = S.xs[i], y = S.ys[i], z = S.zs[i];
+          const dx = x - cx, dy = y - cy, dz = z - cz, d2 = dx * dx + dy * dy + dz * dz;
+          if (d2 > S.R2) continue;
+          const vis = cull.inView(x, y, z, r);
+          if (T.c && shOn && d2 < castR2) {
+            if (vis || cull.inShadow(x, y, z, r)) put('c', i);
+          } else if (vis) put(T.l && d2 > S.lowD2 ? 'l' : 'n', i);
+        }
       }
       for (const t of ['c', 'n', 'l']) {
         const m = T[t];

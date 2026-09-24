@@ -19,5 +19,7 @@ import wean from "./wean.js";
 import forbesWest from "./forbesWest.js";
 import craig from "./craig.js";
 import warner from "./warner.js";
+import kenmawr from "./kenmawr.js";
+import pennAve from "./pennAve.js";
 
-export const LANDMARKS = [hamerschlag, bakerPorter, cfa, mmch, hunt, gates, cohon, tepper, fence, walkingToTheSky, scotty, stadium, mellonInstitute, cathedralOfLearning, phipps, carnegieMuseum, wean, forbesWest, craig, warner].flat().filter(Boolean);
+export const LANDMARKS = [hamerschlag, bakerPorter, cfa, mmch, hunt, gates, cohon, tepper, fence, walkingToTheSky, scotty, stadium, mellonInstitute, cathedralOfLearning, phipps, carnegieMuseum, wean, forbesWest, craig, warner, kenmawr, pennAve].flat().filter(Boolean);

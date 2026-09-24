@@ -45,8 +45,7 @@ export class GeoBuffer {
     bl.gpuType = THREE.IntType; // → vertexAttribIPointer, read as uvec2 in the shader
     g.setAttribute('bidLayer', bl);
     g.setIndex(new THREE.BufferAttribute(n > 65535 ? this.i.slice(0, ni) : Uint16Array.from(this.i.subarray(0, ni)), 1));
-    g.computeBoundingBox();
-    g.computeBoundingSphere();
+    setBounds(g, this.p, n);
     this.tris = ni / 3;
     this.p = this.n = this.uv = this.c = this.bl = this.i = null; // single-use: free the growable arrays
     this.vcap = this.icap = 0;
@@ -56,13 +55,41 @@ export class GeoBuffer {
   get triangles() { return this.p ? this.ni / 3 : this.tris || 0; }
 }
 
+// Bounding box + sphere straight from a position array (three's compute* go through the generic attribute getters,
+// which is several times slower on the ~2M building vertices).
+export function setBounds(g, P, n) {
+  let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
+  for (let k = 0; k < n * 3; k += 3) {
+    const x = P[k], y = P[k + 1], z = P[k + 2];
+    if (x < x0) x0 = x; if (x > x1) x1 = x;
+    if (y < y0) y0 = y; if (y > y1) y1 = y;
+    if (z < z0) z0 = z; if (z > z1) z1 = z;
+  }
+  if (!n) { x0 = y0 = z0 = x1 = y1 = z1 = 0; }
+  g.boundingBox = new THREE.Box3(new THREE.Vector3(x0, y0, z0), new THREE.Vector3(x1, y1, z1));
+  const cx = (x0 + x1) / 2, cy = (y0 + y1) / 2, cz = (z0 + z1) / 2;
+  let r2 = 0;
+  for (let k = 0; k < n * 3; k += 3) {
+    const dx = P[k] - cx, dy = P[k + 1] - cy, dz = P[k + 2] - cz, d = dx * dx + dy * dy + dz * dz;
+    if (d > r2) r2 = d;
+  }
+  g.boundingSphere = new THREE.Sphere(new THREE.Vector3(cx, cy, cz), Math.sqrt(r2));
+}
+
 // An emitter writes into one buffer with a fixed tint, building index and texture-array layer.
 // u/w are given in metres and normalised by the layer's tile size (su = 1/tileW, sv = 1/tileH).
+// tint.w carries the ground height under the vertex (y + GROUND_BIAS in cm), used by the shaders for the dirt /
+// ambient-occlusion band at the foot of the walls. ground = { y0 (building ground), hf (x, z) → terrain height }:
+// vertices less than 5 m above y0 read the terrain under them (so the band follows sloping streets), the rest use y0.
+export const GROUND_BIAS = 100;
 const q16 = (t) => Math.max(0, Math.min(65535, Math.round((t / TINT_RANGE) * 65535)));
+const qG = (y) => Math.max(0, Math.min(65535, Math.round((y + GROUND_BIAS) * 100)));
 export class Emitter {
-  constructor(buf, tint, bid, layer = 0, su = 1, sv = 1) {
+  constructor(buf, tint, bid, layer = 0, su = 1, sv = 1, ground = null) {
     this.buf = buf; this.t = tint; this.bid = bid; this.layer = layer; this.su = su; this.sv = sv;
     this.tr = q16(tint[0]); this.tg = q16(tint[1]); this.tb = q16(tint[2]);
+    this.hf = ground?.hf || null; this.gy = ground ? ground.y0 : -GROUND_BIAS; this.gq = qG(this.gy); this.gTop = this.gy + 5;
+    this.lx = NaN; this.lz = NaN; this.lg = this.gq;
   }
   v(x, y, z, nx, ny, nz, u, w) {
     const B = this.buf;
@@ -73,6 +100,10 @@ export class Emitter {
     n[k * 4] = Math.round(nx * 127); n[k * 4 + 1] = Math.round(ny * 127); n[k * 4 + 2] = Math.round(nz * 127);
     uv[k * 2] = u * this.su; uv[k * 2 + 1] = w * this.sv;
     c[k * 4] = this.tr; c[k * 4 + 1] = this.tg; c[k * 4 + 2] = this.tb;
+    if (this.hf && y < this.gTop) {
+      if (x !== this.lx || z !== this.lz) { this.lx = x; this.lz = z; this.lg = qG(Math.max(this.gy, this.hf(x, z))); }
+      c[k * 4 + 3] = this.lg;
+    } else c[k * 4 + 3] = this.gq;
     bl[k * 2] = this.bid; bl[k * 2 + 1] = this.layer;
     return B.count++;
   }

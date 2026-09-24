@@ -1,11 +1,13 @@
 // Railway through Junction Hollow (CSX / Allegheny Valley "P&W Subdivision") plus the disused spur:
 // ballast bed on a smoothed grade, instanced sleepers, two steel rails, and a stone portal where the line
 // dives into the Schenley Tunnel under Oakland. Disused track is rusty, overgrown and gappy; abandoned
-// (lifted) track is not drawn.
+// (lifted) track is not drawn. Also the NS Pittsburgh Line (double track) through Bloomfield / East Liberty:
+// ~13.5 km of track, so the swept ballast / rails are thinned to where the line bends (simplify3), and rails +
+// sleepers come in ~160 m pieces drawn only within a few hundred metres of the camera.
 import * as THREE from 'three';
 import { mergeGeometries } from 'three/examples/jsm/utils/BufferGeometryUtils.js';
 import { resamplePolyline, polyLength, mulberry, RAIL_GONE } from './ground-painter.js';
-import { GeoBuf, sweepSeg } from './bridges.js';
+import { GeoBuf, sweepSeg, simplify3 } from './bridges.js';
 import { RAIL_OUT } from './terrain.js';
 
 const GAUGE = 1.435;
@@ -88,9 +90,9 @@ export function createRail(ctx) {
 
   const buf = { ballast: new GeoBuf(), oldBallast: new GeoBuf(), rail: new GeoBuf(), rust: new GeoBuf() };
   const ties = [];
-  const probes = []; // points every ~25 m along the drawn track (distance culling of rails and sleepers)
   const rnd = mulberry(99);
   let portal = null;
+  let nRun = 0;
   // Lines that leave the data go on over the terrain skirt for RAIL_OUT m (on its rendered surface; the 3D
   // surroundings keep clear of them) instead of stopping dead at the data edge.
   const surfAt = ctx.terrain?.meshHeightAt;
@@ -99,6 +101,7 @@ export function createRail(ctx) {
   const groundAt = (x, z) => (inGrid(x, z) || !surfAt ? ctx.heightAt(x, z) : surfAt(x, z));
   for (const ch of chains(ways)) {
     for (const run of clipToRect(ch.points, hf.minX - out, hf.minZ - out, hf.maxX + out, hf.maxZ + out)) {
+      nRun++;
       const S = resamplePolyline(run, 2).map((p) => ({ ...p, nx: -p.tz, nz: p.tx }));
       for (let i = 1; i < S.length - 1; i++) {
         let tx = S[i + 1].x - S[i - 1].x, tz = S[i + 1].z - S[i - 1].z;
@@ -114,23 +117,27 @@ export function createRail(ctx) {
         return s / n;
       });
       for (let i = 0; i < y.length; i++) y[i] = Math.max(y[i], g[i] - 0.4) + 0.35;
-      const yOf = (i) => y[i];
-      for (let i = 0; i < S.length; i += 12) probes.push([S[i].x, y[i], S[i].z]);
+      // the swept geometry (ballast, rails) only needs samples where the line bends or the grade changes: the
+      // 2 m samples are thinned to a tolerance of a few centimetres (13.5 km of track since the map reaches East
+      // Liberty — ~420k triangles at 2 m)
+      const keep = simplify3(S, y, 0.035, 18);
+      const K = keep.map((i) => S[i]), yK = keep.map((i) => y[i]);
+      const yOf = (i) => yK[i];
       const bb = ch.rusty ? buf.oldBallast : buf.ballast;
       // ballast: trapezoid, top 3.2 m wide at rail base, toe 5 m wide at -1.2
-      sweepSeg(bb, S, yOf, [-1.6, 0], [1.6, 0], [0, 1]);
-      sweepSeg(bb, S, yOf, [1.6, 0], [2.6, -1.3], [1, 1]);
-      sweepSeg(bb, S, yOf, [-1.6, 0], [-2.6, -1.3], [-1, 1]);
+      sweepSeg(bb, K, yOf, [-1.6, 0], [1.6, 0], [0, 1]);
+      sweepSeg(bb, K, yOf, [1.6, 0], [2.6, -1.3], [1, 1]);
+      sweepSeg(bb, K, yOf, [-1.6, 0], [-2.6, -1.3], [-1, 1]);
       // rails (simple I-rail: head + web) on the sleepers
       const rb = ch.rusty ? buf.rust : buf.rail;
       for (const sgn of [-1, 1]) {
         const o = sgn * GAUGE / 2;
         const top = 0.16 + 0.15;
-        sweepSeg(rb, S, yOf, [o - 0.036, top], [o + 0.036, top], [0, 1]);
-        sweepSeg(rb, S, yOf, [o + 0.036, top], [o + 0.036, top - 0.045], [1, 0]);
-        sweepSeg(rb, S, yOf, [o - 0.036, top], [o - 0.036, top - 0.045], [-1, 0]);
-        sweepSeg(rb, S, yOf, [o + 0.012, top - 0.045], [o + 0.012, 0.16], [1, 0]);
-        sweepSeg(rb, S, yOf, [o - 0.012, top - 0.045], [o - 0.012, 0.16], [-1, 0]);
+        sweepSeg(rb, K, yOf, [o - 0.036, top], [o + 0.036, top], [0, 1]);
+        sweepSeg(rb, K, yOf, [o + 0.036, top], [o + 0.036, top - 0.045], [1, 0]);
+        sweepSeg(rb, K, yOf, [o - 0.036, top], [o - 0.036, top - 0.045], [-1, 0]);
+        sweepSeg(rb, K, yOf, [o + 0.012, top - 0.045], [o + 0.012, 0.16], [1, 0]);
+        sweepSeg(rb, K, yOf, [o - 0.012, top - 0.045], [o - 0.012, 0.16], [-1, 0]);
       }
       // sleepers every 0.6 m
       const L = S[S.length - 1].s;
@@ -140,7 +147,7 @@ export function createRail(ctx) {
         const p = S[k], q = S[k + 1], t = (s - p.s) / Math.max(1e-6, q.s - p.s);
         if (ch.rusty && rnd() < 0.18) continue; // missing / rotted sleepers
         ties.push({
-          x: p.x + (q.x - p.x) * t, y: y[k] + (y[k + 1] - y[k]) * t + 0.08, z: p.z + (q.z - p.z) * t,
+          x: p.x + (q.x - p.x) * t, y: y[k] + (y[k + 1] - y[k]) * t + 0.08, z: p.z + (q.z - p.z) * t, chunk: nRun * 1000 + Math.floor(s / 160),
           a: Math.atan2(p.tz, p.tx) + (ch.rusty ? (rnd() - 0.5) * 0.12 : 0), rusty: ch.rusty,
         });
       }
@@ -156,55 +163,103 @@ export function createRail(ctx) {
       }
     }
   }
-  const fine = []; // rails + sleepers: sub-pixel beyond a few hundred metres (the ballast bed carries the line)
+  // Rails + sleepers are sub-pixel beyond a few hundred metres (the ballast bed carries the line): the rails are
+  // split into ~160 m pieces like the sleepers, and each piece is drawn only within RANGE of the camera.
+  const fine = [];
   for (const [k, b] of Object.entries(buf)) {
     if (b.empty) continue;
     const mat = { ballast: ballastMat, oldBallast: oldBallastMat, rail: railMat, rust: rustMat }[k];
-    const m = new THREE.Mesh(b.geometry(), mat);
-    m.name = `rail-${k}`;
-    m.receiveShadow = true;
-    m.castShadow = k === 'rail' || k === 'rust';
-    group.add(m);
-    if (k === 'rail' || k === 'rust') fine.push(m);
+    const g = b.geometry();
+    const pieces = k === 'rail' || k === 'rust' ? splitByCell(g, 160) : [g];
+    for (const geo of pieces) {
+      const m = new THREE.Mesh(geo, mat);
+      m.name = 'rail-' + k;
+      m.receiveShadow = true;
+      m.castShadow = k === 'rail' || k === 'rust';
+      m.matrixAutoUpdate = false;
+      group.add(m);
+      if (pieces.length > 1 || k === 'rail' || k === 'rust') fine.push(m);
+    }
   }
-  // instanced sleepers
+  // instanced sleepers, one mesh per ~160 m of track
   if (ties.length) {
-    const geo = new THREE.BoxGeometry(2.6, 0.16, 0.24);
-    const inst = new THREE.InstancedMesh(geo, tieMat, ties.length);
+    const geo = sleeperGeometry(2.6, 0.16, 0.24);
     const m4 = new THREE.Matrix4(), q = new THREE.Quaternion(), pos = new THREE.Vector3(), sc = new THREE.Vector3(1, 1, 1), up = new THREE.Vector3(0, 1, 0);
     const col = new THREE.Color();
-    ties.forEach((t, i) => {
-      // box length runs across the track: rotate so local X = lateral normal
-      q.setFromAxisAngle(up, -(t.a + Math.PI / 2));
-      m4.compose(pos.set(t.x, t.y, t.z), q, sc);
-      inst.setMatrixAt(i, m4);
-      col.set(t.rusty ? '#8a8078' : '#ffffff').multiplyScalar(0.85 + rnd() * 0.3);
-      inst.setColorAt(i, col);
-    });
-    inst.instanceMatrix.needsUpdate = true;
-    inst.receiveShadow = true;
-    inst.castShadow = false;
-    inst.name = 'rail-sleepers';
-    inst.computeBoundingSphere();
-    group.add(inst);
-    fine.push(inst);
+    const byChunk = new Map();
+    for (const t of ties) { let l = byChunk.get(t.chunk); if (!l) byChunk.set(t.chunk, (l = [])); l.push(t); }
+    for (const list of byChunk.values()) {
+      const inst = new THREE.InstancedMesh(geo, tieMat, list.length);
+      list.forEach((t, i) => {
+        // box length runs across the track: rotate so local X = lateral normal
+        q.setFromAxisAngle(up, -(t.a + Math.PI / 2));
+        m4.compose(pos.set(t.x, t.y, t.z), q, sc);
+        inst.setMatrixAt(i, m4);
+        col.set(t.rusty ? '#8a8078' : '#ffffff').multiplyScalar(0.85 + rnd() * 0.3);
+        inst.setColorAt(i, col);
+      });
+      inst.instanceMatrix.needsUpdate = true;
+      inst.receiveShadow = true;
+      inst.castShadow = false;
+      inst.name = 'rail-sleepers';
+      inst.matrixAutoUpdate = false;
+      inst.computeBoundingSphere();
+      group.add(inst);
+      fine.push(inst);
+    }
   }
-  if (fine.length && probes.length) {
+  if (fine.length) {
     const RANGE = ctx.quality?.level === 'low' ? 220 : 380;
+    for (const m of fine) {
+      const bs = m.isInstancedMesh ? m.boundingSphere : (m.geometry.boundingSphere || (m.geometry.computeBoundingSphere(), m.geometry.boundingSphere));
+      m.userData.cull = { c: bs.center.clone(), r: bs.radius };
+    }
     let lx = Infinity, ly = Infinity, lz = Infinity;
     ctx.onUpdate(() => {
       const p = ctx.camera?.position;
       if (!p || Math.abs(p.x - lx) + Math.abs(p.y - ly) + Math.abs(p.z - lz) < 5) return;
       lx = p.x; ly = p.y; lz = p.z;
-      let d2 = Infinity;
-      for (const q of probes) d2 = Math.min(d2, (q[0] - p.x) ** 2 + (q[1] - p.y) ** 2 + (q[2] - p.z) ** 2);
-      const vis = d2 < RANGE * RANGE;
-      for (const m of fine) m.visible = vis;
+      for (const m of fine) { const c = m.userData.cull; m.visible = c.c.distanceTo(p) - c.r < RANGE; }
     }, 20);
   }
   if (portal) group.add(tunnelPortal(ctx, portal));
   ctx.scene.add(group);
   return { group, stats: { sleepers: ties.length, ms: Math.round(performance.now() - T0) } };
+}
+
+// Split a non-indexed triangle geometry into pieces by the cell (cell × cell metres) of each triangle's first vertex.
+function splitByCell(g, cell) {
+  const P = g.attributes.position.array, N = g.attributes.normal.array, U = g.attributes.uv.array;
+  const parts = new Map();
+  for (let t = 0; t < P.length / 9; t++) {
+    const k = Math.floor(P[t * 9] / cell) * 100003 + Math.floor(P[t * 9 + 2] / cell);
+    let l = parts.get(k);
+    if (!l) parts.set(k, (l = []));
+    l.push(t);
+  }
+  const out = [];
+  for (const tris of parts.values()) {
+    const p = new Float32Array(tris.length * 9), n = new Float32Array(tris.length * 9), u = new Float32Array(tris.length * 6);
+    tris.forEach((t, i) => { p.set(P.subarray(t * 9, t * 9 + 9), i * 9); n.set(N.subarray(t * 9, t * 9 + 9), i * 9); u.set(U.subarray(t * 6, t * 6 + 6), i * 6); });
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(p, 3));
+    geo.setAttribute('normal', new THREE.BufferAttribute(n, 3));
+    geo.setAttribute('uv', new THREE.BufferAttribute(u, 2));
+    geo.computeBoundingSphere();
+    out.push(geo);
+  }
+  return out;
+}
+
+// A sleeper: a box without its (never seen) bottom face — 10 triangles.
+function sleeperGeometry(w, h, d) {
+  const g = new THREE.BoxGeometry(w, h, d);
+  const idx = g.index.array, keep = [];
+  // BoxGeometry faces: +x, -x, +y, -y, +z, -z (6 indices each); drop -y
+  for (let i = 0; i < idx.length; i += 6) if (i !== 18) for (let k = 0; k < 6; k++) keep.push(idx[i + k]);
+  g.setIndex(keep);
+  g.clearGroups();
+  return g;
 }
 
 // Stone tunnel portal: a masonry headwall with a round-arched opening and a dark bore behind it.

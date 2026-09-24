@@ -4,10 +4,11 @@
 //   BloomPass   → UnrealBloom mip chain, but NOT blended back into the MSAA target (saves a full-res pass);
 //                 the final pass adds it instead. Threshold/strength follow nightFactor (night lights glow).
 //                 By day only the sun disc and specular sun glints (glass, water, cars) exceed the threshold.
-//   FinalPass   → depth-only screen-space AO (half resolution, 12 samples, bilateral blur, depth-aware upsample,
-//                 weaker on sunlit pixels), bloom add, gentle vignette, ACES tone mapping, a subtle colour grade
-//                 (saturation + warm/cool split tone), sRGB output + dithering — i.e. OutputPass's job plus AO
-//                 composite in a single full-screen draw.
+//   FinalPass   → horizon-based ambient occlusion (GTAO-style: half resolution on a nearest-of-2×2 linear depth
+//                 buffer, 3 slices × 4 steps × 2 sides, distance falloff, thin-detail threshold so grass and paving
+//                 relief stay clean, bilateral blur, depth-aware upsample, weaker on sunlit pixels), bloom add,
+//                 gentle vignette, ACES tone mapping, a subtle colour grade (saturation + warm highlights / cool
+//                 shadows), sRGB output + dithering — i.e. OutputPass's job plus AO composite in one full-screen draw.
 import * as THREE from 'three';
 import { EffectComposer } from 'three/examples/jsm/postprocessing/EffectComposer.js';
 import { RenderPass } from 'three/examples/jsm/postprocessing/RenderPass.js';
@@ -82,50 +83,101 @@ vec3 viewPos(vec2 uv) {
 }
 `;
 
-const AO_FRAG = /* glsl */`
+// Ground-truth-style ambient occlusion (horizon based, after Jimenez et al. 2016): per pixel, SLICES screen-space
+// directions (rotated per pixel), in each the highest horizon on both sides within a world radius (distance falloff:
+// far-in-front samples — foreground objects — do not occlude, so no dark halos around them), integrated against the
+// projected normal (cosine-weighted visible arc). It works on a half-resolution linear depth buffer holding the
+// NEAREST of each 2×2 block (DOWN_FRAG): dithered LOD cross-fades and alpha-to-coverage foliage leave one-pixel
+// holes in the depth buffer, which read as deep pits (dark blotches) at full resolution. Samples are snapped to
+// texel centres, so flat surfaces are exactly unoccluded even at grazing angles.
+// Output: r = AO, g = view depth (for the bilateral blur / upsample).
+const DOWN_FRAG = /* glsl */`
 ${DEPTH_COMMON}
-uniform vec2 uInvFull;          // 1 / full-res size
+uniform vec2 uFullSize;
+void main() {
+  ivec2 b = ivec2(gl_FragCoord.xy) * 2, m = ivec2(uFullSize) - 1;
+  float d = min(min(texelFetch(tDepth, min(b, m), 0).r, texelFetch(tDepth, min(b + ivec2(1, 0), m), 0).r),
+                min(texelFetch(tDepth, min(b + ivec2(0, 1), m), 0).r, texelFetch(tDepth, min(b + ivec2(1, 1), m), 0).r));
+  gl_FragColor = vec4(d >= 0.99999 ? 1e9 : linDepth(d), 0.0, 0.0, 1.0);
+}
+`;
+const AO_FRAG = /* glsl */`
+uniform sampler2D tLin;         // half-res linear view depth (nearest of 2×2)
+uniform vec4 uProj;             // x: tan(fovY/2)*aspect, y: tan(fovY/2), z: near, w: far
+uniform vec2 uInvFull;          // 1 / half-res size (the grid AO works on)
 uniform float uRadius;          // world radius (m) near the camera; grows with distance
 uniform float uIntensity;
 uniform float uFadeStart, uFadeEnd;
 varying vec2 vUv;
-#define SAMPLES 12
+#define SLICES 3
+#define STEPS 4
+vec3 viewPos(vec2 uv) {
+  float z = textureLod(tLin, uv, 0.0).r;
+  return vec3((uv * 2.0 - 1.0) * uProj.xy * z, -z);
+}
+vec2 snapUv(vec2 uv) { return (floor(uv / uInvFull) + 0.5) * uInvFull; }
 void main() {
-  float d = textureLod(tDepth, vUv, 0.0).r;
-  if (d >= 0.99999) { gl_FragColor = vec4(1.0, 60000.0, 0.0, 1.0); return; }
-  vec3 p = viewPos(vUv);
-  float z = -p.z;
+  vec2 uv0 = snapUv(vUv);
+  float z = textureLod(tLin, uv0, 0.0).r;
+  if (z > 1e8) { gl_FragColor = vec4(1.0, 60000.0, 0.0, 1.0); return; }
   if (z > uFadeEnd) { gl_FragColor = vec4(1.0, z, 0.0, 1.0); return; }
+  vec3 p = viewPos(uv0);
   // normal from depth, picking the smaller difference on each axis (no smearing across silhouettes)
   vec2 dx = vec2(uInvFull.x, 0.0), dy = vec2(0.0, uInvFull.y);
-  vec3 pl = viewPos(vUv - dx), pr = viewPos(vUv + dx), pd = viewPos(vUv - dy), pu = viewPos(vUv + dy);
+  vec3 pl = viewPos(uv0 - dx), pr = viewPos(uv0 + dx), pd = viewPos(uv0 - dy), pu = viewPos(uv0 + dy);
   vec3 ddx = abs(pr.z - p.z) < abs(p.z - pl.z) ? pr - p : p - pl;
   vec3 ddy = abs(pu.z - p.z) < abs(p.z - pd.z) ? pu - p : p - pd;
   vec3 n = normalize(cross(ddx, ddy));
+  vec3 v = normalize(-p);
   // world radius grows with distance so aerial views still get contact shading; screen-space radius from it
-  float R = clamp(uRadius + z * 0.014, uRadius, 7.0);
-  float rUv = R / (z * uProj.y * 2.0);
-  rUv = clamp(rUv, 4.0 * uInvFull.y, 0.09);
-  float aspect = uProj.x / uProj.y;
-  // interleaved gradient noise → per-pixel rotation
+  float R = clamp(uRadius + z * 0.009, uRadius, 5.0);
+  float rUv = clamp(R / (z * uProj.y * 2.0), 3.0 * uInvFull.y, 0.12);
+  vec2 aspect = vec2(uInvFull.x / uInvFull.y, 1.0);                 // pixel-isotropic steps
   float noise = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715))));
-  float R2 = R * R;
-  float sum = 0.0;
-  for (int i = 0; i < SAMPLES; i++) {
-    float fi = float(i);
-    float ang = (fi + noise) * 2.39996323;
-    float rr = sqrt((fi + 0.5 + noise * 0.5) / float(SAMPLES)) * rUv;
-    vec2 off = vec2(cos(ang) / aspect, sin(ang)) * rr;
-    vec3 s = viewPos(vUv + off);
-    vec3 v = s - p;
-    float vv = dot(v, v);
-    float vn = dot(v, n);
-    float f = max(0.0, 1.0 - vv / R2);
-    // generous bias + epsilon: soft contact shading in corners instead of saturating to black
-    sum += f * max(0.0, vn - (0.08 * R + 0.002 * z)) / (vv + 0.15 * R2);
+  float jit = fract(noise * 7.13 + 0.37);
+  float invR2 = 1.0 / (R * R);
+  // thin-detail threshold: occluders must rise this far above the tangent plane (grass blades, paving relief and
+  // curbs don't turn a lawn or a street dark; walls, trees, benches and cars still ground themselves)
+  float lift = 0.14 + 0.002 * z;
+  float vis = 0.0, wsum = 0.0;
+  for (int s = 0; s < SLICES; s++) {
+    float phi = (float(s) + noise) * (3.14159265 / float(SLICES));
+    vec2 dir = vec2(cos(phi), sin(phi));
+    // slice plane in view space: screen direction ≈ view-space xy direction
+    vec3 dirV = vec3(dir, 0.0);
+    vec3 ortho = normalize(dirV - v * dot(dirV, v));
+    vec3 axis = cross(ortho, v);
+    vec3 np = n - axis * dot(n, axis);
+    float npl = length(np);
+    if (npl < 1e-4) continue;
+    float cn = clamp(dot(np, v) / npl, -1.0, 1.0);
+    float nAng = sign(dot(np, ortho)) * acos(cn);
+    float h0 = -1.0, h1 = -1.0;                                        // horizon cosines (towards -dir, +dir)
+    for (int k = 0; k < STEPS; k++) {
+      float t = (float(k) + jit) / float(STEPS);
+      vec2 o = dir * aspect * (t * t * rUv + 1.5 * uInvFull.y);
+      vec2 ua = snapUv(uv0 + o), ub = snapUv(uv0 - o);
+      vec3 da = viewPos(ua) - p, db = viewPos(ub) - p;
+      float la = dot(da, da), lb = dot(db, db);
+      float fa = clamp(1.0 - la * invR2, 0.0, 1.0), fb = clamp(1.0 - lb * invR2, 0.0, 1.0);
+      // off-screen samples carry no information
+      fa *= step(0.0, ua.x) * step(ua.x, 1.0) * step(0.0, ua.y) * step(ua.y, 1.0) * smoothstep(lift, 2.0 * lift, dot(da, n));
+      fb *= step(0.0, ub.x) * step(ub.x, 1.0) * step(0.0, ub.y) * step(ub.y, 1.0) * smoothstep(lift, 2.0 * lift, dot(db, n));
+      h1 = max(h1, mix(-1.0, dot(da, v) * inversesqrt(max(la, 1e-8)), fa));
+      h0 = max(h0, mix(-1.0, dot(db, v) * inversesqrt(max(lb, 1e-8)), fb));
+    }
+    // horizon angles (from the view vector, positive towards +dir), clamped to the hemisphere around the normal
+    float g1 = nAng + min(acos(clamp(h1, -1.0, 1.0)) - nAng, 1.5707963);
+    float g0 = nAng + max(-acos(clamp(h0, -1.0, 1.0)) - nAng, -1.5707963);
+    float sn = sin(nAng), cs = cos(nAng);
+    vis += npl * 0.25 * ((-cos(2.0 * g0 - nAng) + cs + 2.0 * g0 * sn) + (-cos(2.0 * g1 - nAng) + cs + 2.0 * g1 * sn));
+    wsum += 1.0;
   }
-  float ao = max(0.0, 1.0 - uIntensity * R * 2.0 * sum / float(SAMPLES));
-  ao = max(ao, 0.3);              // (the composite weakens it on sunlit pixels, see FINAL_FRAG)
+  float ao = wsum > 0.0 ? clamp(vis / wsum, 0.0, 1.0) : 1.0;
+  ao = pow(ao, uIntensity);
+  // far away the depth buffer is too coarse (foliage, LOD dithering) for deep occlusion to be trusted: keep the
+  // soft grounding of buildings, never dark blotches
+  ao = max(ao, 0.7 * smoothstep(90.0, 320.0, z));
   ao = mix(ao, 1.0, smoothstep(uFadeStart, uFadeEnd, z));
   gl_FragColor = vec4(ao, z, 0.0, 1.0);
 }
@@ -161,6 +213,7 @@ uniform sampler2D tAO;
 uniform vec2 uHalfSize;         // AO texture size
 uniform float uAO;              // 0/1
 uniform float uAOStrength;
+uniform float uAOSun;           // how much less AO sunlit (bright) pixels get
 uniform float uBloom;           // 0/1
 uniform float uVignette;
 uniform float uDebug;           // 1 = show the AO buffer
@@ -191,7 +244,7 @@ void main() {
     // Screen-space AO darkens the whole pixel, but occlusion only concerns the ambient part of its light: pixels
     // bright enough to be in direct sun get less of it (no dark halos on sunlit ground next to a sunlit wall)
     float lum = dot(col, vec3(0.2126, 0.7152, 0.0722));
-    float k = uAOStrength * (1.0 - 0.55 * smoothstep(0.14, 0.6, lum));
+    float k = uAOStrength * (1.0 - uAOSun * smoothstep(0.14, 0.6, lum));
     float ao = d < 0.99999 ? mix(1.0, aoUpsample(linDepth(d)), k) : 1.0;
     col *= ao;
     if (uDebug > 0.5) col = vec3(ao * ao);
@@ -207,9 +260,9 @@ void main() {
   if (uGrade > 0.0) {
     vec3 c = gl_FragColor.rgb;
     float l = dot(c, vec3(0.2126, 0.7152, 0.0722));
-    c = max(mix(vec3(l), c, 1.0 + 0.1 * uGrade), 0.0);
+    c = max(mix(vec3(l), c, 1.0 + 0.12 * uGrade), 0.0);
     float hi = smoothstep(0.08, 0.7, l);
-    c *= mix(vec3(1.0) + uGrade * vec3(-0.018, -0.004, 0.03), vec3(1.0) + uGrade * vec3(0.025, 0.004, -0.03), hi);
+    c *= mix(vec3(1.0) + uGrade * vec3(-0.015, -0.002, 0.03), vec3(1.0) + uGrade * vec3(0.04, 0.012, -0.035), hi);
     gl_FragColor.rgb = c;
   }
   #include <colorspace_fragment>
@@ -229,14 +282,20 @@ class FinalPass extends Pass {
     this.aoA = new THREE.WebGLRenderTarget(1, 1, rtOpts);
     this.aoB = new THREE.WebGLRenderTarget(1, 1, rtOpts);
     this.aoA.texture.name = 'post.aoA'; this.aoB.texture.name = 'post.aoB';
+    this.linZ = new THREE.WebGLRenderTarget(1, 1, { type: THREE.FloatType, format: THREE.RedFormat, depthBuffer: false, minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter });
+    this.linZ.texture.name = 'post.linZ';
     const proj = { value: new THREE.Vector4() };
     this.proj = proj;
     const common = { depthTest: false, depthWrite: false, toneMapped: false };
+    this.downMat = new THREE.ShaderMaterial({
+      name: 'post.aoDepth', vertexShader: FS_VERT, fragmentShader: DOWN_FRAG, ...common,
+      uniforms: { tDepth: { value: null }, uProj: proj, uFullSize: { value: new THREE.Vector2(1, 1) } },
+    });
     this.aoMat = new THREE.ShaderMaterial({
       name: 'post.ao', vertexShader: FS_VERT, fragmentShader: AO_FRAG, ...common,
       uniforms: {
-        tDepth: { value: null }, uProj: proj, uInvFull: { value: new THREE.Vector2() },
-        uRadius: { value: 1.0 }, uIntensity: { value: 2.1 }, uFadeStart: { value: 420 }, uFadeEnd: { value: 1150 },
+        tLin: { value: this.linZ.texture }, uProj: proj, uInvFull: { value: new THREE.Vector2() },
+        uRadius: { value: 1.6 }, uIntensity: { value: 1.1 }, uFadeStart: { value: 420 }, uFadeEnd: { value: 1150 },
       },
     });
     this.blurMat = new THREE.ShaderMaterial({
@@ -248,7 +307,7 @@ class FinalPass extends Pass {
       depthTest: false, depthWrite: false, dithering: true,
       uniforms: {
         tDiffuse: { value: null }, tBloom: { value: null }, tAO: { value: this.aoA.texture }, tDepth: { value: null },
-        uProj: proj, uHalfSize: { value: this.halfSize }, uAO: { value: 1 }, uAOStrength: { value: 0.85 },
+        uProj: proj, uHalfSize: { value: this.halfSize }, uAO: { value: 1 }, uAOStrength: { value: 0.85 }, uAOSun: { value: 0.5 },
         uBloom: { value: 1 }, uVignette: { value: 0.22 }, uDebug: { value: 0 }, uGrade: { value: 1 },
       },
     });
@@ -256,9 +315,10 @@ class FinalPass extends Pass {
   }
   setSize(w, h) {
     const hw = Math.max(1, Math.round(w / 2)), hh = Math.max(1, Math.round(h / 2));
-    this.aoA.setSize(hw, hh); this.aoB.setSize(hw, hh);
+    this.aoA.setSize(hw, hh); this.aoB.setSize(hw, hh); this.linZ.setSize(hw, hh);
     this.halfSize.set(hw, hh);
-    this.aoMat.uniforms.uInvFull.value.set(1 / w, 1 / h);
+    this.aoMat.uniforms.uInvFull.value.set(1 / hw, 1 / hh);
+    this.downMat.uniforms.uFullSize.value.set(w, h);
   }
   render(renderer, writeBuffer, readBuffer) {
     const cam = this.camera;
@@ -267,7 +327,9 @@ class FinalPass extends Pass {
     const depth = readBuffer.depthTexture;
     const ao = this.aoEnabled && !!depth;
     if (ao) {
-      this.aoMat.uniforms.tDepth.value = depth;
+      this.downMat.uniforms.tDepth.value = depth;
+      this.quad.material = this.downMat;
+      renderer.setRenderTarget(this.linZ); this.quad.render(renderer);
       this.quad.material = this.aoMat;
       renderer.setRenderTarget(this.aoA); this.quad.render(renderer);
       this.quad.material = this.blurMat;
@@ -290,8 +352,8 @@ class FinalPass extends Pass {
     this.quad.render(renderer);
   }
   dispose() {
-    this.aoA.dispose(); this.aoB.dispose();
-    this.aoMat.dispose(); this.blurMat.dispose(); this.finalMat.dispose();
+    this.aoA.dispose(); this.aoB.dispose(); this.linZ.dispose();
+    this.downMat.dispose(); this.aoMat.dispose(); this.blurMat.dispose(); this.finalMat.dispose();
     this.quad.dispose();
   }
 }
@@ -335,7 +397,7 @@ export function createPost(renderer, scene, camera, { width, height, samples = 4
     // and the canvas), so engine.precompile() can compile them before the first frame.
     materials() {
       return {
-        offscreen: [bloom.materialHighPassFilter, ...bloom.separableBlurMaterials, bloom.compositeMaterial, final.aoMat, final.blurMat],
+        offscreen: [bloom.materialHighPassFilter, ...bloom.separableBlurMaterials, bloom.compositeMaterial, final.downMat, final.aoMat, final.blurMat],
         screen: [final.finalMat],
         target: composer.readBuffer,
       };
