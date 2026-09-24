@@ -290,10 +290,13 @@ export async function createStreetSigns(ctx) {
 
   // chunks near the camera only (signs are unreadable and sub-pixel further away)
   const show2 = SHOW_DIST * SHOW_DIST;
+  let lx = Infinity, ly = Infinity, lz = Infinity;
   ctx.onUpdate?.(() => {
     const cam = ctx.camera;
     if (!cam) return;
     const { x: cx, y: cy, z: cz } = cam.position;
+    if (Math.abs(cx - lx) + Math.abs(cy - ly) + Math.abs(cz - lz) < 2) return; // (only when the camera moved)
+    lx = cx; ly = cy; lz = cz;
     for (const c of list) {
       const dx = cx < c.x0 ? c.x0 - cx : cx > c.x1 ? cx - c.x1 : 0;
       const dz = cz < c.z0 ? c.z0 - cz : cz > c.z1 ? cz - c.z1 : 0;

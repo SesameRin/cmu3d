@@ -16,6 +16,7 @@ import { getLandMask, buildNetwork, edgePoint, M, mulberry32, composeMatrix, poi
 import { personGeometry, createPersonMaterial, createPersonDepthMaterial, randomOutfit, scottyGeometry, createDogMaterial, birdGeometry, createBirdMaterial } from './people.js';
 import { createCarMaterial, createVehicleMesh, randomPaint, CAR_DIMS } from './cars.js';
 import { createLightPoolMaterial } from './props.js';
+import { scheduleFinishWorld } from './warmup.js';
 
 // Rendered ground height; unlike ctx.heightAt it keeps following the terrain skirt beyond the data grid.
 const groundAt = (ctx, x, z) => (ctx.terrain?.meshHeightAt ? ctx.terrain.meshHeightAt(x, z) : ctx.heightAt(x, z));
@@ -573,6 +574,7 @@ export async function createLife(ctx) {
   // into view close by), so the crowd follows the viewer around the 4 km map instead of thinning out over it.
   const PED_KEEP = q.level === 'low' ? 260 : 380, PED_SPAWN = [45, q.level === 'low' ? 230 : 330];
   const recycle = [];
+  const P_ATTRS = [pAttr.shirt, pAttr.pants, pAttr.look, pAttr.anim]; // (per-frame upload ranges: no array literals in the loop)
   function respawnPed(i) {
     for (let tries = 0; tries < 14; tries++) {
       const a = rng() * Math.PI * 2, r = PED_SPAWN[0] + Math.sqrt(rng()) * (PED_SPAWN[1] - PED_SPAWN[0]);
@@ -647,7 +649,7 @@ export async function createLife(ctx) {
       pMesh.instanceMatrix.clearUpdateRanges(); pMesh.instanceMatrix.addUpdateRange(0, c * 16); pMesh.instanceMatrix.needsUpdate = true;
       if (pAttr.dirty) {
         pAttr.dirty = false;
-        for (const [a, sz] of [[pAttr.shirt, 3], [pAttr.pants, 3], [pAttr.look, 4], [pAttr.anim, 3]]) { a.clearUpdateRanges(); a.addUpdateRange(0, c * sz); a.needsUpdate = true; }
+        for (let k = 0; k < P_ATTRS.length; k++) { const a = P_ATTRS[k]; a.clearUpdateRanges(); a.addUpdateRange(0, c * a.itemSize); a.needsUpdate = true; }
       }
     }
   }
@@ -754,12 +756,14 @@ export async function createLife(ctx) {
     }
     cNE[i] = ne; cND[i] = rEdges[ne].a === node ? 1 : -1;
   }
+  const busCands = new Map();
   function spawnCar(i, awayFromCamera) {
     for (let tries = 0; tries < 30; tries++) {
       let ei;
       if (cBusName[i] >= 0) {
         const name = busNames[cBusName[i]];
-        const cands = carSpawnEdges.filter((k) => rEdges[k].line.name === name);
+        let cands = busCands.get(name); // (per line, made once: filtering every road edge per try was a 1–10 ms spike)
+        if (!cands) busCands.set(name, (cands = carSpawnEdges.filter((k) => rEdges[k].line.name === name)));
         if (!cands.length) { cBusName[i] = -1; continue; }
         ei = cands[Math.floor(rng() * cands.length)];
       } else {
@@ -1150,5 +1154,8 @@ export async function createLife(ctx) {
     // current simulated positions (for probes): [[x, z], ...]
     positions: () => ({ people: Array.from(pX, (x, i) => [x, pZ[i]]), cars: Array.from(cX, (x, i) => [x, cZ[i]]) }),
   };
+  // last world step: finish deferred refinements, merge shadow casters, warm-up (world/warmup.js — queued as a
+  // loading task when main.js offers ctx.addLoadTask, else right away)
+  try { await scheduleFinishWorld(ctx); } catch (e) { console.warn('[life] world warm-up failed', e); }
   return ctx.life;
 }

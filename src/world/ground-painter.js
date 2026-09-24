@@ -202,7 +202,16 @@ function makeCanvas(w, h) {
   c.width = w; c.height = h;
   return c;
 }
-const scratchCanvas = makeCanvas; // (low-resolution layers: one per use — drawImage() snapshots it anyway)
+// low-resolution layers: small ones (the near level's tiles, painted over and over at the same few sizes) reuse a
+// canvas per size (drawImage() snapshots it, so reusing it is safe); big ones (one-off far level) get their own
+const scratchCache = new Map();
+function scratchCanvas(w, h) {
+  if (w * h > 256 * 256) return makeCanvas(w, h);
+  const k = w * 4096 + h;
+  let c = scratchCache.get(k);
+  if (!c) { c = makeCanvas(w, h); scratchCache.set(k, c); }
+  return c;
+}
 
 // (no closePath(): fills close their subpaths anyway, and Chrome's Path2D.closePath() is O(subpaths) — a 10k-ring
 // building path took ~0.8 s to build with it; a line back to the start keeps it linear)
@@ -1702,6 +1711,7 @@ function trackLanes(a, add) {
  */
 export function paintRegion(g, mode, P, rect, cx, cz, ppm, opts = {}) {
   const S = makeSources();
+  P = localView(P, rect);
   const w = Math.round(rect.w * ppm), h = Math.round(rect.h * ppm);
   g.save();
   g.setTransform(1, 0, 0, 1, 0, 0);
@@ -1713,6 +1723,66 @@ export function paintRegion(g, mode, P, rect, cx, cz, ppm, opts = {}) {
   g.imageSmoothingQuality = 'high';
   paintAll(g, mode, ppm, P, S, { name: opts.name || 'region', markings: false, ...opts, minX: rect.minX, minZ: rect.minZ, w: rect.w, h: rect.h });
   g.restore();
+}
+
+// Spatial index over the prepared features (64 m cells), so painting a small region (a near-level tile) only
+// visits what lies around it instead of culling every area / way / building of the map (that culling was ~40 % of
+// a tile's drawing-call time). Items are registered with a 16 m margin (paintAll draws features within 12 m of the
+// rectangle; it still culls the candidates exactly) and returned in their original (painting) order.
+const LV_CELL = 64, LV_MARGIN = 16, LV_KEYS = ['areas', 'rails', 'paths', 'roads', 'bRings'];
+function buildIndex(P) {
+  const cellKey = (i, j) => i * 65536 + j;
+  const idx = { always: {}, cells: new Map() };
+  const put = (name, k, n) => {
+    let c = idx.cells.get(k);
+    if (!c) idx.cells.set(k, (c = {}));
+    (c[name] || (c[name] = [])).push(n);
+  };
+  for (const name of LV_KEYS) {
+    const list = P[name] || [];
+    idx.always[name] = [];
+    for (let n = 0; n < list.length; n++) {
+      const b = list[n]._bb;
+      if (!b) { idx.always[name].push(n); continue; }
+      const i0 = Math.floor((b[0] - LV_MARGIN) / LV_CELL), i1 = Math.floor((b[2] + LV_MARGIN) / LV_CELL);
+      const j0 = Math.floor((b[1] - LV_MARGIN) / LV_CELL), j1 = Math.floor((b[3] + LV_MARGIN) / LV_CELL);
+      if ((i1 - i0 + 1) * (j1 - j0 + 1) > 400) { idx.always[name].push(n); continue; } // huge: always a candidate
+      for (let i = i0; i <= i1; i++) for (let j = j0; j <= j1; j++) put(name, cellKey(i, j), n);
+    }
+  }
+  const trees = P.trees || [];
+  for (let n = 0; n < trees.length; n++) {
+    const [x, z] = trees[n];
+    const i0 = Math.floor((x - LV_MARGIN) / LV_CELL), i1 = Math.floor((x + LV_MARGIN) / LV_CELL);
+    const j0 = Math.floor((z - LV_MARGIN) / LV_CELL), j1 = Math.floor((z + LV_MARGIN) / LV_CELL);
+    for (let i = i0; i <= i1; i++) for (let j = j0; j <= j1; j++) put('trees', cellKey(i, j), n);
+  }
+  idx.cellKey = cellKey;
+  return idx;
+}
+const indexes = new WeakMap();
+function localView(P, rect) {
+  let idx = indexes.get(P);
+  if (!idx) { idx = buildIndex(P); indexes.set(P, idx); }
+  const i0 = Math.floor(rect.minX / LV_CELL), i1 = Math.floor((rect.minX + rect.w) / LV_CELL);
+  const j0 = Math.floor(rect.minZ / LV_CELL), j1 = Math.floor((rect.minZ + rect.h) / LV_CELL);
+  if ((i1 - i0 + 1) * (j1 - j0 + 1) > 64) return P; // big region: the plain lists are as fast
+  const out = Object.assign({}, P);
+  for (const name of [...LV_KEYS, 'trees']) {
+    const src = P[name];
+    if (!src) continue;
+    const seen = new Set(idx.always[name] || []);
+    for (let i = i0; i <= i1; i++) for (let j = j0; j <= j1; j++) {
+      const c = idx.cells.get(idx.cellKey(i, j));
+      const l = c && c[name];
+      if (l) for (const n of l) seen.add(n);
+    }
+    const ids = [...seen].sort((a, b) => a - b);
+    const arr = new Array(ids.length);
+    for (let k = 0; k < ids.length; k++) arr[k] = src[ids[k]];
+    out[name] = arr;
+  }
+  return out;
 }
 
 /** Road/path preparation without painting (for modules that need the same classification). */

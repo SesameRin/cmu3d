@@ -113,6 +113,14 @@ export async function createRoads(ctx) {
   await step('markings', () => createMarkingDecals(ctx));
   await step('curbs', () => createCurbs(ctx));
   await step('fieldArt', () => createFieldArt(ctx));
+  // medium / high: every marking / curb tile is built now, during loading (building them the first time the camera
+  // came near cost up to 6 ms per frame, for seconds after every flight, plus new GPU buffers); low (phones) keeps
+  // building them on demand
+  if (ctx.quality?.level !== 'low') await step('tilesEager', async () => {
+    let n = 0;
+    for (const set of lazySets.get(ctx) || []) n += await set.buildAll();
+    return n;
+  });
   ctx.roads = { bridges, deckHeightAt: bridges?.deckHeightAt || (() => null), surfaceAt: surface, waterLevelAt: (x, z) => waterLevelAt(ctx, x, z), stats };
   stats.totalMs = Math.round(performance.now() - T0);
   console.info('[roads]', JSON.stringify(stats));
@@ -389,6 +397,7 @@ function createCliffs(ctx) {
 // the far level's painted markings in over the last 100 m of that range (terrain.js MARK_RANGE). Car park stall
 // lines are found per lot when its first tile is built (ground-painter lotStalls).
 const TILE = 200;
+const lazySets = new WeakMap(); // ctx → [tile sets] (createRoads builds them all during loading)
 
 function createLazyTiles(ctx, name, { build, placeholder, range }) {
   const tiles = new Map();
@@ -404,6 +413,19 @@ function createLazyTiles(ctx, name, { build, placeholder, range }) {
   let lx = Infinity, lz = Infinity, ly = Infinity, pending = true;
   const api = {
     group, stats,
+    // build every tile now (yielding to the loading screen); returns the number of tiles built
+    async buildAll() {
+      let n = 0, tY = performance.now();
+      for (const t of tiles.values()) {
+        if (t.built) continue;
+        buildTile(t);
+        if (t.mesh) t.mesh.visible = false; // (the per-frame pass shows the ones in range)
+        n++;
+        if (performance.now() - tY > 60) { await ctx.yield?.(); tY = performance.now(); }
+      }
+      pending = true;
+      return n;
+    },
     // bucket a feature into every tile its bounding box touches
     add(x0, z0, x1, z1, item) {
       for (let i = Math.floor(x0 / TILE); i <= Math.floor(x1 / TILE); i++) {
@@ -433,6 +455,9 @@ function createLazyTiles(ctx, name, { build, placeholder, range }) {
     group.add(m);
     t.mesh = m;
   };
+  if (!lazySets.has(ctx)) lazySets.set(ctx, []);
+  lazySets.get(ctx).push(api);
+  const todo = [];
   ctx.onUpdate(() => {
     const cam = ctx.camera;
     if (!cam) return;
@@ -442,7 +467,7 @@ function createLazyTiles(ctx, name, { build, placeholder, range }) {
     lx = p.x; lz = p.z; ly = p.y;
     // high aerial views: the painted far level carries the markings
     const high = Math.max(0, p.y - hAt(p.x, p.z)) > range + 20;
-    const todo = [];
+    todo.length = 0;
     for (const t of tiles.values()) {
       const d = Math.hypot(t.cx - p.x, t.cz - p.z);
       if (!t.built) { if (!high && d < R + 100) todo.push([d, t]); continue; }

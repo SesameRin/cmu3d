@@ -245,10 +245,14 @@ export function createHud(ctx, { root, catalog, actions }) {
   }
   let fitT = 0;
   addEventListener('resize', () => { clearTimeout(fitT); fitT = setTimeout(fitTopBar, 120); });
-  // measured once the app is up (no forced layout during init), again when the web fonts arrive
+  // measured at the end of loading (prepare(): the first full layout of the HUD costs tens of ms — behind the loading
+  // screen, not in the first frames), again when the web fonts arrive later
+  let fitted = false;
+  function prepare() { fitTopBar(); fitted = true; }
   ctx.events?.on?.('app:ready', () => {
-    requestAnimationFrame(fitTopBar);
-    document.fonts?.ready?.then(() => requestAnimationFrame(fitTopBar)).catch(() => {});
+    if (!fitted) requestAnimationFrame(fitTopBar);
+    const f = document.fonts;
+    if (f?.ready && f.status !== 'loaded') f.ready.then(() => requestAnimationFrame(fitTopBar)).catch(() => {});
   });
 
   // ---------------------------------------------------------------- state sync
@@ -307,7 +311,7 @@ export function createHud(ctx, { root, catalog, actions }) {
 
   // ---------------------------------------------------------------- per-frame
   // The controls' touch joystick (walk / fly on touch screens) sits bottom-left: panels there make room for it.
-  let touchEl = null, joyOn = false;
+  let touchEl = null, joyOn = false, touchT = 1;
   let lastHeading = NaN;
   let locT = 0, dbgT = 0, frames = 0, fpsAcc = 0, fps = 0, worstDt = 0;
   let lastLoc = '';
@@ -328,7 +332,9 @@ export function createHud(ctx, { root, catalog, actions }) {
       if (ctx.nav?.busy) hintUntil = performance.now() + HINT_MS;   // the timer starts once the walk-to has landed
       else if (performance.now() > hintUntil) hideWalkHint(true);
     }
-    if (!touchEl || !touchEl.isConnected) touchEl = root.querySelector('.nav-touch');
+    // (looked up at most twice a second: a querySelector every frame on desktop, where it never exists)
+    touchT += dt;
+    if ((!touchEl || !touchEl.isConnected) && touchT > 0.5) { touchT = 0; touchEl = root.querySelector('.nav-touch'); }
     const joy = !!touchEl && touchEl.style.display !== 'none' && (m === 'walk' || m === 'fly');
     if (joy !== joyOn) { joyOn = joy; root.classList.toggle('joy-on', joy); }
     // location readout
@@ -367,6 +373,7 @@ export function createHud(ctx, { root, catalog, actions }) {
     showTime,
     setDebug,
     fitTopBar,
+    prepare,
   };
 }
 

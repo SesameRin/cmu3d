@@ -776,6 +776,7 @@ export async function createVegetation(ctx) {
     // re-partition after 12 m of movement or 12° of turning; at most ~12×/s while turning, 5×/s while moving
     if (dirty || (changed && elapsed - lastPart > (watch.moved(cam) ? 0.2 : 0.08))) {
       watch.mark(cam); shadowKey = sk; dirty = false; lastPart = elapsed;
+      ctx.partitionedAt = elapsed; // (props.js does its own re-partition in another frame)
       const tp = performance.now();
       partition();
       partitionMs = performance.now() - tp;

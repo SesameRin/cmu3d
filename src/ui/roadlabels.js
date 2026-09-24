@@ -175,7 +175,7 @@ function buildModel(data) {
         let bonus = 0;
         // Forbes Avenue at the head of the Cut (Forbes × Morewood) is the visitor's main street: prefer it
         if (road.name === 'Forbes Avenue' && Math.hypot(x - 0, z + 180) < 110) bonus = 4;
-        anchors.push({ id: anchors.length, road, chain: c, s, x, z, dx, dz, half, bonus, y: NaN, occ: -1, occT: -1e9 });
+        anchors.push({ id: anchors.length, road, chain: c, s, x, z, dx, dz, half, bonus, y: NaN, occ: -1, occT: -1e9, ocx: NaN, ocy: NaN, ocz: NaN });
       }
     }
   }
@@ -530,6 +530,7 @@ export function createRoadLabels(ctx, { root, labels, before = null }) {
   // -------------------------------------------------------------- per frame
   const MAJOR = 5;
   const isMajor = (road) => road.pri >= MAJOR;
+  const majorAnchors = model.anchors.filter((a) => isMajor(a.road)), minorAnchors = model.anchors.filter((a) => !isMajor(a.road));
   const cands = [];
   const placed = [];
   /** Screen placement + score of one anchor, or the reason it can't be shown right now. */
@@ -589,7 +590,8 @@ export function createRoadLabels(ctx, { root, labels, before = null }) {
     const limit = (W < 720 ? 6 : 12) - (major ? 0 : frame.majorN);
     cands.length = 0;
     if (limit > 0) {
-      for (const a of model.anchors) if (isMajor(a.road) === major && consider(a, cam, frame.walk) === null) cands.push(a);
+      const list = major ? majorAnchors : minorAnchors;
+      for (let i = 0; i < list.length; i++) if (consider(list[i], cam, frame.walk) === null) cands.push(list[i]);
     }
     cands.sort((p, q) => q.score - p.score);
     if (major) placed.length = 0;
@@ -612,12 +614,15 @@ export function createRoadLabels(ctx, { root, labels, before = null }) {
       if (a.compact && (m.wc === m.w || !cells(G, a.sx, a.sy, m.wc, m.h, a.ang, free))) continue;
       const w = a.compact ? m.wc : m.w;
       a.why = 'occluded';
-      // line of sight against buildings and hills (cached, a few fresh tests per pass)
-      if (clock - a.occT > OCC_TTL) {
+      // line of sight against buildings and hills (cached, a few fresh tests per pass; a result stays valid while
+      // the camera has not moved — the world is static)
+      const cp = cam.position;
+      if (clock - a.occT > OCC_TTL && Math.abs(cp.x - a.ocx) + Math.abs(cp.y - a.ocy) + Math.abs(cp.z - a.ocz) > 0.3) {
         if (occBudget <= 0) continue;
         occBudget--;
         a.occ = occluded(a, cam) ? 1 : 0;
         a.occT = clock;
+        a.ocx = cp.x; a.ocy = cp.y; a.ocz = cp.z;
       }
       if (a.occ === 1) continue;
       // reserve it right away so the next road names of this pass fit around it
@@ -672,7 +677,8 @@ export function createRoadLabels(ctx, { root, labels, before = null }) {
     if (!enabled) { if (states.size) hideAll(); frame.began = false; return; }
     clock += dt || 0;
     sinceSel += dt || 0;
-    if (!frame.began) {
+    // (labels.js skipped an idle frame — nothing moved: the last layout stands, only fades continue below)
+    if (!frame.began && !labels?.idle) {
       // labels.js didn't run its declutter pass this frame (no labels): lay out on an own grid
       const G = ownGrid();
       layout(G, 'mid');
@@ -720,6 +726,12 @@ export function createRoadLabels(ctx, { root, labels, before = null }) {
   return {
     layer,
     update,
+    /** Loading time: anchor heights, text sizes and the line-of-sight grid, instead of during the first passes. */
+    prepare() {
+      for (const a of model.anchors) if (Number.isNaN(a.y)) a.y = anchorY(ctx, a) + 0.8;
+      for (const road of model.roads) metaOf(road);
+      occluders();
+    },
     get enabled() { return enabled; },
     setEnabled(on) { enabled = !!on; layer.classList.toggle('off', !enabled); if (!enabled) hideAll(); },
     setMinPriority(p) { minPriority = Number.isFinite(p) ? p : -Infinity; },
@@ -757,9 +769,11 @@ const mmTmp = [0, 0];
 /**
  * Draws road names along the roads of the (north-up) minimap. g has the CSS-pixel transform set; the view maps world
  * (x, z) to X = cw/2 + (x − cx)/mpp, Y = ch/2 + (z − cz)/mpp. Positions are on a fixed world grid along each chain
- * (per zoom level) so names don't swim while the map pans.
+ * (per zoom level) so names don't swim while the map pans. The minimap renders a whole-map (or a larger-than-view)
+ * image once per zoom level and pans over it, so it asks for names more often along a road (`repeat`, px) to have
+ * each road named inside a small view.
  */
-export function drawMinimapRoadNames(g, data, { cx, cz, mpp, cw, ch, dpr = 1 }) {
+export function drawMinimapRoadNames(g, data, { cx, cz, mpp, cw, ch, dpr = 1, repeat = 280 }) {
   const model = roadModel(data);
   if (!model.roads.length) return 0;
   const minPri = mpp <= 1.3 ? 2 : mpp <= 2.3 ? 3 : mpp <= 3.5 ? 4 : mpp <= 5.6 ? 5 : 6;
@@ -810,7 +824,7 @@ export function drawMinimapRoadNames(g, data, { cx, cz, mpp, cw, ch, dpr = 1 }) 
     const text = road.zh || road.en;
     const gl = glyphs(g, text);
     const Lw = (gl.total + 4) * mpp;                         // metres of road the text needs
-    const spacing = Math.max(Lw * 3, 280 * mpp);
+    const spacing = Math.max(Lw * 3, repeat * mpp);     // (repeat: px between two names of a road)
     const placedHere = [];
     for (const c of road.chains) {
       const [bx0, bz0, bx1, bz1] = c.bbox;

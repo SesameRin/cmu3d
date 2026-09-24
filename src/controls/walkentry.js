@@ -288,5 +288,6 @@ export function createWalkEntry(ctx, world) {
     return { x: spot.x, z: spot.z, heading: ((heading % (2 * Math.PI)) + 2 * Math.PI) % (2 * Math.PI), pitch, open: false, footway: !!spot.footway };
   }
 
-  return { find, assess, viewFree };
+  // (the footway index, built at load time instead of on the first switch to walk mode)
+  return { find, assess, viewFree, prepare() { if (!footGrid) buildFootways(); } };
 }

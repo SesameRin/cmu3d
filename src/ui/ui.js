@@ -379,13 +379,29 @@ export function createUI(ctx) {
     picking: (dt) => picking.update(dt), minimap: (dt) => minimap.update(dt), tour: (dt) => tour.update(dt),
   };
   let pollT = 0, pokeT = 0, obsT = 1;
-  addEventListener('resize', () => { obsT = 1; });
+  // HUD panel rects (label declutter obstacles) are re-read — a forced style / layout pass of ~1–2 ms — only while
+  // they may be changing: for a while after a panel's class changes (open / close and their CSS transitions) or a
+  // resize, plus a slow safety poll. The labels' own class toggles don't count.
+  let obsHot = 1.5;
+  const heat = () => { obsHot = 1.2; };
+  addEventListener('resize', () => { obsT = 1; heat(); });
+  try {
+    new MutationObserver((list) => {
+      for (const m of list) {
+        const t = m.target;
+        if (t.closest?.('.lbl-layer, .rlbl-layer')) continue;
+        heat();
+        return;
+      }
+    }).observe(root, { attributes: true, attributeFilter: ['class', 'aria-hidden'], subtree: true });
+  } catch { obsHot = Infinity; }   // no MutationObserver: poll as before
   const perf = { ms: 0 };           // exponential moving average of the UI's own per-frame cost
   ctx.onUpdate((dt) => {
     const t0 = performance.now();
     // HUD rects for the label declutter: read first, before any component writes to the DOM this frame
     obsT += dt;
-    if (labels && obsT > 0.4) { obsT = 0; safe('obstacles', () => labels.sampleObstacles()); }
+    obsHot -= dt;
+    if (labels && obsT > (obsHot > 0 ? 0.2 : 2)) { obsT = 0; safe('obstacles', () => labels.sampleObstacles()); }
     if (lapseSelf && ctx.env?.setTime) {
       const hNow = (getHours() + dt * TIMELAPSE_HOURS_PER_SEC) % 24;
       safe('setTime', () => ctx.env.setTime(hNow));
@@ -463,6 +479,26 @@ export function createUI(ctx) {
 
   // ---------------------------------------------------------------- public API
   ctx.ui = {
+    // Loading time (main.js): everything the first minutes of exploring would otherwise build lazily — label boxes
+    // and line-of-sight grids, road-name anchors, the picking triangle grids. detail(text) updates the loading line.
+    async prepare(detail) {
+      safe('labels.prepare', () => labels?.prepare?.());
+      safe('roadLabels.prepare', () => roadLabels?.prepare?.());
+      safe('minimap.prepare', () => minimap?.prepare?.());
+      safe('hud.prepare', () => hud?.prepare?.());
+      // the info panel's first open (DOM build, cold code, catalogue lookups, layout) cost ~100 ms on the first click:
+      // one open / close behind the loading screen (no events, no camera move)
+      safe('info warm-up', () => {
+        const rec = catalog.records.find((r) => r.kind === 'landmark' && r.position) || catalog.records[0];
+        if (!info || !rec || info.isOpen) return;
+        info.show(rec);
+        void info.el.offsetHeight;
+        info.hide(true);
+      });
+      detail?.('拾取网格');
+      try { await picking?.prepare?.(() => ctx.yield()); } catch (e) { console.warn('[ui] pick grids failed', e); }
+      detail?.('');
+    },
     showInfo(entry) { return select(entry); },
     hideInfo: () => deselect(),
     toast: (msg, opts) => toast(msg, opts),

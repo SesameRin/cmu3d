@@ -918,7 +918,9 @@ export async function createProps(ctx) {
       let sk = 0;
       if (shadows && sun?.castShadow) { const e = sun.shadow.camera.matrixWorldInverse.elements; sk = e[12] + e[13] * 1.3 + e[14] * 0.7 + sun.shadow.camera.right; }
       const changed = watch.changed(cam) || Math.abs(sk - shadowKey) > 8;
-      if (dirty || (changed && elapsed - lastPart > (watch.moved(cam) ? 0.2 : 0.08))) {
+      // (never in the same frame as the trees' re-partition: both follow the camera at the same rate, and the two
+      // together made a periodic 3–4 ms spike)
+      if ((dirty || (changed && elapsed - lastPart > (watch.moved(cam) ? 0.2 : 0.08))) && ctx.partitionedAt !== elapsed) {
         watch.mark(cam); shadowKey = sk; dirty = false; lastPart = elapsed;
         partitionSets();
       }

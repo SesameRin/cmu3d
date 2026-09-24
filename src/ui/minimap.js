@@ -45,10 +45,30 @@ export function createMinimap(ctx, { root, catalog, getSelected, toast }) {
   let level = 3;
   let collapsed = storage.get('cmu3d.minimap') === 'off' || (storage.get('cmu3d.minimap') === null && isNarrow());
   let large = false;
-  let last = '';
   let roadNamesFailed = false;
   let cw = 0, ch = 0, dpr = 1;
   const view = { cx: 0, cz: 0, mpp: LEVELS[level] };
+  // Redrawing the minimap every frame (scaling the whole-map image, laying out and stroking the road names glyph by
+  // glyph) cost ~1 ms of main thread per frame and a lot of raster work in the GPU process, which also draws the 3D
+  // view. Now:
+  //  · the map itself (footprints / roads / greens) is pre-rendered at the zoom level's scale — for the overview
+  //    levels the WHOLE map in one modest image (built at load time for the default level, on first use for the
+  //    others), for the close-up levels a buffer larger than the view that is re-rendered when the view leaves it —
+  //    and a frame only blits the view's window of it 1:1;
+  //  · the road names are laid out for the view exactly as before, into an overlay that slides with the map and is
+  //    laid out again at most ~6 times a second while the view moves and as soon as it stops;
+  //  · a frame is drawn only when something changed, at most ~30 times a second.
+  const WHOLE_MAX = 2600;          // device px: largest side of a whole-map level image
+  const levelImgs = new Map();     // level → { c, x0, z0, mpp, dpr, w, h } covering the whole map
+  const buf = { c: document.createElement('canvas'), x0: 0, z0: 0, mpp: 0, dpr: 0, w: 0, h: 0, valid: false };
+  const names = { c: document.createElement('canvas'), cx: NaN, cz: NaN, mpp: 0, cw: 0, ch: 0, dpr: 0, t: -1e9 };
+  const NAMES_MS = 160;
+  let lmRecs = null, lmN = -1;     // the catalogue's landmark records (dots)
+  let prevFx = NaN, prevFz = NaN;
+  const lastSig = new Float64Array(10).fill(NaN);
+  let lastDraw = -1e9;
+  const DRAW_MS = 32;
+  let dirty = true;
 
   function applyState() {
     el.classList.toggle('collapsed', collapsed);
@@ -56,7 +76,7 @@ export function createMinimap(ctx, { root, catalog, getSelected, toast }) {
     el.classList.toggle('large', large);
     el.setAttribute('aria-hidden', collapsed ? 'true' : 'false');
     root.classList.toggle('mm-open', !collapsed);
-    last = '';
+    dirty = true;
   }
   applyState();
 
@@ -67,14 +87,15 @@ export function createMinimap(ctx, { root, catalog, getSelected, toast }) {
     ch = Math.max(1, Math.round(r.height));
     canvas.width = Math.round(cw * dpr);
     canvas.height = Math.round(ch * dpr);
-    last = '';
+    buf.valid = false;
+    dirty = true;
   }
 
   function setLevel(i) {
     level = clamp(i, 0, LEVELS.length - 1);
     zin.disabled = level === 0;
     zout.disabled = level === LEVELS.length - 1;
-    last = '';
+    dirty = true;
   }
   setLevel(level);
 
@@ -132,9 +153,9 @@ export function createMinimap(ctx, { root, catalog, getSelected, toast }) {
     if (collapsed || !ctx.camera) return;
     if (!cw) resize();
     const cam = ctx.camera.position;
-    const mode = navMode(ctx);
     let fx = cam.x, fz = cam.z;
-    if (mode === 'orbit') { const st = viewState(ctx); fx = st.target[0]; fz = st.target[2]; }
+    const ot = ctx.nav && 'orbitTarget' in ctx.nav ? ctx.nav.orbitTarget : null;
+    if (ot) { fx = ot.x; fz = ot.z; } else if (navMode(ctx) === 'orbit') { const st = viewState(ctx); fx = st.target[0]; fz = st.target[2]; }
     if (!Number.isFinite(fx + fz + cam.x + cam.z)) return;       // broken camera: skip this frame
     const mpp = LEVELS[level];
     // keep the window inside the data (with some slack)
@@ -144,42 +165,114 @@ export function createMinimap(ctx, { root, catalog, getSelected, toast }) {
     const heading = cameraHeading(ctx.camera);
     if (!Number.isFinite(heading)) return;
     const sel = getSelected?.();
-    const pulse = sel ? Math.floor(performance.now() / 50) : 0;
-    const sig = `${fx.toFixed(1)}|${fz.toFixed(1)}|${cam.x.toFixed(1)}|${cam.z.toFixed(1)}|${heading.toFixed(3)}|${mpp}|${cw}|${ch}|${sel?.key || ''}|${pulse}`;
-    if (sig === last) return;
-    last = sig;
-    view.cx = fx; view.cz = fz; view.mpp = mpp;
-    draw(cam, heading, sel);
+    const now = performance.now();
+    const pulse = sel ? Math.floor(now / 50) : 0;
+    // redraw only when something visible changed (0.1 m of the view / camera, 0.001 rad of heading), <= ~30 Hz
+    const L = lastSig;
+    const changed = dirty || names.cx !== view.cx || names.cz !== view.cz || Math.abs(fx - L[0]) > 0.1 || Math.abs(fz - L[1]) > 0.1 || Math.abs(cam.x - L[2]) > 0.1 ||
+      Math.abs(cam.z - L[3]) > 0.1 || Math.abs(heading - L[4]) > 0.001 || mpp !== L[5] || cw !== L[6] || ch !== L[7] ||
+      pulse !== L[8] || (sel ? 1 : 0) !== L[9];
+    if (!changed || now - lastDraw < DRAW_MS) return;
+    lastDraw = now; dirty = false;
+    L[0] = fx; L[1] = fz; L[2] = cam.x; L[3] = cam.z; L[4] = heading; L[5] = mpp; L[6] = cw; L[7] = ch; L[8] = pulse; L[9] = sel ? 1 : 0;
+    draw(cam, heading, sel, fx, fz, mpp);
   }
 
-  function draw(cam, heading, sel) {
-    const g = canvas.getContext('2d');
+  // Paint the map (scaled whole-map image, road names, landmark dots) into image `img` whose top-left corner is at
+  // world (x0, z0), w × h CSS px at metres-per-px mpp and device ratio d.
+  function paintMap(img, x0, z0, w, h, mpp, d) {
+    const W = Math.round(w * d), H = Math.round(h * d);
+    const c = img.c;
+    if (c.width !== W || c.height !== H) { c.width = W; c.height = H; }
+    const g = c.getContext('2d');
     g.setTransform(1, 0, 0, 1, 0, 0);
     g.fillStyle = COLORS.bg;
-    g.fillRect(0, 0, canvas.width, canvas.height);
-    const { cx, cz, mpp } = view;
-    const sw = cw * mpp * S, sh = ch * mpp * S;
-    const sx = (cx - (cw * mpp) / 2 - b.minX) * S, sy = (cz - (ch * mpp) / 2 - b.minZ) * S;
+    g.fillRect(0, 0, W, H);
+    const sw = w * mpp * S, sh = h * mpp * S;
+    const sx = (x0 - b.minX) * S, sy = (z0 - b.minZ) * S;
     g.imageSmoothingEnabled = true;
     g.imageSmoothingQuality = 'high';
     // clip the source rect to the image to avoid browser differences
     const cx0 = Math.max(0, sx), cy0 = Math.max(0, sy), cx1 = Math.min(off.width, sx + sw), cy1 = Math.min(off.height, sy + sh);
     if (cx1 > cx0 && cy1 > cy0) {
-      const kx = canvas.width / sw, ky = canvas.height / sh;
+      const kx = W / sw, ky = H / sh;
       g.drawImage(off, cx0, cy0, cx1 - cx0, cy1 - cy0, (cx0 - sx) * kx, (cy0 - sy) * ky, (cx1 - cx0) * kx, (cy1 - cy0) * ky);
+    }
+    Object.assign(img, { x0, z0, mpp, dpr: d, w, h });
+  }
+  // Road names for the view centred on (cx, cz) (same layout as ever: fitted to this view), into the overlay.
+  function layoutNames(cx, cz, mpp) {
+    const W = canvas.width, H = canvas.height;
+    const c = names.c;
+    if (c.width !== W || c.height !== H) { c.width = W; c.height = H; }
+    const g = c.getContext('2d');
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    g.clearRect(0, 0, W, H);
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    try { drawMinimapRoadNames(g, data, { cx, cz, mpp, cw, ch, dpr }); } catch (err) { if (!roadNamesFailed) { roadNamesFailed = true; console.warn('[ui] minimap road names failed', err); } }
+    Object.assign(names, { cx, cz, mpp, cw, ch, dpr, t: performance.now() });
+  }
+  const PAD = 80;                  // m of dark margin around the data in a whole-map image
+  const wholeFits = (lv) => Math.max(b.maxX - b.minX, b.maxZ - b.minZ) + 2 * PAD <= (WHOLE_MAX / Math.max(1, dpr)) * LEVELS[lv];
+  // The whole-map image of a level (built once per level and device ratio), or null for the close-up levels.
+  function wholeImage(lv) {
+    if (!wholeFits(lv)) return null;
+    let img = levelImgs.get(lv);
+    if (img && img.dpr === dpr) return img;
+    const mpp = LEVELS[lv];
+    img = img || { c: document.createElement('canvas') };
+    paintMap(img, b.minX - PAD, b.minZ - PAD, Math.ceil((b.maxX - b.minX + 2 * PAD) / mpp), Math.ceil((b.maxZ - b.minZ + 2 * PAD) / mpp), mpp, dpr);
+    levelImgs.set(lv, img);
+    return img;
+  }
+  // The close-up buffer: (re-)centred on (fx, fz) when the view gets near its edge.
+  function bufferImage(fx, fz, mpp) {
+    const B = buf;
+    const m = Math.round(Math.max(cw, ch) * 0.5);            // margin (CSS px) on every side of the view
+    const w = cw + 2 * m, h = ch + 2 * m;
+    const inside = B.valid && B.mpp === mpp && B.dpr === dpr && B.w === w && B.h === h &&
+      Math.abs(fx - (B.x0 + (w / 2) * mpp)) / mpp < m * 0.8 && Math.abs(fz - (B.z0 + (h / 2) * mpp)) / mpp < m * 0.8;
+    if (!inside) { paintMap(B, fx - (w / 2) * mpp, fz - (h / 2) * mpp, w, h, mpp, dpr); B.valid = true; }
+    return B;
+  }
+
+  function draw(cam, heading, sel, fx, fz, mpp) {
+    const img = wholeImage(level) || bufferImage(fx, fz, mpp);
+    const settled = fx === prevFx && fz === prevFz;
+    prevFx = fx; prevFz = fz;
+    // blit the view's window of the image at a whole device pixel (crisp, no resampling); the view centre follows
+    // that snap. Beyond the image (a view larger than the map) the background shows.
+    const ox = Math.round(((fx - img.x0) / mpp - cw / 2) * dpr), oy = Math.round(((fz - img.z0) / mpp - ch / 2) * dpr);
+    const cx = img.x0 + (ox / dpr + cw / 2) * mpp, cz = img.z0 + (oy / dpr + ch / 2) * mpp;
+    view.cx = cx; view.cz = cz; view.mpp = mpp;
+    const g = canvas.getContext('2d');
+    g.setTransform(1, 0, 0, 1, 0, 0);
+    const W = canvas.width, H = canvas.height;
+    const sx0 = Math.max(0, ox), sy0 = Math.max(0, oy), sx1 = Math.min(img.c.width, ox + W), sy1 = Math.min(img.c.height, oy + H);
+    if (sx0 > ox || sy0 > oy || sx1 < ox + W || sy1 < oy + H) { g.fillStyle = COLORS.bg; g.fillRect(0, 0, W, H); }
+    if (sx1 > sx0 && sy1 > sy0) {
+      g.imageSmoothingEnabled = false;
+      g.drawImage(img.c, sx0, sy0, sx1 - sx0, sy1 - sy0, sx0 - ox, sy0 - oy, sx1 - sx0, sy1 - sy0);
+      g.imageSmoothingEnabled = true;
+    }
+    // road names: laid out again for this view when it settled / after NAMES_MS, else slid along with the map
+    const N = names;
+    if (N.mpp !== mpp || N.cw !== cw || N.ch !== ch || N.dpr !== dpr ||
+        ((N.cx !== cx || N.cz !== cz) && (settled || performance.now() - N.t >= NAMES_MS))) layoutNames(cx, cz, mpp);
+    const nx = Math.round(((N.cx - cx) / mpp) * dpr), nz = Math.round(((N.cz - cz) / mpp) * dpr);
+    if (Math.abs(nx) < W && Math.abs(nz) < H) {
+      g.imageSmoothingEnabled = false;
+      g.drawImage(N.c, nx, nz);
+      g.imageSmoothingEnabled = true;
     }
     g.setTransform(dpr, 0, 0, dpr, 0, 0);
     const X = (x) => cw / 2 + (x - cx) / mpp;
     const Z = (z) => ch / 2 + (z - cz) / mpp;
 
-    // road names along the streets
-    try { drawMinimapRoadNames(g, data, { cx, cz, mpp, cw, ch, dpr }); } catch (err) { if (!roadNamesFailed) { roadNamesFailed = true; console.warn('[ui] minimap road names failed', err); } }
-    g.setTransform(dpr, 0, 0, dpr, 0, 0);
-
     // landmarks
     if (catalog) {
-      for (const r of catalog.records) {
-        if (r.kind !== 'landmark' || !r.position) continue;
+      if (!lmRecs || lmN !== catalog.records.length) { lmN = catalog.records.length; lmRecs = catalog.records.filter((r) => r.kind === 'landmark' && r.position); }
+      for (const r of lmRecs) {
         const x = X(r.position[0]), y = Z(r.position[2]);
         if (x < -5 || y < -5 || x > cw + 5 || y > ch + 5) continue;
         g.beginPath(); g.arc(x, y, 3.2, 0, Math.PI * 2);
@@ -188,6 +281,7 @@ export function createMinimap(ctx, { root, catalog, getSelected, toast }) {
         g.fillStyle = '#c41230'; g.fill();
       }
     }
+
     // selection pulse
     if (sel?.position) {
       const x = X(sel.position[0]), y = Z(sel.position[2]);
@@ -215,13 +309,16 @@ export function createMinimap(ctx, { root, catalog, getSelected, toast }) {
     g.fillStyle = '#ffffff'; g.shadowColor = 'rgba(0,0,0,0.6)'; g.shadowBlur = 4; g.fill();
     g.shadowBlur = 0; g.strokeStyle = '#c41230'; g.lineWidth = 1.4; g.stroke();
     g.restore();
-    scaleLabel();
+    if (mpp !== scaleMpp) { scaleMpp = mpp; scaleLabel(); }
   }
+  let scaleMpp = 0;
 
   addEventListener('resize', () => requestAnimationFrame(resize));
 
   return {
     el, update, toggle,
+    /** Loading time: the whole-map images of the overview zoom levels, not on the first draw / zoom click. */
+    prepare() { if (!cw) resize(); for (let lv = 0; lv < LEVELS.length; lv++) wholeImage(lv); },
     get collapsed() { return collapsed; },
     goTo,
   };

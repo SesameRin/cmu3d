@@ -339,3 +339,22 @@ export function terrainHitDistance(ctx, ray, maxT) {
   }
   return Infinity;
 }
+
+/**
+ * Loading time: build every pick mesh's triangle grid now (hover / click then never falls back to three's raycast
+ * or builds a grid mid-exploration). `pause` (e.g. ctx.yield) is awaited between meshes so the loading screen stays
+ * alive. Returns the number of grids built.
+ */
+export async function buildPickGrids(ctx, pause = null) {
+  let n = 0;
+  for (const { meshes } of flatten(ctx).roots) {
+    for (const m of meshes) {
+      let st;
+      try { st = gridState(m); } catch { st = false; }
+      if (st !== undefined) continue;
+      try { gridFor(m); n++; } catch { /* that mesh keeps using three's raycast */ }
+      if (pause) await pause();
+    }
+  }
+  return n;
+}

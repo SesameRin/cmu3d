@@ -1306,6 +1306,7 @@ export async function createBuildings(ctx) {
       meshes.push(mesh);
       c.meshes.push(mesh);
       if (tag === 'base') triCount += buf.triangles; else detailTris += buf.triangles;
+      if (tag !== 'base') mesh.userData.noShadowProxy = true; // (castShadow / visible change with distance)
       ctx.pick?.add(mesh, resolver);
     }
     c.bufs = null;
@@ -1364,7 +1365,7 @@ export async function createBuildings(ctx) {
     const dx = Math.max(c.x0 - p.x, 0, p.x - c.x0 - c.size), dz = Math.max(c.z0 - p.z, 0, p.z - c.z0 - c.size);
     return Math.hypot(dx, dz, Math.max(0, p.y - 60));
   };
-  const LOD = lowQ ? { show: 480, build: 520, urgent: 260, init: 300 } : { show: 720, build: 780, urgent: 380, init: 420 };
+  const LOD = lowQ ? { show: 480 } : { show: 720 };
   // start view: a ?cam= link, else the home view over the campus
   const start = (() => {
     try {
@@ -1373,56 +1374,48 @@ export async function createBuildings(ctx) {
     } catch { /* no location */ }
     return { x: -120, y: 60, z: 70 };
   })();
+  // Every detail chunk is built now, during loading (nearest the start view first, yielding so the loading screen
+  // stays alive). Building them lazily while exploring cost 4–12 ms per frame for seconds after every flight, plus
+  // a shadow-map refresh and new GPU buffers per chunk; the extra loading time is ~1 s.
   const T4 = performance.now();
-  for (const dc of detailList.map((c) => [chunkDist(c, start), c]).sort((a, b) => a[0] - b[0])) {
-    if (dc[0] > LOD.init) break; // (the rest follows lazily during the first frames)
-    stepDetail(dc[1], Infinity);
-    if (performance.now() - T4 > 150) { await ctx.yield?.(); }
+  let tY = T4;
+  const order = detailList.map((c) => [chunkDist(c, start), c]).sort((a, b) => a[0] - b[0]);
+  for (let k = 0; k < order.length; k++) {
+    stepDetail(order[k][1], Infinity);
+    if (performance.now() - tY > 60) {
+      ctx.loading?.detail?.(`建筑细节 ${k + 1} / ${order.length}`);
+      await ctx.yield?.();
+      tY = performance.now();
+    }
   }
+  // shop-sign lettering (was painted a few ms per frame after start-up, then uploaded in one go while exploring)
+  if (!sg.done) sg.step(Infinity);
   const T5 = performance.now();
   const initChunks = detailBuilt, initDetailMs = Math.round(detailMs);
 
   // ---- per-frame LOD: base chunks within drawDistance; detail + signs by distance (the detail's small shadows
-  // only near the camera); lazy detail builds, nearest first, within a per-frame time budget — a bigger one for
-  // chunks already close to the camera (after a teleport / fast flight), so they catch up within a few frames
-  // instead of one long stall. In ?shot mode the close ones are built at once.
+  // only near the camera). Only visibility flags change here — nothing is built, uploaded or allocated — and only
+  // when the camera has moved.
   const baseList = [...baseChunks.values()].filter((c) => c.meshes.length);
-  const budgetMs = ctx.shotMode ? 40 : 4, urgentMs = ctx.shotMode ? Infinity : 12;
-  const pending = [];
+  let lx = Infinity, ly = Infinity, lz = Infinity;
   ctx.onUpdate?.(() => {
     const cam = ctx.camera;
     if (!cam) return;
     const p = cam.position;
+    if (Math.abs(p.x - lx) + Math.abs(p.y - ly) + Math.abs(p.z - lz) < 2) return;
+    lx = p.x; ly = p.y; lz = p.z;
     const far = ctx.quality?.drawDistance || 3200;
     for (const c of baseList) {
       const vis = chunkDist(c, p) < far;
       for (const m of c.meshes) m.visible = vis;
     }
-    pending.length = 0;
     for (const c of detailList) {
       const d = chunkDist(c, p);
-      c.d = d;
-      if (!c.done) { if (d < LOD.build) pending.push(c); continue; }
       const vis = d < LOD.show, cast = d < 420;
       for (const m of c.meshes) { m.visible = vis; m.castShadow = cast; } // (picked up by the next periodic shadow update)
       if (c.signFar) c.signFar.visible = d < SIGN_FAR;
       if (c.signNear) c.signNear.visible = d < DETAIL_NEAR;
     }
-    if (pending.length) {
-      pending.sort((a, b) => a.d - b.d);
-      const t0 = performance.now(), deadline = t0 + budgetMs, urgentDeadline = t0 + urgentMs;
-      for (const c of pending) {
-        if (c.d < LOD.urgent && performance.now() < urgentDeadline) stepDetail(c, urgentDeadline);
-        else if (performance.now() < deadline) stepDetail(c, deadline);
-        else break;
-        const vis = c.done && c.d < LOD.show;
-        for (const m of c.meshes) m.visible = vis;
-        if (c.signFar) c.signFar.visible = c.d < SIGN_FAR;
-        if (c.signNear) c.signNear.visible = c.d < DETAIL_NEAR;
-      }
-    }
-    if (shadowDirty) { shadowDirty = false; ctx.env?.refreshShadows?.(); }
-    if (!sg.done) sg.step(ctx.shotMode ? 60 : 6); // shop-sign lettering, painted after start-up
   }, 11);
 
   // ---- labels (one per distinct name)

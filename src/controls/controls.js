@@ -120,11 +120,19 @@ function createWorld(ctx) {
 
   // Top of the tallest solid collider at (x, z) — or within `margin` metres of it — whose vertical span
   // contains y (or y is just above it). Used to keep cameras out of buildings.
+  // (called every frame by the orbit camera: a reused result list, no allocation)
+  const nearShapes = [];
+  const shapesNear = (x, z, r) => {
+    nearShapes.length = 0;
+    if (colliders?.queryInto) return colliders.queryInto(x, z, r, nearShapes);
+    return colliders?.query?.(x, z, r) || nearShapes;
+  };
   function roofAbove(x, z, y, margin = 0) {
-    const list = colliders?.query?.(x, z, 0.25 + margin);
-    if (!list || !list.length) return null;
+    const list = shapesNear(x, z, 0.25 + margin);
+    if (!list.length) return null;
     let top = null;
-    for (const s of list) {
+    for (let i = 0; i < list.length; i++) {
+      const s = list[i];
       if (!Number.isFinite(s.yMax)) continue;
       if (y < (Number.isFinite(s.yMin) ? s.yMin : -1e9) - 1 || y > s.yMax + 2.5) continue;
       if (top !== null && s.yMax <= top) continue;
@@ -137,8 +145,9 @@ function createWorld(ctx) {
   // Highest thing (terrain or collider top) at (x, z) — used to lift flight arcs.
   function obstacleTop(x, z) {
     let top = heightAt(x, z);
-    const list = colliders?.query?.(x, z, 3);
-    if (list) for (const s of list) {
+    const list = shapesNear(x, z, 3);
+    for (let i = 0; i < list.length; i++) {
+      const s = list[i];
       if (Number.isFinite(s.yMax) && s.yMax > top && s.yMax < top + 400) top = s.yMax;
     }
     return top;
@@ -963,6 +972,14 @@ export function createControls(ctx) {
     get flySpeed() { return fly.speed; },
     set flySpeed(v) { fly.speed = v; },
     pickPoint: (x, y) => { const p = pickPoint(x, y, new THREE.Vector3()); return p ? [p.x, p.y, p.z] : null; },
+    // What getState().target is in orbit mode (the orbit target, or the look point of a flight that ends in orbit),
+    // as a live Vector3 — null in walk / fly. Allocation-free, for per-frame readers (env shadows, minimap).
+    get orbitTarget() { return mode !== 'orbit' ? null : flight.active ? fLook : orbit.cur.target; },
+    // Loading-time preparation (main.js, behind the loading screen): the lazy lookups the first camera moves need.
+    prepare() {
+      try { world.warm(); } catch (err) { console.warn('[controls] terrain index failed', err); }
+      try { walkEntry.prepare?.(); } catch (err) { console.warn('[controls] walk-entry index failed', err); }
+    },
   };
   ctx.nav = nav;
 
@@ -978,6 +995,7 @@ export function createControls(ctx) {
   }, -10);
   nav.stats = stats;
 
+  const orbitOpts = { idle: 0 };
   function update(dt) {
     if (flight.active) {
       flight.step(dt, fPos, fLook);
@@ -1000,8 +1018,8 @@ export function createControls(ctx) {
       }
       if (input.turn) orbit.rotateBy(input.turn * 1.3 * dt);
       const idleMs = performance.now() - lastInput;
-      const idle = !shot && !document.hidden && idleMs > IDLE_MS ? clamp((idleMs - IDLE_MS) / 5000, 0, 1) : 0;
-      orbit.update(dt, { idle });
+      orbitOpts.idle = !shot && !document.hidden && idleMs > IDLE_MS ? clamp((idleMs - IDLE_MS) / 5000, 0, 1) : 0;
+      orbit.update(dt, orbitOpts);
       focus.copy(orbit.cur.target);
     } else if (mode === 'walk') {
       walk.update(dt, input);

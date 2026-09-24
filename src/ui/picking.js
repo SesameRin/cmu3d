@@ -5,7 +5,7 @@
 import * as THREE from 'three';
 import { h, escapeHtml } from './dom.js';
 import { icon } from './icons.js';
-import { firstPickHit, terrainHitDistance, warmPickGrids, gridStats, pickGridQueue } from './raycast.js';
+import { firstPickHit, terrainHitDistance, warmPickGrids, buildPickGrids, gridStats, pickGridQueue } from './raycast.js';
 
 const HOVER_INTERVAL = 0.09;   // s between hover raycasts
 const REST = 0.06;             // s the pointer must rest before a hover raycast
@@ -158,7 +158,8 @@ export function createPicking(ctx, { root, catalog, labels, onHover, onSelect, i
     canvas.addEventListener('pointerup', onUp);
     canvas.addEventListener('pointerleave', onLeave);
   }
-  // Picking acceleration structures are built in idle time once the app is up.
+  // Picking acceleration structures are built at load time (prepare(), called by ui.prepare from main.js); anything
+  // added later is queued for idle time once the app is up.
   ctx.events?.on?.('app:ready', () => setTimeout(() => { try { warmPickGrids(ctx); } catch { /* ignore */ } }, 2500));
   // Pointer lock moves aren't reported as pointer position changes; keep picking the centre.
   document.addEventListener('pointerlockchange', () => { moved = true; setHover(null); });
@@ -193,6 +194,7 @@ export function createPicking(ctx, { root, catalog, labels, onHover, onSelect, i
 
   return {
     update,
+    prepare: (pause) => buildPickGrids(ctx, pause),
     pickAt,
     clear: () => setHover(null),
     gridStats,

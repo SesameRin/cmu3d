@@ -153,6 +153,21 @@ export function makeLOD(coarse, far) {
   return lod;
 }
 
+// Finish every queued refinement now (during loading: world/warmup.js calls this once all landmarks are built),
+// yielding to the loading screen between slices. On medium / high the detailed versions are then complete before
+// the first frame — refining them in idle slices / on approach while exploring meant 10–30 ms hitches.
+export async function flushRefine(ctx, sliceMs = 50) {
+  const q = queues.get(ctx);
+  if (!q) return 0;
+  let n = 0;
+  while (q.jobs.length) {
+    const job = q.jobs[0];
+    if (runJob(ctx, q, job, sliceMs)) n++;
+    await ctx.yield?.();
+  }
+  return n;
+}
+
 export function deferRefine(ctx, job) {
   const q = refineQueue(ctx);
   q.jobs.push({ ...job, it: null, cpu: 0, maxStep: 0, maxStepAt: 0, steps_: 0, slices: 0 });

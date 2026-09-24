@@ -13,7 +13,7 @@ const CELL = 12;                 // declutter grid cell (px)
 const DEFAULT_MAX = { landmark: 4200, building: 650, buildingMajor: 1150, area: 1000, poi: 320, road: 500 };
 const WALK_MAX = 260;            // non-landmark labels at eye level: only what is around you
 const FLIP_MIN = 10, FLIP_MAX = 110;   // px: stem length range of a landmark label hung below its anchor
-const OBSTACLE_TTL = 0.6;        // s: HUD rects are re-read by the UI (sampleObstacles) — fallback poll interval
+const OBSTACLE_TTL = 2.5;        // s: HUD rects are re-read by the UI (sampleObstacles, when panels change) — fallback poll
 const OCC_TTL = 0.5;             // s a line-of-sight result stays valid
 const OCC_PER_FRAME = 8;         // line-of-sight tests per frame
 const OCC_GRID = 24;             // m, spatial grid for the occluder footprints
@@ -77,9 +77,14 @@ export function createLabels(ctx, { root, catalog, onSelect, obstacles }) {
   // a layout; update() only falls back to polling when nobody sampled for a while.
   let obstacleRects = [];
   let obstacleT = 1e9;
+  let obstaclesMoved = true;     // the rects changed since the last declutter pass
+  const sameRects = (a, b) => a.length === b.length && a.every((r, i) => r.left === b[i].left && r.top === b[i].top && r.right === b[i].right && r.bottom === b[i].bottom);
   function sampleObstacles() {
     obstacleT = 0;
-    try { obstacleRects = (obstacles && obstacles()) || []; } catch { obstacleRects = []; }
+    let next;
+    try { next = (obstacles && obstacles()) || []; } catch { next = []; }
+    if (!sameRects(next, obstacleRects)) obstaclesMoved = true;
+    obstacleRects = next;
   }
 
   const view = new THREE.Matrix4();
@@ -166,7 +171,7 @@ export function createLabels(ctx, { root, catalog, onSelect, obstacles }) {
         pri: lb.priority ?? (kind === 'landmark' ? 9 : 3),
         maxD: lb.maxDistance || (kind === 'building' && (lb.priority ?? 0) >= 6 ? DEFAULT_MAX.buildingMajor : DEFAULT_MAX[kind] || 800),
         w: 0, h: 0, ch: 0, dirty: true, alpha: 0, shown: false, was: false, x: -1e4, y: -1e4, o: -1, sx: 0, sy: 0, dist: 0, fade: 0,
-        occ: -1, occT: -1e9, own: null, flip: 0, flipShown: -1, by0: 0, by1: 0,
+        occ: -1, occT: -1e9, ocx: NaN, ocy: NaN, ocz: NaN, own: null, flip: 0, flipShown: -1, by0: 0, by1: 0,
       };
       states.set(key, st);
       added.push(st);
@@ -273,17 +278,41 @@ export function createLabels(ctx, { root, catalog, onSelect, obstacles }) {
   }
 
   // ---------------------------------------------------------------- per frame
+  // Idle frames: while the view, the viewport, the HUD panels and the label set are unchanged and no fade is running,
+  // the projected layout is exactly the last one — the whole pass is skipped (a full pass still runs a few times a
+  // second to catch anything else). roadlabels.js follows `idle` and skips its layout as well.
+  const viewSig = new Float64Array(36).fill(NaN);
+  let animating = true, lastMode = '', lastMinPri = NaN, idleN = 0, idle = false;
+  function viewChanged(cam, W, H) {
+    const a = cam.matrixWorld.elements, b = cam.projectionMatrix.elements, S = viewSig;
+    let changed = S[32] !== W || S[33] !== H;
+    for (let i = 0; i < 16 && !changed; i++) if (S[i] !== a[i] || S[16 + i] !== b[i]) changed = true;
+    if (changed) { for (let i = 0; i < 16; i++) { S[i] = a[i]; S[16 + i] = b[i]; } S[32] = W; S[33] = H; }
+    return changed;
+  }
   function update(dt) {
-    if ((ctx.labels?.version ?? 0) !== version) sync();
+    if ((ctx.labels?.version ?? 0) !== version) { sync(); animating = true; }
     const cam = ctx.camera;
+    idle = false;
     if (!cam || !states.size) return;
     clock += dt || 0;
     const W = innerWidth, H = innerHeight;
     if (!enabled) {
       for (const st of states.values()) if (st.shown) { st.el.style.display = 'none'; st.shown = false; st.alpha = 0; }
+      animating = true;
       return;
     }
     cam.updateMatrixWorld();
+    const mode0 = ctx.nav?.mode || '';
+    const moved = viewChanged(cam, W, H) || mode0 !== lastMode || minPriority !== lastMinPri;
+    if (!moved && !animating && !obstaclesMoved && !toMeasure.length && ++idleN % 15 !== 0) {
+      obstacleT += dt || 0;
+      if (obstacles && obstacleT > OBSTACLE_TTL) sampleObstacles();
+      idle = true;
+      return;
+    }
+    idleN = 0;
+    lastMode = mode0; lastMinPri = minPriority; obstaclesMoved = false;
     view.copy(cam.matrixWorldInverse);
     proj.copy(cam.projectionMatrix);
     const near = cam.near;
@@ -297,15 +326,19 @@ export function createLabels(ctx, { root, catalog, onSelect, obstacles }) {
     // --- project
     cands.length = 0;
     toMeasure.length = 0;
+    const cpx = cam.matrixWorld.elements[12], cpy = cam.matrixWorld.elements[13], cpz = cam.matrixWorld.elements[14];
     for (const st of states.values()) {
       st.cand = false;
       if (st.pri < minPriority) continue;
       const p = st.label.position;
+      // distance first (world space = view space distance): most labels are out of range, no transform for them
+      const maxD = walk && st.kind !== 'landmark' ? Math.min(st.maxD, WALK_MAX) : st.maxD;
+      const ddx = p.x - cpx, ddy = p.y - cpy, ddz = p.z - cpz;
+      const d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+      if (d2 > maxD * maxD) continue;
       v.set(p.x, p.y, p.z, 1).applyMatrix4(view);
       if (v.z > -near) continue;                                  // behind the camera
-      const dist = Math.hypot(v.x, v.y, v.z);
-      const maxD = walk && st.kind !== 'landmark' ? Math.min(st.maxD, WALK_MAX) : st.maxD;
-      if (dist > maxD) continue;
+      const dist = Math.sqrt(d2);
       v.applyMatrix4(proj);
       if (v.w <= 0) continue;
       const sx = (v.x / v.w * 0.5 + 0.5) * W;
@@ -340,11 +373,14 @@ export function createLabels(ctx, { root, catalog, onSelect, obstacles }) {
     let ghosts = 0;
     if (eye) {
       let budget = OCC_PER_FRAME;
+      const cp = cam.position;
       for (const st of cands) {
         if (budget <= 0) break;
-        if (clock - st.occT < OCC_TTL) continue;
+        // (a result stays valid while the camera has not moved: the world is static)
+        if (clock - st.occT < OCC_TTL || Math.abs(cp.x - st.ocx) + Math.abs(cp.y - st.ocy) + Math.abs(cp.z - st.ocz) <= 0.3) continue;
         st.occ = occluded(st, cam) ? 1 : 0;
         st.occT = clock;
+        st.ocx = cp.x; st.ocy = cp.y; st.ocz = cp.z;
         budget--;
       }
       for (const st of cands) if (st.occ === 1) st.rank -= 20;
@@ -425,10 +461,12 @@ export function createLabels(ctx, { root, catalog, onSelect, obstacles }) {
 
     // --- apply with smooth fades
     const k = 1 - Math.exp(-(dt || 0.016) * 10);
+    animating = false;
     for (const st of states.values()) {
       const target = st.cand && st.accept ? st.fade : 0;
       st.alpha += (target - st.alpha) * k;
       if (target === 0 && st.alpha < 0.03) st.alpha = 0;
+      if (Math.abs(target - st.alpha) > 0.01) animating = true;
       st.was = target > 0;
       if (st.alpha <= 0) {
         if (st.shown) { st.el.style.display = 'none'; st.shown = false; }
@@ -482,9 +520,20 @@ export function createLabels(ctx, { root, catalog, onSelect, obstacles }) {
     setHover,
     select: (st) => st && onSelect?.(st.label, st.rec),
     get enabled() { return enabled; },
-    setEnabled(on) { enabled = !!on; layer.classList.toggle('off', !enabled); },
-    setMinPriority(p) { minPriority = Number.isFinite(p) ? p : -Infinity; },
+    setEnabled(on) { enabled = !!on; layer.classList.toggle('off', !enabled); animating = true; },
+    setMinPriority(p) { minPriority = Number.isFinite(p) ? p : -Infinity; animating = true; },
     sampleObstacles,
+    /** true when this frame's pass was skipped (nothing changed): the previous layout still stands */
+    get idle() { return idle; },
+    /** Loading time: create every label element, measure every box and build the line-of-sight grid now. */
+    prepare() {
+      if ((ctx.labels?.version ?? 0) !== version) sync();
+      const todo = [];
+      for (const st of states.values()) if (st.dirty) todo.push(st);
+      measure(todo);
+      occluders();
+      animating = true;
+    },
     // road names share this renderer's declutter grid: fn(grid, 'mid' | 'end') is called during every declutter pass
     setRoadHook(fn) { roadHook = typeof fn === 'function' ? fn : null; },
     count: () => states.size,

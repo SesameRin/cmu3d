@@ -401,6 +401,9 @@ export function groundRange(ctx, frame, ring, step = 4) {
 // Checked every few frames - it only toggles `visible`.
 export function distanceCull(ctx, { x, z, detail = null, near = 600, main = null, far = Infinity }) {
   if (!ctx.onUpdate || (!detail && !main)) return;
+  // (their visibility changes at runtime: world/shadowproxy.js must not merge their casters)
+  if (detail) detail.userData.noShadowProxy = true;
+  if (main) main.userData.noShadowProxy = true;
   let frameN = 0;
   ctx.onUpdate(() => {
     if ((frameN++ & 7) !== 0) return;
@@ -410,7 +413,9 @@ export function distanceCull(ctx, { x, z, detail = null, near = 600, main = null
     let changed = false;
     if (detail && detail.visible !== d < near) { detail.visible = d < near; changed = true; }
     if (main && main.visible !== d < far) { main.visible = d < far; changed = true; }
-    if (changed) ctx.env?.refreshShadows?.();      // static casters appeared / vanished
+    // (no forced shadow refresh: the next scheduled one picks the casters up — a forced one re-renders both
+    // cascades in the frame the threshold is crossed)
+    void changed;
   }, 20);
 }
 

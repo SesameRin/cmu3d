@@ -76,10 +76,10 @@ export function createColliders(cell = 16) {
   function addPolygon(ring, yMin = -Infinity, yMax = Infinity, tag = null) {
     let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
     for (const [x, z] of ring) { x0 = Math.min(x0, x); x1 = Math.max(x1, x); z0 = Math.min(z0, z); z1 = Math.max(z1, z); }
-    return insert({ kind: 'poly', ring, yMin, yMax, tag, x0, x1, z0, z1 }, x0, z0, x1, z1);
+    return insert({ kind: 'poly', ring, yMin, yMax, tag, x0, x1, z0, z1, q: 0 }, x0, z0, x1, z1);
   }
   function addCircle(x, z, r, yMin = -Infinity, yMax = Infinity, tag = null) {
-    return insert({ kind: 'circle', x, z, r, yMin, yMax, tag, x0: x - r, x1: x + r, z0: z - r, z1: z + r }, x - r, z - r, x + r, z + r);
+    return insert({ kind: 'circle', x, z, r, yMin, yMax, tag, x0: x - r, x1: x + r, z0: z - r, z1: z + r, q: 0 }, x - r, z - r, x + r, z + r);
   }
   // Oriented box: centre, half-extents along its local axes, rotation (radians about +Y)
   function addBox(cx, cz, hw, hd, rotY = 0, yMin = -Infinity, yMax = Infinity, tag = null) {
@@ -87,24 +87,38 @@ export function createColliders(cell = 16) {
     const pts = [[-hw, -hd], [hw, -hd], [hw, hd], [-hw, hd]].map(([a, b]) => [cx + a * c + b * s, cz - a * s + b * c]);
     return addPolygon(pts, yMin, yMax, tag);
   }
-  function query(x, z, r) {
-    if (!Number.isFinite(x) || !Number.isFinite(z) || !Number.isFinite(r)) return [];
-    const out = new Set();
+  // Shapes overlapping the square (x ± r, z ± r), each once (de-duplicated with a per-query stamp), appended to out.
+  let stamp = 0;
+  function collect(x, z, r, out) {
+    if (!Number.isFinite(x) || !Number.isFinite(z) || !Number.isFinite(r)) return out;
+    if (++stamp > 1e15) stamp = 1;
     for (let i = Math.floor((x - r) / cell); i <= Math.floor((x + r) / cell); i++) {
       for (let j = Math.floor((z - r) / cell); j <= Math.floor((z + r) / cell); j++) {
         const list = grid.get(key(i, j));
-        if (list) for (const s of list) if (x + r >= s.x0 && x - r <= s.x1 && z + r >= s.z0 && z - r <= s.z1) out.add(s);
+        if (!list) continue;
+        for (let k = 0; k < list.length; k++) {
+          const s = list[k];
+          if (s.q === stamp || x + r < s.x0 || x - r > s.x1 || z + r < s.z0 || z - r > s.z1) continue;
+          s.q = stamp;
+          out.push(s);
+        }
       }
     }
-    return [...out];
+    return out;
   }
+  function query(x, z, r) { return collect(x, z, r, []); }
   // Push a vertical capsule (pos = feet, radius, height) out of every overlapping shape. Mutates pos. Returns true if hit.
+  // (called several times per frame while walking / flying: works on a reused list, no allocation)
+  const near = [];
   function resolve(pos, radius = 0.35, height = 1.7) {
     if (!Number.isFinite(pos.x) || !Number.isFinite(pos.z)) return false;
     let hit = false;
     for (let iter = 0; iter < 3; iter++) {
       let moved = false;
-      for (const s of query(pos.x, pos.z, radius)) {
+      near.length = 0;
+      collect(pos.x, pos.z, radius, near);
+      for (let n = 0; n < near.length; n++) {
+        const s = near[n];
         if (pos.y + height < s.yMin || pos.y > s.yMax) continue;
         if (s.kind === 'circle') {
           const dx = pos.x - s.x, dz = pos.z - s.z, d = Math.hypot(dx, dz), min = s.r + radius;
@@ -139,16 +153,19 @@ export function createColliders(cell = 16) {
     }
     return hit;
   }
-  return { shapes, addPolygon, addCircle, addBox, query, resolve };
+  // queryInto(x, z, r, out): like query() but appends to a caller-owned array (per-frame callers reuse one)
+  return { shapes, addPolygon, addCircle, addBox, query, queryInto: collect, resolve };
 }
 
 export function createContext({ data, info }) {
   const { isMobile, quality } = detectQuality();
   const heightfield = createHeightfield(data.terrain);
   const updates = [];
+  let runList = null;
   const raycaster = new THREE.Raycaster();
   const down = new THREE.Vector3(0, -1, 0);
   const tmp = new THREE.Vector3();
+  const hits = [];
   let lastYield = 0, yieldEvery = 40, yieldCost = 8;
 
   const ctx = {
@@ -167,16 +184,30 @@ export function createContext({ data, info }) {
     landmarks: [],                  // [{ key, name, nameZh, osmIds, object, anchor:[x,z] }]
     skipBuildingIds: new Set(),     // OSM ids that landmark modules replace; buildings.js must not render them
     loading: { step() {}, detail() {} }, // replaced by the UI loading screen
+    // Work a module would otherwise do lazily after start-up (idle-time detail builds, caches): register it here while
+    // building and main.js runs it behind the loading screen, after every build step and before the shader compile /
+    // warm-up frames. fn may be async (yield with ctx.yield()). Tasks added after loading run right away.
+    loadTasks: [],
+    addLoadTask(label, fn) {
+      if (typeof fn !== 'function') return;
+      if (ctx.engine?.running) { Promise.resolve().then(fn).catch((e) => console.warn(`[load task] ${label} failed`, e)); return; }
+      ctx.loadTasks.push([String(label || '准备'), fn]);
+    },
 
     // ---- per-frame updates. fn(dt, elapsed). Lower order runs first. Returns unsubscribe.
     onUpdate(fn, order = 0) {
       const entry = { fn, order };
       updates.push(entry);
       updates.sort((a, b) => a.order - b.order);
-      return () => { const i = updates.indexOf(entry); if (i >= 0) updates.splice(i, 1); };
+      runList = null;
+      return () => { const i = updates.indexOf(entry); if (i >= 0) { updates.splice(i, 1); runList = null; } };
     },
+    // (iterates a snapshot — callbacks may subscribe / unsubscribe while running — that is only re-made when the
+    // list changed, so a frame allocates nothing here)
     tick(dt, elapsed) {
-      for (const u of updates.slice()) { try { u.fn(dt, elapsed); } catch (e) { console.error('[update]', e); } }
+      if (!runList) runList = updates.slice();
+      const list = runList;
+      for (let i = 0; i < list.length; i++) { try { list[i].fn(dt, elapsed); } catch (e) { console.error('[update]', e); } }
     },
 
     // ---- picking registry (raycast targets for hover/click)
@@ -221,8 +252,10 @@ export function createContext({ data, info }) {
         const top = Number.isFinite(fromY) ? fromY + 1.2 : y + 200;
         raycaster.set(tmp.set(x, top, z), down);
         raycaster.far = top - y + 0.5;
-        const hits = raycaster.intersectObjects(ctx.walkables.meshes, false);
+        hits.length = 0;
+        raycaster.intersectObjects(ctx.walkables.meshes, false, hits);
         if (hits.length) y = Math.max(y, hits[0].point.y);
+        hits.length = 0;
       }
       return y;
     },

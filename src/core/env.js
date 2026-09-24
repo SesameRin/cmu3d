@@ -962,7 +962,12 @@ void main() { gl_FragColor = vec4(smoothstep(uTh.x, uTh.x + uTh.y, cmuCloudField
   let perfLevel = 0;
   renderer.shadowMap.autoUpdate = false;   // this module owns shadow refreshes (updateShadow sets needsUpdate)
   renderer.shadowMap.needsUpdate = true;
-  const newCascade = (light) => ({ light, half: 0, far: 0, t: -1e9, center: new THREE.Vector3(1e9, 0, 0), light0: new THREE.Vector3(0, -1, 0) });
+  // A moved box is re-rendered at most every MOVE_MS (per CPU degrade level): ~every second frame at 60 fps.
+  const MOVE_MS = [30, 45, 60, 90];
+  const newCascade = (light) => ({
+    light, half: 0, far: 0, t: -1e9, center: new THREE.Vector3(1e9, 0, 0), light0: new THREE.Vector3(0, -1, 0),
+    plan: { center: new THREE.Vector3(), L: new THREE.Vector3(), half: 0, far: 0, R: 0, texel: 1 },
+  });
   const CM = newCascade(sun), CN = newCascade(sunNear);
   let cnMode = null;                      // what light 1's map currently holds: 'near' | 'far' | null
   const fwd = new THREE.Vector3(), lx = new THREE.Vector3(), ly = new THREE.Vector3(), center = new THREE.Vector3();
@@ -1024,8 +1029,11 @@ void main() { gl_FragColor = vec4(smoothstep(uTh.x, uTh.x + uTh.y, cmuCloudField
     const hn = clamp(70 + camH * 1.2, 70, 150);
     const gn = Math.min(g0, 40) + hn * 0.55;             // near box centre, metres ahead of the camera
     let half, mx, mz;
-    const st = ctx.nav?.getState?.();
-    const tgt = st && st.mode === 'orbit' ? st.target : null;
+    // orbit target (live vector from the controls; getState() allocates, so only as a fallback)
+    const nav = ctx.nav;
+    let tgt = null;
+    if (nav && 'orbitTarget' in nav) tgt = nav.orbitTarget;
+    else { const st = nav?.getState?.(); if (st && st.mode === 'orbit') tgt = st.target; }
     if (tgt) {
       const tx = tgt[0] ?? tgt.x, ty = tgt[1] ?? tgt.y, tz = tgt[2] ?? tgt.z;
       const dist = Math.hypot(cp.x - tx, cp.y - ty, cp.z - tz);
@@ -1065,27 +1073,35 @@ void main() { gl_FragColor = vec4(smoothstep(uTh.x, uTh.x + uTh.y, cmuCloudField
     }
   }
 
-  // Position cascade c (light, shadow camera, biases) around ground point (x, z) with half-size `half`. Returns
-  // true when its map is re-rendered this frame. The light, its shadow camera and the biases are only touched
-  // together with a new shadow pass, so a map that is not re-rendered stays consistent with the matrix it was
-  // rendered with (three updates shadow.matrix inside the shadow pass).
-  function placeCascade(c, x, z, half, L, force, hz, now) {   // hz 0: only when moved
+  // Plan cascade c (light, shadow camera, biases) around ground point (x, z) with half-size `half`: works out the
+  // snapped box into c.plan and returns whether its map is due this frame — forced, animated casters due (hz; 0 =
+  // only when moved), or the box moved (at most every MOVE_MS: a map that is not re-rendered stays consistent with
+  // the matrix it was rendered with, it just covers the old box a frame longer). commitCascade() then applies the
+  // plan: the light, its shadow camera and the biases are only touched together with a new shadow pass (three
+  // updates shadow.matrix inside the shadow pass).
+  function planCascade(c, x, z, half, L, force, hz, now) {
+    const P = c.plan;
     if (!Number.isFinite(half) || !Number.isFinite(x) || !Number.isFinite(z)) return false;
     half = Math.pow(2, Math.ceil(Math.log2(half) * 8) / 8);
-    center.set(x, ctx.heightAt(x, z), z);
+    const cp = P.center.set(x, ctx.heightAt(x, z), z);
     const texel = (2 * half) / c.light.shadow.mapSize.x;
     // light-space basis identical to the one three builds for the shadow camera (lookAt with up = +Y)
     lightBasis(L);
-    const u = center.dot(lx), v = center.dot(ly);
-    center.addScaledVector(lx, Math.round(u / texel) * texel - u).addScaledVector(ly, Math.round(v / texel) * texel - v);
+    const u = cp.dot(lx), v = cp.dot(ly);
+    cp.addScaledVector(lx, Math.round(u / texel) * texel - u).addScaledVector(ly, Math.round(v / texel) * texel - v);
     const elev = Math.max(0.05, L.y);
     const R = clamp(260 / Math.tan(Math.asin(elev)), 300, 2600) + half;
     const far = R + half * 1.5 + 250;
-    const moved = half !== c.half || Math.abs(far - c.far) > 1 || c.center.distanceToSquared(center) > 1e-6 || c.light0.dot(L) < 1 - 1e-10;
-    if (!force && !moved && (!hz || now - c.t < 1000 / hz - 2)) return false;
-    const light = c.light;
-    light.target.position.copy(center);
-    light.position.copy(center).addScaledVector(L, R);
+    P.half = half; P.far = far; P.R = R; P.texel = texel; P.L.copy(L);
+    const moved = half !== c.half || Math.abs(far - c.far) > 1 || c.center.distanceToSquared(cp) > 1e-6 || c.light0.dot(L) < 1 - 1e-10;
+    if (force) return true;
+    if (moved && now - c.t >= MOVE_MS[perfLevel]) return true;
+    return !!hz && now - c.t >= 1000 / hz - 2;
+  }
+  function commitCascade(c, now) {
+    const P = c.plan, light = c.light, half = P.half, far = P.far;
+    light.target.position.copy(P.center);
+    light.position.copy(P.center).addScaledVector(P.L, P.R);
     const sc = light.shadow.camera;
     if (half !== c.half || Math.abs(far - c.far) > 1) {
       sc.left = -half; sc.right = half; sc.top = half; sc.bottom = -half;
@@ -1093,9 +1109,9 @@ void main() { gl_FragColor = vec4(smoothstep(uTh.x, uTh.x + uTh.y, cmuCloudField
       sc.updateProjectionMatrix();
       c.half = half; c.far = far;
     }
-    light.shadow.normalBias = texel * 1.4;
-    light.shadow.bias = -Math.max(0.03, texel * 0.6) / far;
-    c.center.copy(center); c.light0.copy(L);
+    light.shadow.normalBias = P.texel * 1.4;
+    light.shadow.bias = -Math.max(0.03, P.texel * 0.6) / far;
+    c.center.copy(P.center); c.light0.copy(P.L);
     light.shadow.needsUpdate = true;
     c.t = now;
     return true;
@@ -1115,19 +1131,25 @@ void main() { gl_FragColor = vec4(smoothstep(uTh.x, uTh.x + uTh.y, cmuCloudField
     fitShadows();
     const now = performance.now();
     const lvl = perfLevel;
-    let did = placeCascade(CM, fit.mx, fit.mz, fit.mh, L, force, fit.near ? SHADOW_HZ_FAR[lvl] : SHADOW_HZ[lvl], now);
+    const dueM = planCascade(CM, fit.mx, fit.mz, fit.mh, L, force, fit.near ? SHADOW_HZ_FAR[lvl] : SHADOW_HZ[lvl], now);
     // light 1's map: near box (low viewer) or far box (aerial viewer). The map must exist before the shader uses it:
     // a freshly activated (or re-purposed) cascade is rendered this frame.
     const mode = fit.near ? 'near' : fit.far ? 'far' : null;
-    if (mode === 'near') {
-      if (placeCascade(CN, fit.nx, fit.nz, fit.nh, L, force || cnMode !== 'near', SHADOW_HZ[lvl], now)) did = true;
-    } else if (mode === 'far') {
+    const forceN = force || cnMode !== mode;
+    let dueN = false;
+    if (mode === 'near') dueN = planCascade(CN, fit.nx, fit.nz, fit.nh, L, forceN, SHADOW_HZ[lvl], now);
+    else if (mode === 'far') {
       // (beyond the main box only distant, mostly static casters: re-rendered when the box or the sun moved, at most
       // SHADOW_HZ_AERIAL times a second)
-      if (now - CN.t >= 1000 / SHADOW_HZ_AERIAL[lvl] - 2 || cnMode !== 'far' || force) {
-        if (placeCascade(CN, fit.fx, fit.fz, fit.fh, L, force || cnMode !== 'far', 0, now)) did = true;
-      }
+      if (forceN || now - CN.t >= 1000 / SHADOW_HZ_AERIAL[lvl] - 2) dueN = planCascade(CN, fit.fx, fit.fz, fit.fh, L, forceN, 0, now);
     }
+    // Never both shadow passes in one frame unless one is forced: the other one follows a frame later (the one that
+    // waited longer goes first) — two big passes in the same frame were a regular frame-time spike while moving.
+    let doM = dueM, doN = dueN;
+    if (doM && doN && !force && !forceN) { if (CN.t < CM.t) doM = false; else doN = false; }
+    let did = false;
+    if (doM) did = commitCascade(CM, now);
+    if (doN) did = commitCascade(CN, now) || did;
     cnMode = mode;
     CASCADE.a.x = mode ? 1 : 0;
     CASCADE.a.w = mode === 'far' ? 1 : 0;

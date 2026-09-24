@@ -54,8 +54,8 @@ async function main() {
   const canvas = document.getElementById('scene');
   handleContextLoss(ctx, canvas);
 
-  // On 'low' the scenery that isn't needed to start exploring is built after the first frame (progressive start).
-  const deferWorld = ctx.quality.level === 'low' && !ctx.shotMode;
+  // Everything is built behind the loading screen, on every preset: a somewhat longer load buys smooth exploring
+  // (building trees / props / traffic after the first frame on 'low' made the first seconds stutter).
   const worldSteps = [
     ['树木', () => createVegetation(ctx)],
     ['街道设施', () => createProps(ctx)],
@@ -74,7 +74,7 @@ async function main() {
       if (object) { object.name = object.name || `landmark:${lm.key}`; ctx.scene.add(object); }
       ctx.landmarks.push({ key: lm.key, name: lm.name, nameZh: lm.nameZh, osmIds: lm.osmIds || [], object });
     }]),
-    ...(deferWorld ? [] : worldSteps),
+    ...worldSteps,
     ['操控', () => createControls(ctx)],
     ['界面', () => createUI(ctx)],
   ];
@@ -84,7 +84,7 @@ async function main() {
   const tStart = performance.now();
   for (let i = 0; i < steps.length; i++) {
     const [label, fn] = steps[i];
-    loading.step(label, 0.9 * (i / steps.length)); // the last 10 % is shader compilation + first frames
+    loading.step(label, 0.86 * (i / steps.length)); // the last 14 %: shaders, preload tasks, warm-up frames
     await ctx.yield();
     const t0 = performance.now();
     try {
@@ -96,19 +96,38 @@ async function main() {
       if (i < 2) { loading.error?.(`${label} 初始化失败：${e.message}`); return; }
     }
   }
-  timings.push(['total', Math.round(performance.now() - tStart)]);
+  timings.push(['build', Math.round(performance.now() - tStart)]);
 
   const hours = parseFloat(params.get('hours'));
   if (Number.isFinite(hours)) ctx.env?.setTime?.(hours);
   window.__setView = (cam, look) => ctx.nav?.setView?.(cam, look);
   applyViewParams(ctx, params);
 
-  // Compile every shader program up front (in parallel where the driver supports it) so the first frame doesn't stall
-  loading.step('准备画面', 0.9);
-  await ctx.yield();
-  const tc = performance.now();
-  try { await ctx.engine.precompile(); } catch (e) { console.warn('[init] shader precompile failed', e); }
-  timings.push(['compile', Math.round(performance.now() - tc)]);
+  // ---- final preparation, still behind the loading screen: whatever the first minutes of exploring would otherwise
+  // build, compile or upload on the fly happens now (a few seconds more loading, no hitches afterwards).
+  const timed = async (label, p, fn) => {
+    loading.step(label, p);
+    await ctx.yield();
+    const t0 = performance.now();
+    let r;
+    try { r = await fn(); } catch (e) { console.warn(`[init] ${label} failed`, e); }
+    timings.push([label, Math.round(performance.now() - t0)]);
+    return r;
+  };
+  // 1. deferred work that modules registered with ctx.addLoadTask(label, fn) (detail builds, caches…)
+  const tasks = (ctx.loadTasks || []).splice(0);
+  for (let i = 0; i < tasks.length; i++) await timed(tasks[i][0], 0.86 + 0.03 * (i / tasks.length), tasks[i][1]);
+  // 2. every shader program, compiled in parallel where the driver supports it, and every texture uploaded
+  await timed('编译着色器', 0.89, () => ctx.engine.precompile());
+  // 3. interaction caches: picking grids, label sizes, line-of-sight grids, the camera's terrain index
+  await timed('准备交互', 0.93, async () => {
+    ctx.nav?.prepare?.();
+    await ctx.ui?.prepare?.((d) => loading.detail?.(d));
+  });
+  // 4. warm-up frames: the first frames' one-off work, then every object drawn once (GPU buffers, shader variants)
+  const warm = await timed('预热场景', 0.97, () => ctx.engine.warmScene?.());
+  if (warm) window.__warmStats = warm;
+  timings.push(['total', Math.round(performance.now() - tStart)]);
   loading.step('准备就绪', 1);
 
   ctx.engine.start();
@@ -116,18 +135,8 @@ async function main() {
   requestAnimationFrame(() => requestAnimationFrame(() => timings.push(['firstFrames', Math.round(performance.now() - tf)])));
   loading.done();
   ctx.events.emit('app:ready', { errors });
+  ctx.events.emit('world:complete');     // (kept for listeners: the world is always complete at this point now)
   if (errors.length) console.warn('[init] finished with errors:', errors);
-
-  if (deferWorld) {
-    // progressive start: trees, street furniture and traffic appear during the first seconds of exploring
-    for (const [label, fn] of worldSteps) {
-      await ctx.yield();
-      const t0 = performance.now();
-      try { await fn(); timings.push([label, Math.round(performance.now() - t0)]); } catch (e) { console.error(`[init] ${label} failed`, e); }
-    }
-    try { ctx.engine.warm?.(); } catch { /* shaders compile on first use instead */ }
-    ctx.events.emit('world:complete');
-  }
 
   let frames = 0;
   const unsub = ctx.onUpdate(() => { if (++frames > 8) { window.__READY = true; unsub(); } }, 1000);

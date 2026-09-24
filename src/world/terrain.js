@@ -1,11 +1,11 @@
-// Terrain: heightfield mesh in 64×64-cell chunks with four levels of detail (vertex stride 1–8 cells by distance,
-// built on demand; curtains hide the cracks between levels) + a low-detail skirt of concentric rings that
-// continues the terrain 3.2 km beyond the data bounds (edge heights blending into synthetic hills) and fades into
-// the fog. One MeshStandardMaterial shades it all (onBeforeCompile):
+// Terrain: heightfield mesh in 128×128-cell chunks with four levels of detail (vertex stride 1–8 cells by distance;
+// all built during loading on medium / high, on demand on low; curtains hide the cracks between levels) + a
+// low-detail skirt of concentric rings that continues the terrain 3.2 km beyond the data bounds (edge heights
+// blending into synthetic hills) and fades into the fog. One MeshStandardMaterial shades it all (onBeforeCompile):
 //   · painted ground texture in two levels (ground-painter.js): 'far' covers the whole data (painted once at
 //     start-up, in far mode) and carries the road / field markings; 'near' is a ~450 m window around the camera
-//     at ~0.22 m per pixel in a wrap-around canvas, repainted strip by strip as the camera moves (createNearLevel)
-//     — sharp ground wherever one walks. It has NO markings: within CORE_FADE of the camera those are crisp decal
+//     at ~0.22 m per pixel in a wrap-around texture, painted tile by tile (paced, nearest first) as the camera
+//     moves (createNearLevel) — sharp ground wherever one walks. It has NO markings: within CORE_FADE of the camera those are crisp decal
 //     geometry (roads.js), beyond it the far level takes over;
 //   · a detail-type mask (vegetation / asphalt / hard / soil) selecting world-space close-up detail;
 //   · outside the data: a procedural, band-limited "Pittsburgh" (wooded slopes, street-grid neighbourhoods);
@@ -35,7 +35,7 @@ const SKIRT_OFFSETS = [0, 6, 14, 26, 42, 64, 94, 134, 186, 254, 340, 450, 590, 7
 // map, and nothing of it to paint at start-up.
 const NEAR = { high: { px: 2048, m: 448 }, medium: { px: 2048, m: 512 }, low: { px: 1024, m: 384 } };
 const NEAR_MAX_H = 420; // camera height above the ground up to which the near level is kept up to date (m)
-const CHUNK = { low: 128 }; // cells per terrain chunk side (64 by default; bigger chunks = fewer draw calls at low)
+const CHUNK = { low: 128, medium: 128, high: 128 }; // cells per terrain chunk side (bigger chunks = fewer draw calls; the GPU easily takes the extra triangles)
 // Terrain chunk levels of detail: vertex stride 1 / 2 / 4 / 8 cells, switched by the distance from the camera to
 // the chunk (LOD 0 — the exact surface meshHeightAt describes, which the road decals are draped on — reaches
 // beyond the marking range). Chunks hang a short curtain from their edges that hides the cracks between levels.
@@ -322,6 +322,28 @@ const OUTER_GLSL = /* glsl */`
 // On each side the colour / mask are re-sampled 0.55 m away from the border and chosen with a pixel-wide step
 // at the true border, plus a thin darker soil line. Only for lawn (r ≈ 1) against hard or bare ground (r ≈ 0):
 // wood edges stay soft.
+// The near level's slot table (createNearLevel): texel (i mod n, j mod n) holds the world tile (i, j) painted into that
+// slot of the wrap-around textures. gNearOk: 1 where the tile under p is painted. gNearW: weight of the near level —
+// 0 outside painted tiles, fading from the centres of the outermost painted tiles to their outer edges (the old
+// window edge fade; it also hides the seam next to a tile that is not painted yet).
+const NEAR_GLSL = /* glsl */`
+  uniform sampler2D uNearTiles;
+  uniform vec2 uNearTile; // (tile size m, tiles per side)
+  float gTileOk(vec2 t) {
+    vec2 v = texelFetch(uNearTiles, ivec2(mod(t, uNearTile.y)), 0).rg;
+    return step(abs(v.x - t.x) + abs(v.y - t.y), 0.25);
+  }
+  float gNearOk(vec2 p) { return gTileOk(floor(p / uNearTile.x)); }
+  // the near colour texture stores sRGB values (plain RGBA8): decode after filtering
+  vec3 gNearRGB(vec3 c) { return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(vec3(0.04045), c)); }
+  float gNearW(vec2 p) {
+    vec2 q = p / uNearTile.x;
+    if (gTileOk(floor(q)) < 0.5) return 0.0;
+    vec2 c = q - 0.5, b = floor(c), f = c - b;
+    float v = mix(mix(gTileOk(b), gTileOk(b + vec2(1.0, 0.0)), f.x), mix(gTileOk(b + vec2(0.0, 1.0)), gTileOk(b + vec2(1.0, 1.0)), f.x), f.y);
+    return clamp(v * 2.0 - 1.0, 0.0, 1.0);
+  }
+`;
 const EDGE_GLSL = /* glsl */`
   void gCrispEdge(sampler2D map, sampler2D msk, vec4 rect, float w, vec2 wp, float vd, float fp, inout vec3 gcol, inout vec3 gm, inout float edgeLine) {
     vec2 uv = (wp - rect.xy) / rect.zw;
@@ -343,7 +365,7 @@ const EDGE_GLSL = /* glsl */`
              * (1.0 - smoothstep(32.0, 45.0, vd)) * step(abs(sd), 0.9);
     if (ok <= 0.0) return;
     float e = smoothstep(-0.6 * fp, 0.6 * fp, sd);
-    vec3 cc = mix(textureLod(map, uH, 0.0).rgb, textureLod(map, uG, 0.0).rgb, e);
+    vec3 cc = gNearRGB(mix(textureLod(map, uH, 0.0).rgb, textureLod(map, uG, 0.0).rgb, e)); // (only used with the near level)
     gcol = mix(gcol, cc, ok);
     gm = mix(gm, mix(mH, mG, e), ok);
     edgeLine = ok * exp(-(sd - 0.02) * (sd - 0.02) / 0.0016) * (1.0 - smoothstep(0.012, 0.035, fp));
@@ -378,6 +400,7 @@ function makeGroundMaterial(uniforms) {
         uniform vec2 uHouse3D;
         uniform sampler2D uEdgeLU;
         ${OUTER_GLSL}
+        ${NEAR_GLSL}
         ${EDGE_GLSL}`)
       .replace('#include <map_fragment>', `
         vec2 wp = vGPos.xz;
@@ -389,18 +412,18 @@ function makeGroundMaterial(uniforms) {
         // decal geometry (roads.js); further out they come from the far level's own markings texture (uFarMarks),
         // faded in over uMarkFade. Beyond uCoreFade (or outside the window) the far level alone is used.
         vec2 uvN = wp / uNearPeriod;
-        float wN = gRectW(wp, uNearRect) * (1.0 - smoothstep(uCoreFade.x, uCoreFade.y, vd));
+        float wN = gNearW(wp) * (1.0 - smoothstep(uCoreFade.x, uCoreFade.y, vd));
         vec3 gcol = texture2D(uFarMap, uvF).rgb;
         vec3 gm = texture2D(uFarMask, uvF).rgb;
         if (wN > 0.0) {
-          gcol = mix(gcol, texture2D(uNearMap, uvN).rgb, wN);
+          gcol = mix(gcol, gNearRGB(texture2D(uNearMap, uvN).rgb), wN);
           gm = mix(gm, texture2D(uNearMask, uvN).rgb, wN);
         }
         // unsharp mask while the painted texture is magnified (close to the camera) — on luminance only: per
         // channel it overshoots differently in R, G and B and fringes saturated edges (red / white field paint)
         float shp = uSharpen * (1.0 - smoothstep(6.0, 35.0, vd));
         if (shp > 0.001) {
-          vec3 blur = mix(texture2D(uFarMap, uvF, 1.3).rgb, texture2D(uNearMap, uvN, 1.3).rgb, wN);
+          vec3 blur = mix(texture2D(uFarMap, uvF, 1.3).rgb, gNearRGB(texture2D(uNearMap, uvN, 1.3).rgb), wN);
           const vec3 LUM = vec3(0.2126, 0.7152, 0.0722);
           float l = dot(gcol, LUM), lb = dot(blur, LUM);
           gcol *= max(l + (l - lb) * shp, 0.0) / max(l, 1e-3);
@@ -491,7 +514,7 @@ function makeGroundMaterial(uniforms) {
       .replace('#include <emissivemap_fragment>', `#include <emissivemap_fragment>
         totalEmissiveRadiance += gEmit;`);
   };
-  mat.customProgramCacheKey = () => 'cmu-ground-v7';
+  mat.customProgramCacheKey = () => 'cmu-ground-v9';
   return mat;
 }
 
@@ -722,6 +745,7 @@ export async function createTerrain(ctx) {
     uFarMarks: { value: tex.farMarks },
     uNearMap: { value: tex.near }, uNearMask: { value: tex.nearMask },
     uNearRect: nearLevel.rectUniform, uNearPeriod: { value: nearCfg.m },
+    uNearTiles: nearLevel.tilesUniform, uNearTile: nearLevel.tileUniform,
     uMarkFade: { value: new THREE.Vector2(markRange(ctx) - 100, markRange(ctx)) },
     uMarkWhite: { value: new THREE.Color('#ebe9e1') }, uMarkYellow: { value: new THREE.Color('#d8a526') },
     uDetail: { value: tex.detail },
@@ -774,12 +798,40 @@ export async function createTerrain(ctx) {
       chunks.push(c);
     }
   }
-  // LOD selection (when the camera has moved a few metres): the right level for every chunk, missing geometry
-  // built nearest first within a small per-frame budget (more right after a jump); LOD 0 geometry of chunks far
-  // behind is dropped again.
+  // Levels of detail: on medium / high every level of every chunk is built now, during loading (~0.5 s; building
+  // them on demand while exploring cost up to 14 ms per frame after each flight, plus new GPU buffers), each as its
+  // own mesh of which only the chunk's current level is visible — so the per-frame selection only flips visibility,
+  // and the loading-time warm-up (which draws every hidden object once) puts all of them on the GPU. On low (phones:
+  // memory) they are still built on demand, nearest first within a small per-frame budget, swapped into the one
+  // mesh, and LOD 0 of chunks far behind is dropped again.
+  const eagerLods = !low;
   const lodStats = { built: 0, buildMs: 0, counts: [0, 0, 0, 0] };
+  if (eagerLods) {
+    const tL = performance.now();
+    let tY = tL;
+    for (const c of chunks) {
+      c.meshes = [];
+      for (let lod = 0; lod < 4; lod++) {
+        if (!c.geos[lod]) { c.geos[lod] = chunkGeometry(c, lod, H, GW, CS, B, gridH); lodStats.built++; }
+        let m = c.mesh;
+        if (lod !== c.lod) {
+          m = new THREE.Mesh(c.geos[lod], material);
+          m.name = `${c.mesh.name}-lod${lod}`;
+          m.receiveShadow = true;
+          m.castShadow = false;
+          m.matrixAutoUpdate = false;
+          m.visible = false;
+          group.add(m);
+        }
+        c.meshes[lod] = m;
+      }
+      if (performance.now() - tY > 60) { await ctx.yield?.(); tY = performance.now(); }
+    }
+    lodStats.buildMs += performance.now() - tL;
+  }
   const _cp = new THREE.Vector3();
   let lodLast = null, lodPending = true;
+  const lodWant = [];
   const updateLods = (force = false) => {
     const cam = ctx.camera;
     if (!cam) return;
@@ -787,14 +839,15 @@ export async function createTerrain(ctx) {
     const moved = !lodLast || Math.abs(p.x - lodLast.x) + Math.abs(p.y - lodLast.y) + Math.abs(p.z - lodLast.z) > 6;
     if (!moved && !lodPending && !force) return;
     const jump = !lodLast || Math.abs(p.x - lodLast.x) + Math.abs(p.z - lodLast.z) > 150;
-    lodLast = p.clone();
-    const want = [];
+    if (lodLast) lodLast.copy(p); else lodLast = p.clone();
+    const want = lodWant;
+    want.length = 0;
     for (const c of chunks) {
       const d = c.box.distanceToPoint(p);
       const lod = d < lodDist[0] ? 0 : d < lodDist[1] ? 1 : d < lodDist[2] ? 2 : 3;
       if (c.geos[lod]) setLod(c, lod);
       else want.push([d, c, lod]);
-      if (c.geos[0] && lod > 0 && d > lodDist[1] * 1.6) { c.geos[0].dispose(); c.geos[0] = null; }
+      if (!eagerLods && c.geos[0] && lod > 0 && d > lodDist[1] * 1.6) { c.geos[0].dispose(); c.geos[0] = null; }
     }
     want.sort((a, b) => a[0] - b[0]);
     const t0 = performance.now(), budget = force ? 1e9 : jump ? 14 : 4;
@@ -808,7 +861,12 @@ export async function createTerrain(ctx) {
     lodStats.buildMs += performance.now() - t0;
     lodPending = k < want.length;
   };
-  const setLod = (c, lod) => { if (c.lod !== lod) { c.mesh.geometry = c.geos[lod]; c.lod = lod; } };
+  const setLod = (c, lod) => {
+    if (c.lod === lod) return;
+    if (c.meshes) { c.mesh.visible = false; c.mesh = c.meshes[lod]; c.mesh.visible = true; }
+    else c.mesh.geometry = c.geos[lod];
+    c.lod = lod;
+  };
   ctx.onUpdate?.(() => updateLods(), 22);
   const triStats = () => {
     const counts = [0, 0, 0, 0];
@@ -835,31 +893,24 @@ export async function createTerrain(ctx) {
   mark("skirt");
 
   // ---------------------------------------------------------------- 3D surroundings on the skirt
-  // Built after the first frame, a few milliseconds per frame (they are only ever seen out at the data edge,
-  // and building them up front cost ~0.2 s — 0.7 s+ on slow CPUs — of loading). The materials exist now, so the
-  // shader precompile covers them.
+  // Built now, during loading (~0.2 s; 0.7 s+ on slow CPUs). They used to be built after the first frame, a few
+  // milliseconds per frame, which showed up as stutter while exploring (and as new GPU buffers / first draws later).
   let skirtStats = { ms: 0, pending: true };
   try {
     const kit = skirtKit(ctx);
     const surface = { get: () => skirtLook, set: (v) => { skirtLook = v; } };
     const gen = buildSkirtContent(ctx, { B, skirtGeo: skirt, surface, detailData: tex.detail.image.data, meshHeightAt, edgeAt: edgeLU.at, kit });
-    const budget = low ? 4 : 8;
-    let ms = 0;
-    const off = ctx.onUpdate?.(() => {
-      const t0 = performance.now();
-      let r = { done: false };
-      try {
-        do { r = gen.next(); } while (!r.done && performance.now() - t0 < budget);
-      } catch (e) { console.warn('[terrain] surroundings failed', e); r = { done: true, value: null }; }
-      ms += performance.now() - t0;
-      if (!r.done) return;
-      off?.();
-      skirtContent = r.value;
-      skirtStats = Object.assign(skirtContent?.stats || {}, { ms: Math.round(ms) });
-      if (ctx.terrain) { ctx.terrain.surroundings = skirtContent?.group || null; ctx.terrain.stats.surroundings = skirtStats; }
-      if (skirtContent && season !== (ctx.env?.state?.season || 'autumn')) skirtContent.setSeason(season);
-      ctx.events?.emit?.('terrain:surroundings', skirtContent?.group || null);
-    }, 30);
+    let ms = 0, tS = performance.now(), r = { done: false };
+    try {
+      for (;;) {
+        r = gen.next();
+        if (r.done) break;
+        if (performance.now() - tS > 60) { ms += performance.now() - tS; await ctx.yield?.(); tS = performance.now(); }
+      }
+    } catch (e) { console.warn('[terrain] surroundings failed', e); r = { done: true, value: null }; }
+    ms += performance.now() - tS;
+    skirtContent = r.value;
+    skirtStats = Object.assign(skirtContent?.stats || {}, { ms: Math.round(ms) });
   } catch (e) { console.warn('[terrain] surroundings failed', e); }
 
   // ---------------------------------------------------------------- seasons + weather
@@ -935,6 +986,9 @@ export async function createTerrain(ctx) {
 
   // GPU memory of the ground textures (RGBA8 + full mip chain ≈ 4/3)
   const texMB = Object.values(tex).reduce((m, t) => m + ((t.image?.width || 0) * (t.image?.height || 0) * (t.format === THREE.RGFormat ? 2 : 4) * 4) / 3, 0) / 1048576;
+  // the sharp near level around the start view (so the first frames have next to nothing to paint)
+  try { nearLevel.prefill(); } catch (e) { console.warn('[terrain] near level prefill failed', e); }
+  mark("nearPrefill");
   mark("rest");
   const stats = {
     steps, paintMs: Math.round(paintMs), meshMs: Math.round(meshMs), surroundings: skirtStats, totalMs: Math.round(performance.now() - T0),
@@ -964,46 +1018,141 @@ export async function createTerrain(ctx) {
     setSeason,
     stats,
     groundData: painted.prepared, // classified roads/paths (used by roads.js for the marking decals)
-    surroundings: null, // 3D trees / houses / road continuations beyond the data (set once built, after the first frame)
+    surroundings: null, // 3D trees / houses / road continuations beyond the data (Group, set below)
     near: nearLevel, // the sharp level: { rect(), update(force), stats }
   };
+  ctx.terrain.surroundings = skirtContent?.group || null;
+  if (skirtContent && season !== (ctx.env?.state?.season || 'autumn')) skirtContent.setSeason(season);
+  ctx.events?.emit?.('terrain:surroundings', skirtContent?.group || null);
   console.info('[terrain]', JSON.stringify(stats));
   return ctx.terrain;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// The sharp near level. A PX² canvas (+ a half-resolution mask) holds an M-metre window of the ground around the
-// camera, wrapped: world (x, z) lives at canvas pixel (x·ppm mod PX, z·ppm mod PX), so the shader samples it with
-// uv = world / M on a repeating texture and the window can move in steps of M / 8 by painting only the strips it
-// newly covers (paintRegion; typically an 8th of the window: ~2–4 ms of drawing calls). The window sits a
-// little ahead of the camera, in the direction it looks; above NEAR_MAX_H the far level alone is visible and
-// the window stays where it is.
+// The sharp near level: an M-metre window of the ground around the camera at PX² pixels in a wrap-around texture —
+// world (x, z) lives at texel (x·ppm mod PX, z·ppm mod PX), so the shader samples it with uv = world / M on a
+// repeating texture. The window is made of 8 × 8 tiles of M/8 metres. Each tile is painted on its own into a small
+// scratch canvas (paintRegion) and copied into its slot of the textures (texSubImage2D of one tile — never a
+// re-upload of the whole texture); a tiny slot table (uNearTiles: which world tile each slot holds) tells the
+// shaders where the painted ground is valid, so tiles can be painted in any order, a few per frame, nearest first,
+// and nothing wrong is ever shown in between (unpainted tiles show the far level). The window sits a little ahead
+// of the camera, in the direction it looks, and moves in steps of one tile; above NEAR_MAX_H the far level alone is
+// visible and the window stays where it is. Tiles are painted within a small per-frame time budget (repainting whole
+// strips / the whole window and re-uploading the 2048² textures was the main source of stutter while exploring);
+// the window around the start view is painted during loading (prefill).
+// Pacing. A tile costs ~1–1.5 ms of drawing calls on the main thread but ~7–9 ms of rasterisation in the GPU process
+// (Skia), which shares its thread with the WebGL frame — so tiles are paced by an estimate of that GPU time: each
+// painted tile adds NEAR_TILE_GPU ms of "debt", every frame pays NEAR_GPU_PER_FRAME ms back, and a tile is only
+// painted when the debt is paid (≈ one tile every other frame); a missing tile right around the camera may go
+// one tile ahead. The main-thread time is capped too.
+const NEAR_TILE_GPU = 9, NEAR_GPU_PER_FRAME = 5, NEAR_BUDGET_MS = 2.5;
 function createNearLevel(ctx, P, cfg, mkTex) {
-  const PX = cfg.px, M = cfg.m, ppm = PX / M, STEP = M / 8;
-  const MPX = PX / 2, mppm = ppm / 2;
+  const PX = cfg.px, M = cfg.m, ppm = PX / M, NT = 8, T = M / NT, TPX = PX / NT;
+  const MPX = PX / 2, mppm = ppm / 2, MTPX = TPX / 2;
   const mk = (n) => { const c = document.createElement('canvas'); c.width = c.height = n; return c; };
   const color = mk(PX), mask = mk(MPX);
   const gc = color.getContext('2d', { alpha: false }), gmk = mask.getContext('2d', { alpha: false });
-  gc.fillStyle = '#59733a'; gc.fillRect(0, 0, PX, PX);   // (never shown: the window starts out of the way)
+  gc.fillStyle = '#59733a'; gc.fillRect(0, 0, PX, PX);   // (never shown: no slot is valid before it is painted)
   gmk.fillStyle = '#ff0000'; gmk.fillRect(0, 0, MPX, MPX);
+  // The colour level holds sRGB values in a plain RGBA8 texture, decoded in the shaders (gNearRGB): copying canvas
+  // tiles into an SRGB8_ALPHA8 texture takes the GPU process about twice as long (an extra conversion pass).
   const tex = { color: mkTex(color, true, false, true), mask: mkTex(mask, false, false, true) };
+  tex.color.colorSpace = THREE.NoColorSpace;
+  // scratch tile canvases (+ texture wrappers used only as copy sources; they are never uploaded themselves)
+  const tc = mk(TPX), tm = mk(MTPX);
+  const tcg = tc.getContext('2d', { alpha: false }), tmg = tm.getContext('2d', { alpha: false });
+  // slot table: world tile (i, j) held by slot (i mod NT, j mod NT); -1e6 = empty
+  const tableData = new Float32Array(NT * NT * 2).fill(-1e6);
+  const table = new THREE.DataTexture(tableData, NT, NT, THREE.RGFormat, THREE.FloatType);
+  table.minFilter = table.magFilter = THREE.NearestFilter;
+  table.generateMipmaps = false;
+  table.needsUpdate = true;
+  const tilesUniform = { value: table };
+  const tileUniform = { value: new THREE.Vector2(T, NT) };
   const rectUniform = { value: new THREE.Vector4(-1e7, -1e7, 1, 1) };
-  const stats = { px: PX, m: M, paints: 0, fullPaints: 0, ms: 0, lastMs: 0, maxMs: 0 };
+  const stats = { px: PX, m: M, tile: T, paints: 0, windows: 0, ms: 0, lastMs: 0, maxMs: 0, pending: 0 };
   let win = null;
+  let want = [];          // tiles of the current window, nearest first: [i, j, d²]
   const mod = (a, n) => ((a % n) + n) % n;
-  // world rectangle (on the STEP grid) → its one to four pieces on the wrap-around canvas
-  const paintRect = (x, z, w, h) => {
-    if (w <= 0 || h <= 0) return;
-    const px0 = Math.round(x * ppm), pz0 = Math.round(z * ppm), pw = Math.round(w * ppm), ph = Math.round(h * ppm);
-    const split = (p0, pl) => { const c0 = mod(p0, PX); return c0 + pl <= PX ? [[c0, pl, 0]] : [[c0, PX - c0, 0], [0, c0 + pl - PX, PX - c0]]; };
-    for (const [cx, cw, ox] of split(px0, pw)) {
-      for (const [cz, ch, oz] of split(pz0, ph)) {
-        const rect = { minX: (px0 + ox) / ppm, minZ: (pz0 + oz) / ppm, w: cw / ppm, h: ch / ppm };
-        paintRegion(gc, 'color', P, rect, cx, cz, ppm, { name: 'near' });
-        paintRegion(gmk, 'mask', P, rect, cx / 2, cz / 2, mppm, { name: 'near' });
+  const holds = (i, j) => { const k = (mod(j, NT) * NT + mod(i, NT)) * 2; return tableData[k] === i && tableData[k + 1] === j; };
+  // Copy a painted tile canvas into its slot: a plain texSubImage2D with default unpack parameters, which Chrome
+  // executes GPU-side and asynchronously for a GPU canvas (three's copyTextureToTexture sets UNPACK_ROW_LENGTH,
+  // which sends it down the synchronous read-back path: ~13 ms of main thread per tile), then the mip chain.
+  function uploadTile(t, canvas, x, y) {
+    const r = ctx.renderer;
+    if (!r) return;
+    const gl = r.getContext();
+    let p = r.properties.get(t);
+    if (!p.__webglTexture) { r.initTexture(t); p = r.properties.get(t); }
+    r.state.bindTexture(gl.TEXTURE_2D, p.__webglTexture);
+    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+    gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.BROWSER_DEFAULT_WEBGL);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, x, y, canvas.width, canvas.height, gl.RGBA, gl.UNSIGNED_BYTE, canvas);
+    gl.generateMipmap(gl.TEXTURE_2D);
+    r.state.unbindTexture();
+  }
+  function paintTile(i, j) {
+    const t0 = performance.now();
+    const rect = { minX: i * T, minZ: j * T, w: T, h: T };
+    try {
+      paintRegion(tcg, 'color', P, rect, 0, 0, ppm, { name: 'near' });
+      paintRegion(tmg, 'mask', P, rect, 0, 0, mppm, { name: 'near' });
+      const sx = mod(i, NT), sz = mod(j, NT);
+      uploadTile(tex.color, tc, sx * TPX, sz * TPX);
+      uploadTile(tex.mask, tm, sx * MTPX, sz * MTPX);
+      const k = (sz * NT + sx) * 2;
+      tableData[k] = i; tableData[k + 1] = j;
+      table.needsUpdate = true;
+    } catch (e) { console.warn('[terrain] near ground painting failed', e); }
+    const ms = performance.now() - t0;
+    stats.paints++;
+    stats.lastMs = Math.round(ms * 10) / 10;
+    stats.maxMs = Math.max(stats.maxMs, stats.lastMs);
+    stats.ms += ms;
+  }
+  // move the window (on the tile grid) for a camera position + view direction; false when it stays
+  function focusWindow(px, pz, dx, dy, dz, hAbove) {
+    const fl = Math.hypot(dx, dz);
+    // focus: ahead of the camera by up to 18 % of the window (less when looking down from above)
+    let off = 0.18 * M;
+    if (dy < -0.02) off = Math.min(off, (Math.max(0, hAbove) * fl) / -dy);
+    const fx = px + (fl > 1e-3 ? (dx / fl) * off : 0), fz = pz + (fl > 1e-3 ? (dz / fl) * off : 0);
+    if (win && Math.abs(fx - (win.x + M / 2)) < T * 0.75 && Math.abs(fz - (win.z + M / 2)) < T * 0.75) return false;
+    const nx = Math.round((fx - M / 2) / T) * T, nz = Math.round((fz - M / 2) / T) * T;
+    if (win && nx === win.x && nz === win.z) return false;
+    win = { x: nx, z: nz };
+    rectUniform.value.set(nx, nz, M, M);
+    const i0 = Math.round(nx / T), j0 = Math.round(nz / T);
+    want = [];
+    for (let j = 0; j < NT; j++) for (let i = 0; i < NT; i++) want.push([i0 + i, j0 + j, ((i0 + i + 0.5) * T - px) ** 2 + ((j0 + j + 0.5) * T - pz) ** 2]);
+    want.sort((a, b) => a[2] - b[2]);
+    stats.windows++;
+    return true;
+  }
+  // paint missing tiles of the window, nearest first, within budgetMs (at least one); returns how many are left
+  let gpuDebt = 0;
+  function paintMissing(budgetMs, paced, px = 0, pz = 0) {
+    const t0 = performance.now();
+    let n = 0, left = 0;
+    const urgentD2 = (1.6 * T) ** 2;
+    for (const w of want) {
+      if (holds(w[0], w[1])) continue;
+      let go = !paced || (gpuDebt <= 0 && (n === 0 || performance.now() - t0 < budgetMs));
+      if (!go && paced && n === 0 && gpuDebt <= NEAR_TILE_GPU) {
+        const dx = (w[0] + 0.5) * T - px, dz = (w[1] + 0.5) * T - pz;
+        go = dx * dx + dz * dz < urgentD2; // under / right next to the camera: don't wait
       }
+      if (!go) { left++; continue; }
+      paintTile(w[0], w[1]);
+      if (paced) gpuDebt += NEAR_TILE_GPU;
+      n++;
     }
-  };
+    stats.pending = left;
+    if (!left) want = [];
+    return left;
+  }
   const dir = new THREE.Vector3();
   function update(force = false) {
     const cam = ctx.camera;
@@ -1012,36 +1161,38 @@ function createNearLevel(ctx, P, cfg, mkTex) {
     const hAbove = p.y - ctx.heightAt(p.x, p.z);
     if (hAbove > NEAR_MAX_H && !force) return;
     cam.getWorldDirection(dir);
-    const fl = Math.hypot(dir.x, dir.z);
-    // focus: ahead of the camera by up to 18 % of the window (less when looking down from above)
-    let off = 0.18 * M;
-    if (dir.y < -0.02) off = Math.min(off, (Math.max(0, hAbove) * fl) / -dir.y);
-    const fx = p.x + (fl > 1e-3 ? (dir.x / fl) * off : 0), fz = p.z + (fl > 1e-3 ? (dir.z / fl) * off : 0);
-    if (win && !force && Math.abs(fx - (win.x + M / 2)) < STEP * 0.75 && Math.abs(fz - (win.z + M / 2)) < STEP * 0.75) return;
-    const nx = Math.round((fx - M / 2) / STEP) * STEP, nz = Math.round((fz - M / 2) / STEP) * STEP;
-    if (win && nx === win.x && nz === win.z) return;
-    const t0 = performance.now();
+    focusWindow(p.x, p.z, dir.x, dir.y, dir.z, hAbove);
+    gpuDebt = Math.max(0, gpuDebt - NEAR_GPU_PER_FRAME);
+    if (want.length) paintMissing(NEAR_BUDGET_MS, !(force || ctx.shotMode), p.x, p.z);
+  }
+  // During loading: paint the window around the start view (a ?cam= link, else the opening overview — the same
+  // pose as controls.js HOME) so the first frames have nothing (or only a strip) to paint.
+  function prefill() {
+    let cam = null, look = null;
     try {
-      if (!win || Math.abs(nx - win.x) >= M || Math.abs(nz - win.z) >= M) { paintRect(nx, nz, M, M); stats.fullPaints++; }
-      else {
-        const dx = nx - win.x, dz = nz - win.z;
-        if (dx > 0) paintRect(win.x + M, nz, dx, M); else if (dx < 0) paintRect(nx, nz, -dx, M);
-        const xr0 = Math.max(nx, win.x), xr1 = Math.min(nx, win.x) + M;
-        if (dz > 0) paintRect(xr0, win.z + M, xr1 - xr0, dz); else if (dz < 0) paintRect(xr0, nz, xr1 - xr0, -dz);
-      }
-    } catch (e) { console.warn('[terrain] near ground painting failed', e); }
-    win = { x: nx, z: nz };
-    tex.color.needsUpdate = true;
-    tex.mask.needsUpdate = true;
-    rectUniform.value.set(nx, nz, M, M);
-    stats.paints++;
-    stats.lastMs = Math.round((performance.now() - t0) * 10) / 10;
-    stats.maxMs = Math.max(stats.maxMs, stats.lastMs);
-    stats.ms = Math.round(stats.ms + stats.lastMs);
+      const q = new URLSearchParams(location.search);
+      const v = (q.get('cam') || '').split(',').map(Number), l = (q.get('look') || '').split(',').map(Number);
+      if (v.length === 3 && v.every(Number.isFinite)) { cam = v; look = l.length === 3 && l.every(Number.isFinite) ? l : null; }
+    } catch { /* no location */ }
+    if (!cam) {
+      const h = (292 * Math.PI) / 180, el = (29 * Math.PI) / 180, dist = 600, tx = -120, tz = 70, ty = ctx.heightAt(tx, tz);
+      const dx = Math.sin(h), dz = -Math.cos(h);
+      cam = [tx - dx * dist * Math.cos(el), ty + dist * Math.sin(el), tz - dz * dist * Math.cos(el)];
+      look = [tx, ty, tz];
+    }
+    const d = look ? [look[0] - cam[0], look[1] - cam[1], look[2] - cam[2]] : [0, -1, 0];
+    const dl = Math.hypot(d[0], d[1], d[2]) || 1;
+    focusWindow(cam[0], cam[2], d[0] / dl, d[1] / dl, d[2] / dl, cam[1] - ctx.heightAt(cam[0], cam[2]));
+    paintMissing(Infinity, false);
   }
   ctx.onUpdate?.(() => update(), 21);
+  // after a WebGL context loss the textures come back blank: every slot has to be painted again
+  (ctx.renderer?.domElement || ctx.canvas)?.addEventListener?.('webglcontextrestored', () => {
+    tableData.fill(-1e6); table.needsUpdate = true;
+    if (win) { const w = win; win = null; focusWindow(w.x + M / 2, w.z + M / 2, 0, 0, 0, 0); }
+  });
   return {
-    tex, rectUniform, stats, update,
+    tex, rectUniform, tilesUniform, tileUniform, stats, update, prefill,
     rect: () => (win ? { minX: win.x, maxX: win.x + M, minZ: win.z, maxZ: win.z + M } : null),
   };
 }
@@ -1091,6 +1242,7 @@ function createGrass(ctx, { H, GW, GH, CS, B, uniforms, nearCfg }) {
   mat.onBeforeCompile = (sh) => {
     Object.assign(sh.uniforms, gu, {
       uNearMap: uniforms.uNearMap, uNearMask: uniforms.uNearMask, uNearRect: uniforms.uNearRect, uNearPeriod: uniforms.uNearPeriod,
+      uNearTiles: uniforms.uNearTiles, uNearTile: uniforms.uNearTile,
       uGrassTint: uniforms.uGrassTint, uSnow: uniforms.uSnow,
     });
     sh.vertexShader = sh.vertexShader
@@ -1104,6 +1256,7 @@ function createGrass(ctx, { H, GW, GH, CS, B, uniforms, nearCfg }) {
         uniform sampler2D uGHeight, uNearMap, uNearMask;
         uniform vec3 uGrassTint;
         varying vec3 vGCol;
+        ${NEAR_GLSL}
         float gH1(vec2 c) { return fract(sin(dot(c, vec2(127.1, 311.7))) * 43758.5453); }
         // the terrain mesh surface (same triangulation as terrain.js chunkGeometry / meshHeightAt)
         float gTerrain(vec2 p) {
@@ -1121,9 +1274,8 @@ function createGrass(ctx, { H, GW, GH, CS, B, uniforms, nearCfg }) {
         vec2 base = (cell + vec2(r1, r2)) * uGSpacing;
         float d = length(base - (uGCell + 0.5) * uGSpacing);
         // lawn? (near level mask: vegetation without asphalt / hard surface, not beds or woods)
-        vec2 e = min(base - uNearRect.xy, uNearRect.xy + uNearRect.zw - base);
         vec3 m = textureLod(uNearMask, base / uNearPeriod, 0.0).rgb;
-        float lawn = smoothstep(0.86, 0.96, m.r) * (1.0 - smoothstep(0.04, 0.12, m.g + m.b)) * step(4.0, min(e.x, e.y));
+        float lawn = smoothstep(0.86, 0.96, m.r) * (1.0 - smoothstep(0.04, 0.12, m.g + m.b)) * gNearOk(base);
         float hgt = (0.06 + 0.06 * r3) * lawn * (1.0 - smoothstep(uGRadius * 0.55, uGRadius, d)) * (1.0 - smoothstep(0.2, 0.5, uSnow));
         float ang = r2 * 6.2832, ca = cos(ang), sa = sin(ang);
         vec3 p = position;
@@ -1134,7 +1286,7 @@ function createGrass(ctx, { H, GW, GH, CS, B, uniforms, nearCfg }) {
         vec3 transformed = vec3(base.x + p.x, gTerrain(base) + p.y * hgt - 0.01, base.y + p.z);
         // no lawn here: fold the tuft into a point under the ground (flat blades would poke out of slopes)
         if (hgt < 0.004) transformed = vec3(base.x, gTerrain(base) - 1.0, base.y);
-        vec3 gc = textureLod(uNearMap, base / uNearPeriod, 0.0).rgb;
+        vec3 gc = gNearRGB(textureLod(uNearMap, base / uNearPeriod, 0.0).rgb);
         gc *= uGrassTint;                                           // (the texture is decoded from sRGB)
         vGCol = gc * mix(0.62, 1.22 + 0.25 * (r3 - 0.5), aTip) * mix(vec3(1.0), vec3(1.08, 1.05, 0.82), aTip * r1 * 0.6);
       `)
@@ -1145,7 +1297,7 @@ function createGrass(ctx, { H, GW, GH, CS, B, uniforms, nearCfg }) {
       // (both faces lit like the ground below them: no flipped normal on the back face)
       .replace('#include <normal_fragment_begin>', 'float faceDirection = 1.0;\nvec3 normal = normalize(vNormal);\nvec3 nonPerturbedNormal = normal;');
   };
-  mat.customProgramCacheKey = () => 'cmu-grass-v1';
+  mat.customProgramCacheKey = () => 'cmu-grass-v3';
   const mesh = new THREE.Mesh(geo, mat);
   mesh.name = 'terrain-grass';
   mesh.frustumCulled = false;

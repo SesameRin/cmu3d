@@ -15,6 +15,29 @@ export function fovForAspect(aspect) {
   return Math.min(MAX_PORTRAIT_FOV, THREE.MathUtils.radToDeg(v));
 }
 
+// World-matrix updates. three's Scene has matrixAutoUpdate on, so every render re-multiplies the world matrix of
+// EVERY object (2000+ here, twice a frame with the water reflection pass) although almost all of them are static
+// (matrixAutoUpdate off). Once the world is built the scene root stops forcing that (staticWorld below): objects then
+// update when they have to — matrixAutoUpdate objects every frame as before, others after updateMatrix() /
+// matrixWorldNeedsUpdate — and anything added to the scene graph is flagged here so its subtree is placed once.
+let addPatched = false;
+function flagAddedObjects() {
+  if (addPatched) return;
+  addPatched = true;
+  const P = THREE.Object3D.prototype;
+  const add = P.add, attach = P.attach;
+  P.add = function (...objects) {
+    const r = add.apply(this, objects);
+    for (const o of objects) if (o && o.isObject3D) o.matrixWorldNeedsUpdate = true;
+    return r;
+  };
+  P.attach = function (object) {
+    const r = attach.call(this, object);
+    if (object && object.isObject3D) object.matrixWorldNeedsUpdate = true;
+    return r;
+  };
+}
+
 export function createEngine(ctx, canvas) {
   const q = ctx.quality;
   const params = new URLSearchParams(location.search);
@@ -156,6 +179,7 @@ export function createEngine(ctx, canvas) {
     last = now;
     const dt = Math.min(Math.max(raw, 0), 0.1);
     elapsed += dt;
+    if (worldStatic && ++safetyN >= SAFETY_FRAMES) { safetyN = 0; scene.updateMatrixWorld(true); }
     ctx.tick(dt, elapsed);
     renderFrame(dt);
     // our own main-thread time for this frame (update callbacks + three's draw submission); compared with the
@@ -184,6 +208,13 @@ export function createEngine(ctx, canvas) {
   const SUB_STEPS = [0.85, 0.75];
   const CPU_MAX = 3;
   const perf = { sum: 0, js: 0, n: 0, slow: 0, fast: 0, vsync: 0, skip: 0, probing: false, probeWait: 20, gpu: 0, cpu: 0, hinted: false, avg: 0, share: 0, gpuCheck: 0, gpuBlock: 0 };
+  const winRaw = new Float32Array(1024), winJs = new Float32Array(1024), sortBuf = new Float32Array(1024);
+  function median(a, n) {
+    if (!n) return 0;
+    sortBuf.set(a.subarray(0, n));
+    const s = sortBuf.subarray(0, n).sort();
+    return s[n >> 1];
+  }
   let aoWanted = true;       // engine.setAO() override
   let qualityBusy = false;   // setQuality() in progress
   let qualitySeq = 0;
@@ -220,9 +251,14 @@ export function createEngine(ctx, canvas) {
   function autoDegrade(raw, js) {
     if (shotMode || elapsed < 8 || document.hidden || qualityBusy) return;
     if (raw <= 0 || raw > 0.5) { perf.sum = 0; perf.js = 0; perf.n = 0; return; }   // stall / tab switch: restart
+    if (perf.n < winRaw.length) { winRaw[perf.n] = raw; winJs[perf.n] = Math.min(js, raw); }
     perf.sum += raw; perf.js += Math.min(js, raw); perf.n++;
     if (perf.sum < 2.5) return;
-    const avg = perf.sum / perf.n, share = perf.js / perf.sum;
+    // The window's MEDIAN frame (and our median JS time): a few one-off hitches (a panel opening, a GC) must not
+    // cost resolution or effects — lowering them would not help against hitches anyway, and the switch itself
+    // (render targets re-allocated) is one. Sustained slowness moves the median.
+    const n = Math.min(perf.n, winRaw.length);
+    const avg = median(winRaw, n), share = Math.min(1, median(winJs, n) / Math.max(avg, 1e-6));
     perf.sum = 0; perf.js = 0; perf.n = 0;
     perf.avg = avg; perf.share = share;
     if (perf.skip > 0) { perf.skip--; return; }    // settling after a change
@@ -460,11 +496,77 @@ export function createEngine(ctx, canvas) {
     return n;
   }
 
+  // (see flagAddedObjects) — from the first real frame on; a full forced update every SAFETY_FRAMES still places
+  // anything whose matrix was edited without flagging it (at worst a second late).
+  const SAFETY_FRAMES = 60;
+  let worldStatic = false, safetyN = 0;
+  function staticWorld() {
+    if (worldStatic) return;
+    worldStatic = true;
+    flagAddedObjects();
+    scene.updateMatrixWorld(true);
+    scene.matrixAutoUpdate = false;       // (the scene root itself never moves)
+  }
+
+  // One complete frame (per-frame updates + render) while the loop is not running yet — the loading screen still
+  // covers the canvas. Used by warmScene() so the first frames' one-off work happens during loading.
+  function hiddenFrame(dt = 1 / 60) {
+    elapsed += dt;
+    try { ctx.tick(dt, elapsed); } catch (e) { console.warn('[engine] warm-up tick failed', e); }
+    renderFrame(dt);
+  }
+  // Wait until the GPU has executed everything queued so far (shader variants, buffer / texture uploads, the warm-up
+  // draws): a 1-pixel read-back is a full round trip through the command buffer.
+  const px1 = new Uint8Array(4);
+  function gpuSync() {
+    try {
+      const gl = renderer.getContext();
+      const prev = renderer.getRenderTarget();
+      renderer.setRenderTarget(null);
+      gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px1);
+      renderer.setRenderTarget(prev);
+    } catch { /* context lost: nothing to wait for */ }
+  }
+  // Draw EVERY object once through the real pipeline — scene pass into the post buffer, both shadow cascades, post
+  // chain — no matter where it is or whether it is shown right now: frustum culling off, every LOD level, hidden
+  // meshes (distance-LOD'd chunks, night / weather / seasonal extras, far street signs…) made visible for this one
+  // frame. The first draw of an object creates its vertex buffers / VAO and — on ANGLE/D3D11 — compiles the shader
+  // variant for its vertex layout inside the GPU process, which took 100–400 ms per new combination while browsing
+  // (the page stalled whenever the view first reached a new part of the map). Lights keep their state (a light
+  // switched on would change every program). Everything is restored exactly afterwards.
+  function drawEverything() {
+    const lods = [], objs = [];
+    scene.traverse((o) => {
+      if (!o.isLOD) return;
+      lods.push({ o, auto: o.autoUpdate, vis: o.levels.map((l) => l.object.visible) });
+      o.autoUpdate = false;
+      for (const l of o.levels) l.object.visible = true;
+    });
+    let n = 0, unhidden = 0;
+    scene.traverse((o) => {
+      if (o === scene || o.isLight || o.isCamera) return;
+      const drawable = o.isMesh || o.isPoints || o.isLine || o.isSprite;
+      if (o.visible && !(drawable && o.frustumCulled)) return;
+      objs.push(o, o.visible, o.frustumCulled);
+      if (!o.visible) unhidden++;
+      o.visible = true;
+      if (drawable) { o.frustumCulled = false; n++; }
+    });
+    const lights = [];
+    scene.traverse((o) => { if (o.isLight && o.castShadow && o.shadow) { lights.push(o); o.shadow.needsUpdate = true; } });
+    renderer.shadowMap.needsUpdate = true;
+    try { renderFrame(0); } catch (e) { console.warn('[engine] warm-up draw failed', e); }
+    for (let i = 0; i < objs.length; i += 3) { objs[i].visible = objs[i + 1]; objs[i].frustumCulled = objs[i + 2]; }
+    for (const { o, auto, vis } of lods) { o.autoUpdate = auto; o.levels.forEach((l, i) => { l.object.visible = vis[i]; }); }
+    return { objects: n, unhidden, lods: lods.length, calls: frameInfo.calls, triangles: frameInfo.triangles };
+  }
+
   const engine = {
     start() {
       if (running) return;
       running = true;
       last = -1;
+      staticWorld();
       renderer.setAnimationLoop(frame);
       if (shotMode && !watchdog) {
         watchdog = setInterval(() => { if (running && performance.now() - lastFrameAt > 250) frame(performance.now()); }, 120);
@@ -546,6 +648,30 @@ export function createEngine(ctx, canvas) {
       const bad = res.find((r) => r.status === 'rejected');
       if (bad) throw bad.reason;
     },
+    // Final loading step (main.js, after precompile): run the first frames' one-off work now, behind the loading
+    // screen, instead of while the user starts exploring —
+    //  1. two complete frames (per-frame updates + render): every module's first-update work (LOD choices, near
+    //     ground paint, reflection, cloud-shadow map…) and the programs / uploads those frames need;
+    //  2. every object drawn once, wherever it is and whatever its state (drawEverything);
+    //  3. one more normal frame, then a GPU round trip so the driver has finished all of it.
+    // The shadow maps are re-rendered for the real view afterwards. Returns timings / counts for __initTimings.
+    warmScene() {
+      if (running) return null;
+      const t0 = performance.now();
+      try { ctx.materials?.enhance?.(scene); } catch (e) { console.warn('[engine] material relief failed', e); }
+      hiddenFrame(0); hiddenFrame(1 / 60);
+      const t1 = performance.now();
+      const all = drawEverything();
+      gpuSync();
+      const t2 = performance.now();
+      ctx.env?.refreshShadows?.();
+      hiddenFrame(1 / 60);
+      gpuSync();
+      const programs = renderer.info.programs?.length ?? 0;
+      return { frames: Math.round(t1 - t0), everything: Math.round(t2 - t1), settle: Math.round(performance.now() - t2), programs, ...all };
+    },
+    hiddenFrame,
+    gpuSync,
     resize,
     get postActive() { return !!post; },
     get post() { return post; },
